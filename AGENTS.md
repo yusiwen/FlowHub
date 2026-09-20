@@ -73,7 +73,7 @@ cmd/flowhub/        CLI entry: wiring, flags, HTTP server, /healthz, shutdown
 internal/config/    Environment parsing, validation, masked reporting
 internal/logging/   Application logger: stderr tee + size-rotated log file
 internal/webhook/   Lenient payload model, payload schema report, delivery pipeline
-internal/projectmap/ YouTrack project -> repository routing table (config/projects.json)
+internal/projectmap/ YouTrack project -> repository routing table (~/.config/flowhub/config.json)
 internal/dedupe/    TTL idempotency cache
 internal/store/     Audit record, non-blocking queue, JSONL audit, payload log
 internal/metrics/   Counters behind /healthz
@@ -120,9 +120,10 @@ documents. The rules below are load-bearing; do not relax them casually.
    container. `Problems()` is deliberately separate from `validate()` so
    `-print-config` keeps working while a start is refused.
 7. **Routing never guesses a repository.** The mapping from `project.key` to a
-   local checkout lives in `config/projects.json` (template:
-   `config/projects.example.json`). An unmapped project is refused, and a project
-   key that *is* present but unmapped must **not** fall back to the issue-ID
+   local checkout lives in `~/.config/flowhub/config.json` (template:
+   `config/config.example.json`); `FLOWHUB_PROJECTS_FILE` overrides it and a
+   leading `~` is expanded. An unmapped project is refused, and a project key
+   that *is* present but unmapped must **not** fall back to the issue-ID
    prefix. Startup validates every path, git work tree and `origin` before any
    file is created, and refuses otherwise. Do not add a "use the only configured
    repository" fallback: silently editing the wrong repository is the worst

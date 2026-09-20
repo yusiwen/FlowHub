@@ -150,7 +150,11 @@ func (m *Map) Report() string {
 		return b.String()
 	}
 
-	fmt.Fprintf(&b, "projects:           %d mapping(s)\n", m.Len())
+	fmt.Fprintf(&b, "projects:           %d mapping(s)", m.Len())
+	if routable := m.Routable(); routable != m.Len() {
+		fmt.Fprintf(&b, ", %d routable", routable)
+	}
+	fmt.Fprintln(&b)
 	for _, entry := range m.entries {
 		state := ""
 		if !entry.IsEnabled() {

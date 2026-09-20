@@ -76,8 +76,9 @@ clean; `gofmt -l .` reports nothing.
   a hard miss (no issue-prefix fallback — a payload whose key and prefix disagree
   must not be routed on a guess), and startup refuses a mapping whose path,
   work-tree or `origin` does not check out. The live table is
-  `config/projects.json` (gitignored, host-specific paths); the committed template
-  is `config/projects.example.json`. Nothing dispatches to opencode yet: this layer
+  the XDG path `~/.config/flowhub/config.json` (`$XDG_CONFIG_HOME/flowhub/config.json`
+  when set), resolved to an absolute path with `~` expanded; the committed
+  template is `config/config.example.json`. Nothing dispatches to opencode yet: this layer
   loads, validates and reports.
 * **Two-tier validation.** `config.Load` → `validate()` rejects syntactic
   mistakes (unparsable values, an address without a port). `Config.Problems()`

@@ -115,7 +115,7 @@ func run() error {
 		logger.Warn("no project mapping configured: deliveries are recorded but never routed",
 			"path", cfg.ProjectsFile, "hint", "copy config/projects.example.json and set FLOWHUB_PROJECTS_FILE")
 	} else {
-		logger.Info("project mapping loaded", "path", cfg.ProjectsFile, "mappings", projects.Len(), "keys", strings.Join(projects.Keys(), ","))
+		logger.Info("project mapping loaded", "path", cfg.ProjectsFile, "mappings", projects.Len(), "routable", projects.Routable(), "keys", strings.Join(projects.Keys(), ","))
 	}
 
 	started := time.Now()
@@ -220,6 +220,7 @@ func logStartup(logger *slog.Logger, cfg config.Config, projects *projectmap.Map
 		"detail_log", cfg.DetailLog,
 		"projects_file", cfg.ProjectsFile,
 		"project_mappings", projects.Len(),
+		"project_routable", projects.Routable(),
 		"wildcard_listen_acknowledged", cfg.AllowWildcardListen,
 		"active_locks", strings.Join(cfg.ActiveLocks(), ","),
 		"max_body_bytes", cfg.MaxBodyBytes,
@@ -291,7 +292,7 @@ func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.C
 			"queue_depth":               sink.QueueDepth(),
 			"queue_capacity":            cfg.QueueSize,
 			"dedupe_keys":               cache.Len(),
-			"projects":                  map[string]any{"file": cfg.ProjectsFile, "mappings": projects.Len(), "keys": projects.Keys()},
+			"projects":                  map[string]any{"file": cfg.ProjectsFile, "mappings": projects.Len(), "routable": projects.Routable(), "keys": projects.Keys()},
 			"counters":                  stats.Snapshot(),
 		})
 	}
@@ -306,7 +307,9 @@ func versionLine() string {
 	if commit == "" || commit == "unknown" {
 		commit = vcsRevision()
 	}
-	if commit != "" {
+	// `git describe --always --dirty` already yields the short sha while the
+	// repository has no tags, so appending it again would print it twice.
+	if commit != "" && !strings.Contains(Version, commit) {
 		parts = append(parts, commit)
 	}
 	if BuildTime != "" {

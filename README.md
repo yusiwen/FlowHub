@@ -106,7 +106,7 @@ Flags: `-version`, `-print-config`.
 | `FLOWHUB_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `FLOWHUB_LOG_FORMAT` | `text` | `text` or `json` |
 | `FLOWHUB_SHUTDOWN_TIMEOUT` | `10s` | Graceful drain budget on `SIGINT`/`SIGTERM` |
-| `FLOWHUB_PROJECTS_FILE` | `./config/projects.json` | Routing table: YouTrack project → local repository. A missing file only warns; a file that exists but fails validation stops startup |
+| `FLOWHUB_PROJECTS_FILE` | `~/.config/flowhub/config.json` | Routing table: YouTrack project → local repository. `$XDG_CONFIG_HOME/flowhub/config.json` when that is set. A leading `~` is expanded, and the path is made absolute at startup. A missing file only warns; a file that exists but fails validation stops startup |
 
 Disabled locks produce a loud startup warning, and `-print-config` lists the
 active locks. All three locks are expected to be set once the public entry exists
@@ -119,8 +119,9 @@ repository it belongs to. That resolution is **declared in a file, never
 guessed**:
 
 ```bash
-cp config/projects.example.json config/projects.json   # then edit it
-./bin/flowhub -print-config                            # shows the table and any problem
+mkdir -p ~/.config/flowhub
+cp config/config.example.json ~/.config/flowhub/config.json   # then edit it
+./bin/flowhub -print-config                                   # shows the table and any problem
 ```
 
 ```json
@@ -174,8 +175,15 @@ Keys whose name starts with `_` are documentation and are ignored, which is how
 the example carries its explanations in a format without comments.
 
 A **missing** file is only a warning: phase 1 records deliveries without routing
-them. `config/projects.json` is gitignored (its paths are host-specific) while
-`config/projects.example.json` is committed.
+them.
+
+The table lives **outside the repository**, at `~/.config/flowhub/config.json`
+(`$XDG_CONFIG_HOME/flowhub/config.json` when that variable is set), because its
+paths are host-specific. `FLOWHUB_PROJECTS_FILE` overrides it; a leading `~` is
+expanded (Go does not expand it for you) and the value is resolved to an absolute
+path at startup, so the loader, the logs and `-print-config` all name the same
+file — whatever the working directory was. The committed template is
+`config/config.example.json`.
 
 > **Not wired up yet.** Today this layer loads, validates and reports the table;
 > nothing dispatches to opencode. Turning a match into a session (worktree,
@@ -469,7 +477,7 @@ Layout:
 | `internal/store` | Audit record, non-blocking queue, daily JSONL writer, human readable payload log |
 | `internal/projectmap` | YouTrack project → repository routing table: strict loader, canonical paths, fail-closed validation |
 | `internal/metrics` | Counters used by `/healthz` |
-| `config/projects.example.json` | Committed template for the routing table |
+| `config/config.example.json` | Committed template for the routing table |
 | `scripts/smoke.sh` | The end-to-end check behind `make smoke` |
 
 `AGENTS.md` records the project invariants that contributors and coding agents

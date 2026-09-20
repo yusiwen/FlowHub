@@ -36,7 +36,11 @@ const (
 	DefaultLogMaxBytes   = 32 << 20
 	DefaultLogMaxFiles   = 5
 	DefaultDetailMaxBody = 64 << 10
-	DefaultProjectsFile  = "./config/projects.json"
+
+	// DefaultProjectsDir and DefaultProjectsName locate the routing table inside
+	// the XDG config directory.
+	DefaultProjectsDir  = "flowhub"
+	DefaultProjectsName = "config.json"
 )
 
 // Config is the fully resolved receiver configuration.
@@ -109,6 +113,9 @@ type Config struct {
 	// ProjectsFile is the YouTrack project to repository routing table. A missing
 	// file only warns (phase 1 records without routing); a file that exists but
 	// does not parse or validate is a startup error.
+	//
+	// Load resolves it to an absolute path, so the logs, the loader and
+	// -print-config always name the file that was actually read.
 	ProjectsFile string
 
 	// LogLevel is one of debug, info, warn, error.
@@ -131,7 +138,7 @@ func Load() (Config, error) {
 		Token:        os.Getenv("FLOWHUB_TOKEN"),
 		DataDir:      env("FLOWHUB_DATA_DIR", DefaultDataDir),
 		LogFile:      env("FLOWHUB_LOG_FILE", ""),
-		ProjectsFile: env("FLOWHUB_PROJECTS_FILE", DefaultProjectsFile),
+		ProjectsFile: env("FLOWHUB_PROJECTS_FILE", DefaultProjectsFile()),
 		LogLevel:     env("FLOWHUB_LOG_LEVEL", DefaultLogLevel),
 		LogFormat:    env("FLOWHUB_LOG_FORMAT", DefaultLogFormat),
 	}
@@ -173,11 +180,62 @@ func Load() (Config, error) {
 	if cfg.AllowedSources, err = ParseSources(os.Getenv("FLOWHUB_ALLOWED_SOURCES")); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_ALLOWED_SOURCES: %w", err)
 	}
+	cfg.ProjectsFile = ResolveProjectsFile(cfg.ProjectsFile)
 
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// DefaultProjectsFile returns the routing table path:
+//
+//	$XDG_CONFIG_HOME/flowhub/config.json   when XDG_CONFIG_HOME is set
+//	$HOME/.config/flowhub/config.json      otherwise
+//
+// os.UserConfigDir is deliberately not used: on macOS it returns
+// ~/Library/Application Support, while the XDG layout is what this project and
+// the surrounding tooling expect.
+func DefaultProjectsFile() string {
+	if dir := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); dir != "" {
+		return filepath.Join(dir, DefaultProjectsDir, DefaultProjectsName)
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".config", DefaultProjectsDir, DefaultProjectsName)
+	}
+	return filepath.Join(DefaultProjectsDir, DefaultProjectsName)
+}
+
+// ResolveProjectsFile expands a leading "~" and makes the path absolute.
+//
+// The "~" expansion matters because this value comes from an environment
+// variable or a default, never from a shell: without it a path like
+// "~/.config/flowhub/config.json" would be looked up as a literal directory
+// named "~". Making it absolute means the logs and -print-config always name the
+// file that was actually read, whatever the working directory was.
+func ResolveProjectsFile(path string) string {
+	path = expandHome(strings.TrimSpace(path))
+	if path == "" {
+		path = DefaultProjectsFile()
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		return absolute
+	}
+	return path
+}
+
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
 }
 
 func (c Config) validate() error {

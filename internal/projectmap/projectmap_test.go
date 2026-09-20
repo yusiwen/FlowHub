@@ -385,3 +385,39 @@ func TestReportOnEmptyMapExplainsItself(t *testing.T) {
 		t.Fatalf("empty report = %q", report)
 	}
 }
+
+// A disabled entry must not be advertised as routable: the startup banner and
+// /healthz read these, and listing a key that can never match would mislead.
+func TestKeysAndRoutableExcludeDisabledEntries(t *testing.T) {
+	repo := writeRepo(t, filepath.Join(t.TempDir(), "repo"), "")
+	path := writeFile(t, filepath.Join(t.TempDir(), "projects.json"), `{
+	  "projects": [
+	    {"youtrack_key": "LIVE", "also_keys": ["DEV"], "repo": {"path": "`+repo+`"}},
+	    {"youtrack_key": "PLACEHOLDER", "repo": {"path": "/absolute/path/to/your/repo"}, "enabled": false}
+	  ]
+	}`)
+	m, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := m.Len(), 2; got != want {
+		t.Fatalf("Len() = %d, want %d", got, want)
+	}
+	if got, want := m.Routable(), 1; got != want {
+		t.Fatalf("Routable() = %d, want %d", got, want)
+	}
+	if got := strings.Join(m.Keys(), ","); got != "DEV,LIVE" {
+		t.Fatalf("Keys() = %q, want the enabled keys only", got)
+	}
+	if _, ok := m.Match("PLACEHOLDER", "PLACEHOLDER-1"); ok {
+		t.Fatal("a disabled entry matched")
+	}
+	// The disabled entry still needs no valid path, so validation passes.
+	if problems := m.Validate(); len(problems) != 0 {
+		t.Fatalf("Validate = %v, want none", problems)
+	}
+	report := m.Report()
+	if !strings.Contains(report, "2 mapping(s), 1 routable") {
+		t.Fatalf("report does not distinguish routable entries:\n%s", report)
+	}
+}

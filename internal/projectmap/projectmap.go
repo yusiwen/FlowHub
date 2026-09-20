@@ -210,17 +210,37 @@ func (m *Map) Len() int {
 	return len(m.entries)
 }
 
-// Keys returns every configured key, sorted, including alias keys.
+// Keys returns every key of the ENABLED entries, sorted, including alias keys.
+//
+// Disabled entries are excluded: this feeds the startup banner and /healthz, where
+// listing a key that can never match a delivery would be misleading.
 func (m *Map) Keys() []string {
 	if m == nil {
 		return nil
 	}
 	keys := make([]string, 0, len(m.byKey))
 	for _, entry := range m.entries {
+		if !entry.IsEnabled() {
+			continue
+		}
 		keys = append(keys, entry.keys...)
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// Routable returns the number of entries that can actually match a delivery.
+func (m *Map) Routable() int {
+	if m == nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range m.entries {
+		if entry.IsEnabled() {
+			count++
+		}
+	}
+	return count
 }
 
 // Resolve looks up one project key.
