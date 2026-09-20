@@ -1,0 +1,31 @@
+# Build output
+/bin/
+/flowhub
+
+# Runtime data: audit log now, SQLite registry later.
+# NOTE: never add an ignore rule that hides source directories (see the
+# "plugins/ was git-ignored" lesson recorded in the design documents).
+/data/
+
+# Local secrets
+.env
+*.env
+!*.env.example
+
+# Go scratch when kept inside the tree
+/.cache/
+
+# Go build/test artifacts
+*.test
+*.out
+coverage.*
+
+# Nix / direnv
+.direnv/
+result
+result-*
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
