@@ -36,6 +36,7 @@ const (
 	DefaultLogMaxBytes   = 32 << 20
 	DefaultLogMaxFiles   = 5
 	DefaultDetailMaxBody = 64 << 10
+	DefaultProjectsFile  = "./config/projects.json"
 )
 
 // Config is the fully resolved receiver configuration.
@@ -105,6 +106,11 @@ type Config struct {
 	// DetailLogMaxBodyBytes caps how much of a body is pretty printed there.
 	DetailLogMaxBodyBytes int
 
+	// ProjectsFile is the YouTrack project to repository routing table. A missing
+	// file only warns (phase 1 records without routing); a file that exists but
+	// does not parse or validate is a startup error.
+	ProjectsFile string
+
 	// LogLevel is one of debug, info, warn, error.
 	LogLevel string
 
@@ -118,15 +124,16 @@ type Config struct {
 // Load reads the configuration from the environment and validates it.
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:        env("FLOWHUB_ADDR", DefaultAddr),
-		HookPath:    env("FLOWHUB_HOOK_PATH", DefaultHookPath),
-		HookKey:     os.Getenv("FLOWHUB_HOOK_KEY"),
-		TokenHeader: env("FLOWHUB_TOKEN_HEADER", DefaultTokenHeader),
-		Token:       os.Getenv("FLOWHUB_TOKEN"),
-		DataDir:     env("FLOWHUB_DATA_DIR", DefaultDataDir),
-		LogFile:     env("FLOWHUB_LOG_FILE", ""),
-		LogLevel:    env("FLOWHUB_LOG_LEVEL", DefaultLogLevel),
-		LogFormat:   env("FLOWHUB_LOG_FORMAT", DefaultLogFormat),
+		Addr:         env("FLOWHUB_ADDR", DefaultAddr),
+		HookPath:     env("FLOWHUB_HOOK_PATH", DefaultHookPath),
+		HookKey:      os.Getenv("FLOWHUB_HOOK_KEY"),
+		TokenHeader:  env("FLOWHUB_TOKEN_HEADER", DefaultTokenHeader),
+		Token:        os.Getenv("FLOWHUB_TOKEN"),
+		DataDir:      env("FLOWHUB_DATA_DIR", DefaultDataDir),
+		LogFile:      env("FLOWHUB_LOG_FILE", ""),
+		ProjectsFile: env("FLOWHUB_PROJECTS_FILE", DefaultProjectsFile),
+		LogLevel:     env("FLOWHUB_LOG_LEVEL", DefaultLogLevel),
+		LogFormat:    env("FLOWHUB_LOG_FORMAT", DefaultLogFormat),
 	}
 
 	var err error

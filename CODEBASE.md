@@ -28,6 +28,7 @@ is tested, and only records deliveries. It does **not** talk to opencode yet.
 | `internal/store/multi.go` | Fans one record out to several recorders |
 | `internal/store/jsonl.go` | Daily rotating append-only JSONL writer (`webhook-YYYY-MM-DD.jsonl`, `0600`) |
 | `internal/store/detail.go` | Human readable per-delivery payload log (`payload-YYYY-MM-DD.log`, `0600`) |
+| `internal/projectmap/` | YouTrack project → repository routing table (`projectmap.go` loader/matching, `validate.go` filesystem+remote checks, `strip.go` `_`-prefixed doc keys) |
 | `internal/metrics/metrics.go` | Counters behind `/healthz` |
 | `README.md` | Operator-facing documentation: config table, log formats, pipeline, jq recipes, verification checklist |
 
@@ -70,6 +71,14 @@ clean; `gofmt -l .` reports nothing.
 * **Module path** is `github.com/yusiwen/flowhub` (the repository is not yet
   pushed anywhere; change the single `module` line in `go.mod` plus the imports
   if the real path differs).
+* **Routing is declared, never guessed.** `internal/projectmap` maps
+  `project.key` to a local checkout. A project key that is present but unmapped is
+  a hard miss (no issue-prefix fallback — a payload whose key and prefix disagree
+  must not be routed on a guess), and startup refuses a mapping whose path,
+  work-tree or `origin` does not check out. The live table is
+  `config/projects.json` (gitignored, host-specific paths); the committed template
+  is `config/projects.example.json`. Nothing dispatches to opencode yet: this layer
+  loads, validates and reports.
 * **Two-tier validation.** `config.Load` → `validate()` rejects syntactic
   mistakes (unparsable values, an address without a port). `Config.Problems()`
   is the security gate checked in `main` before any file is touched: today it

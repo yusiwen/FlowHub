@@ -12,6 +12,10 @@
 *.env
 !*.env.example
 
+# Routing table: host-specific absolute paths. The committed template is
+# config/projects.example.json.
+/config/projects.json
+
 # Go scratch when kept inside the tree
 /.cache/
 

@@ -26,6 +26,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/dedupe"
 	"github.com/yusiwen/flowhub/internal/logging"
 	"github.com/yusiwen/flowhub/internal/metrics"
+	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/store"
 	"github.com/yusiwen/flowhub/internal/webhook"
 )
@@ -64,8 +65,28 @@ func run() error {
 		fmt.Println(versionLine())
 		return nil
 	}
+	// Load the routing table before anything else touches the filesystem. A
+	// missing file is only a warning (phase 1 records without routing), but a file
+	// that exists and does not parse or validate must stop the start: a broken
+	// mapping is how an agent ends up in the wrong repository.
+	projects, projectsErr := projectmap.Load(cfg.ProjectsFile)
+	if projectsErr != nil && !errors.Is(projectsErr, projectmap.ErrNotFound) {
+		return projectsErr
+	}
+	if problems := projects.Validate(); len(problems) > 0 {
+		return fmt.Errorf("refusing to start, project mapping %s:\n  - %s",
+			cfg.ProjectsFile, strings.Join(problems, "\n  - "))
+	}
+
 	if *printConfig {
 		fmt.Print(cfg.Report())
+		fmt.Print(projects.Report())
+		if errors.Is(projectsErr, projectmap.ErrNotFound) {
+			fmt.Printf("warning:            no project mapping file at %s\n", cfg.ProjectsFile)
+		}
+		for _, problem := range projects.Validate() {
+			fmt.Printf("mapping_problem:    %s\n", problem)
+		}
 		return nil
 	}
 	// Refuse to start on configuration that would silently widen the attack
@@ -89,6 +110,13 @@ func run() error {
 		defer logCloser.Close()
 	}
 	slog.SetDefault(logger)
+
+	if errors.Is(projectsErr, projectmap.ErrNotFound) {
+		logger.Warn("no project mapping configured: deliveries are recorded but never routed",
+			"path", cfg.ProjectsFile, "hint", "copy config/projects.example.json and set FLOWHUB_PROJECTS_FILE")
+	} else {
+		logger.Info("project mapping loaded", "path", cfg.ProjectsFile, "mappings", projects.Len(), "keys", strings.Join(projects.Keys(), ","))
+	}
 
 	started := time.Now()
 	stats := metrics.New()
@@ -129,7 +157,7 @@ func run() error {
 	mux := http.NewServeMux()
 	mux.Handle(base, handler)
 	mux.Handle(base+"/{key}", handler)
-	mux.Handle("GET /healthz", healthHandler(cfg, stats, sink, cache, audit, detail, started))
+	mux.Handle("GET /healthz", healthHandler(cfg, projects, stats, sink, cache, audit, detail, started))
 
 	server := &http.Server{
 		Handler:           mux,
@@ -145,7 +173,7 @@ func run() error {
 		return fmt.Errorf("listen on %s: %w", cfg.Addr, err)
 	}
 
-	logStartup(logger, cfg, listener.Addr().String())
+	logStartup(logger, cfg, projects, listener.Addr().String())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -182,7 +210,7 @@ func run() error {
 	return nil
 }
 
-func logStartup(logger *slog.Logger, cfg config.Config, addr string) {
+func logStartup(logger *slog.Logger, cfg config.Config, projects *projectmap.Map, addr string) {
 	logger.Info("flowhub receiver starting",
 		"version", versionLine(),
 		"addr", addr,
@@ -190,6 +218,8 @@ func logStartup(logger *slog.Logger, cfg config.Config, addr string) {
 		"data_dir", cfg.DataDir,
 		"log_file", cfg.ResolvedLogFile(),
 		"detail_log", cfg.DetailLog,
+		"projects_file", cfg.ProjectsFile,
+		"project_mappings", projects.Len(),
 		"wildcard_listen_acknowledged", cfg.AllowWildcardListen,
 		"active_locks", strings.Join(cfg.ActiveLocks(), ","),
 		"max_body_bytes", cfg.MaxBodyBytes,
@@ -234,7 +264,7 @@ func startSweeper(ctx context.Context, cache *dedupe.Cache, ttl time.Duration, l
 
 // healthHandler serves GET /healthz for local operations. nginx never proxies
 // this path, so it is not part of the public attack surface.
-func healthHandler(cfg config.Config, stats *metrics.Counters, sink *store.Async, cache *dedupe.Cache, audit *store.JSONL, detail *store.Detail, started time.Time) http.HandlerFunc {
+func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.Counters, sink *store.Async, cache *dedupe.Cache, audit *store.JSONL, detail *store.Detail, started time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Payload and audit paths are only known after the first record of the
 		// day, so they are read per request rather than captured at startup.
@@ -261,6 +291,7 @@ func healthHandler(cfg config.Config, stats *metrics.Counters, sink *store.Async
 			"queue_depth":               sink.QueueDepth(),
 			"queue_capacity":            cfg.QueueSize,
 			"dedupe_keys":               cache.Len(),
+			"projects":                  map[string]any{"file": cfg.ProjectsFile, "mappings": projects.Len(), "keys": projects.Keys()},
 			"counters":                  stats.Snapshot(),
 		})
 	}

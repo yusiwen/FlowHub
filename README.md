@@ -106,10 +106,80 @@ Flags: `-version`, `-print-config`.
 | `FLOWHUB_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `FLOWHUB_LOG_FORMAT` | `text` | `text` or `json` |
 | `FLOWHUB_SHUTDOWN_TIMEOUT` | `10s` | Graceful drain budget on `SIGINT`/`SIGTERM` |
+| `FLOWHUB_PROJECTS_FILE` | `./config/projects.json` | Routing table: YouTrack project → local repository. A missing file only warns; a file that exists but fails validation stops startup |
 
 Disabled locks produce a loud startup warning, and `-print-config` lists the
 active locks. All three locks are expected to be set once the public entry exists
 (`youtrack-webhook-and-flowhub-security.md` §12.2).
+
+## Routing: YouTrack project → repository
+
+opencode operates on a directory, so every delivery has to be resolved to the
+repository it belongs to. That resolution is **declared in a file, never
+guessed**:
+
+```bash
+cp config/projects.example.json config/projects.json   # then edit it
+./bin/flowhub -print-config                            # shows the table and any problem
+```
+
+```json
+{
+  "projects": [
+    {
+      "youtrack_key": "BEAP_BE",
+      "repo": {
+        "path": "/Users/yusiwen/git/work/pipechina/beap-be",
+        "remote": "git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git",
+        "default_branch": "master"
+      },
+      "worktrees": "/Users/yusiwen/git/work/pipechina/beap-be-worktrees",
+      "agent": "devops"
+    }
+  ]
+}
+```
+
+**Why it cannot come from YouTrack.** The webhook payload carries only
+`{key, name, shortName}` for the project, and YouTrack exposes no REST field or
+endpoint for the VCS-integration repository URL — so there is nothing to read
+even though YouTrack knows the answer. Measured evidence:
+`youtrack-webhook-and-flowhub-security.md` §5.6.
+
+### Matching
+
+| Rule | Behaviour |
+| --- | --- |
+| Primary key | `youtrack_key` is matched against the payload's `project.key`, **case-insensitively** |
+| Aliases | `also_keys` lets several YouTrack projects share one repository |
+| Fallback | Only when a payload carries **no** project object: the issue-ID prefix (`BEAP_BE-12` → `BEAP_BE`) |
+| Unmapped project key | **Hard miss.** A payload that names a project you did not map is never routed via the prefix — that would be exactly the guess this layer exists to prevent |
+| `enabled: false` | Never matched, and not validated (it may point at a checkout this host does not have) |
+
+### Startup validation (fail-closed)
+
+A mapping file that exists must be correct, so these all **stop the process**
+before any file is created:
+
+* `repo.path` missing, not a directory, or not a git work tree;
+* `repo.path` not matching `repo.remote` — compared against `.git/config`, so a
+  typo cannot route work into the wrong clone (leave `remote` empty to skip only
+  this check);
+* a relative path anywhere (it would depend on the caller's working directory);
+* `worktrees` inside `repo.path` or equal to it;
+* a duplicate key, or an `agent` name that is not a plain identifier;
+* any unknown JSON member (a typo in a field name is an error, not a no-op).
+
+Keys whose name starts with `_` are documentation and are ignored, which is how
+the example carries its explanations in a format without comments.
+
+A **missing** file is only a warning: phase 1 records deliveries without routing
+them. `config/projects.json` is gitignored (its paths are host-specific) while
+`config/projects.example.json` is committed.
+
+> **Not wired up yet.** Today this layer loads, validates and reports the table;
+> nothing dispatches to opencode. Turning a match into a session (worktree,
+> `POST /session`, the `task_session` registry) is the next step.
 
 ## Endpoints
 
@@ -397,7 +467,9 @@ Layout:
 | `internal/webhook` | Lenient payload model, payload schema report, the delivery pipeline, redaction |
 | `internal/dedupe` | TTL idempotency cache |
 | `internal/store` | Audit record, non-blocking queue, daily JSONL writer, human readable payload log |
+| `internal/projectmap` | YouTrack project → repository routing table: strict loader, canonical paths, fail-closed validation |
 | `internal/metrics` | Counters used by `/healthz` |
+| `config/projects.example.json` | Committed template for the routing table |
 | `scripts/smoke.sh` | The end-to-end check behind `make smoke` |
 
 `AGENTS.md` records the project invariants that contributors and coding agents
