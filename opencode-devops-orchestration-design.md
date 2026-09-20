@@ -157,6 +157,9 @@ opencode 不允许指定 `sessionID`，方案：
 4. **不要**按 title 搜索定位（不可靠，title 会被自动改写）；title 仅作辅助；
 5. 可选 `parentID` 建树（根=issue，子=步骤），但推荐**单 session 多轮次**（上下文连续、审计简单）。
 
+> ✅ **实测（2026-09-20，见安全文档 §5.6）**：`task_key` 可直接取 **`payload.id`**——YouTrack 侧 `issue.id` 就是可读 ID（`TEST-11`），
+> 不必先 REST 反查再拼 key，建 session 的 `title` 也能直接用。这砍掉了每条事件的一次 REST 往返。
+
 ## 9. 轮询 vs webhook（编排模型）
 
 - **opencode 不轮询任何 DevOps 系统**。原因：每 session 同时只允许一个 drain loop，轮询会占住执行循环、烧 token；人工审批等事件不可预测。
@@ -167,6 +170,24 @@ opencode 不允许指定 `sessionID`，方案：
   4. 末轮结束 → 回帖汇报。
 - 例外：短时只读查询可给 agent 配 MCP/tool 同步调用；「触发并等待外部长任务」应拆两轮。
 - 若某系统不支持 webhook，则由 **FlowHub 轮询该系统**，而非 opencode。
+
+### 9.1 触发规则的实测约束（2026-09-20）
+
+> 详细报文证据见安全文档 **§5.6**。下面每一条都直接约束 §9 的"一轮一事件"如何落地。
+
+| 约束 | 结论 |
+|---|---|
+| `task_key` | 直接用 `payload.id`（可读 ID），无需反查 |
+| 事件时间 | **只用 `timestamp`**；`updated` 实测落后一个事件，不能排序/做水位线 |
+| 评论触发 | 匹配 `comments[].text`（建议 `(?i)^\s*/opencode\b`）；**评论没有 `id`**，不能按 id 去重或引用某条评论；作者取 `comments[].author.login` |
+| 状态触发 | 遍历 `changedFields` 匹配 `value.name`（如 `"In Progress"`）；**不要用 `presentation`**（随语言变），也不要按索引/数量判断 |
+| 字段名重复 | 自定义字段会报两条（内部名 + 本地化名，如 `State` + `状态`），匹配要遍历全部条目 |
+| 多值字段 | `oldValue`/`value` 是**全量数组快照**，判断"新增了某个版本"必须自己做集合差 |
+| 开关/标记 | **不要用 issue tag**：加 tag 不产生任何事件（guard 跳过）。用自定义字段（单/多选）当开关 |
+| 作者白名单 | 操作人字段位置按事件类型不同（`reporter`/`updatedBy`/`comments[].author`/`attachments[].author`）；**`issueDeleted` 没有任何操作人字段**，需单独定义行为（建议只做项目白名单） |
+| 状态反查 | 未变更的字段在 payload 里完全缺席 → 需要"当前状态"时 REST 反查，但只需在真正要读状态的轮次做 |
+| 日期字段 | 值锚定在 **12:00 UTC**（UI 显示 24 日 ↔ `2026-09-24T12:00:00Z`）；"超期"判定要按项目时区取日期比较，不要直接比毫秒数 |
+| 历史缺口 | 实测遇到过"只收到删除、没收到创建"（接收端上线前的事件不会补发）→ §7 通道 C 的 REST 对账是必需项，registry 也要容忍"删除未知 issue" |
 
 ## 10. 回帖汇报
 
@@ -297,6 +318,9 @@ YouTrack / Gitea / Drone
 6. registry 与 opencode 是否同机？决定广告地址与网络策略。
 7. 事件回报交给插件，还是外部适配层订阅 SSE？
 8. 部署形态（裸进程/systemd/docker/k8s）？是否需独立 data 目录/固定端口。
+   - ✅ **2026-09-20 现状**：裸进程跑在本机 Mac，绑 **LAN 地址** `192.168.8.135:8080`（WG 在路由器上，路由器 DNAT 到 Mac；Mac 看到的对端恒为 `10.1.0.1`）。
+     容器化时需显式确认通配绑定（`FLOWHUB_ALLOW_WILDCARD_LISTEN=1`），并把端口只发布到 loopback；客户端是笔记本时建议改用 SSH 反隧道（安全文档 §8.5）。
+   - 独立 data 目录 + 固定端口：接收端已支持（`FLOWHUB_DATA_DIR` / `FLOWHUB_ADDR`），审计与报文日志按天落盘。
 
 ## 18. 参考资料
 

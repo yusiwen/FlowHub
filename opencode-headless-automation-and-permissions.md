@@ -585,3 +585,5 @@ curl -s "$BASE/session/$SID/message" | python3 -m json.tool | tail -40
 - 本地 OpenAPI spec：`GET http://localhost:4096/doc`（1.18.31 实测 162 paths）
 - 服务端日志：`~/.local/share/opencode/log/opencode.log`
 - 姊妹文档：`opencode-devops-orchestration-design.md`（设计文档，本文为其补充与校正）
+- YouTrack 侧真实报文的实测结论：`youtrack-webhook-and-flowhub-security.md` **§5.6**（2026-09-20，13 条真实投递）
+  —— 本文不涉及 payload 细节，phase 2 实现触发规则时以那份实测为准

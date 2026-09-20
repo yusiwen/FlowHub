@@ -8,6 +8,10 @@
 > - [`opencode-headless-automation-and-permissions.md`](./opencode-headless-automation-permissions.md) —— opencode serve API 与权限机制实测（本文 §9.4、§11 依赖其结论）
 >
 > 标记约定：**✅ 实测** ｜ **📄 官方文档** ｜ **🔬 源码级**（读代码得出，未在运行实例上复现） ｜ **❓ 未验证/待确认**
+>
+> **本轮实测（2026-09-20）**：自建 YouTrack（app 1.0.5）→ nginx → 路由器 DNAT → 本机 FlowHub 接收端跑通真实链路，
+> 收到 **13 条投递（12 accepted + 1 因来源白名单尚未配好被拒）**。逐条报文与校验结果见 **§5.6**；
+> §0、§5.2、§5.3、§5.5、§13 已就地标注实测结论（保留原有 🔬/📄 判断，另加 ✅ 实测结果与差异说明）。
 
 ---
 
@@ -19,10 +23,12 @@
 | 2 | 认证强度如何？ | **只有共享密钥放在一个可配置 header 里**，无 HMAC 签名、无投递 ID、无序号 🔬 |
 | 3 | 能收到哪些事件？ | 11 类：issue create/update/delete、comment add/update/delete、work item add/update/delete、attachment add/delete（另有 All Events 兜底）📄✅ |
 | 4 | 最大坑是什么？ | ① app 内置 SSRF 校验**拒绝私有 IP 字面量**（192.168.x/10.x/172.16-31.x/169.254.x）→ 必须走域名 🔬；② 传到线上的 token **可能是字面量 `secret`**（源码注释自认）🔬❓；③ 发布版是**同步 postSync**，接收端慢会拖慢 YouTrack（每 URL 5s 超时、无重试）🔬 |
-| 5 | payload 能直接用吗？ | **不能照文档写死**：发布版 base 里没有 `numberInProject`、`project` 里是 `key` 不是 `id`、用户对象没有 `id`、也没有可读 issue key（`PROJ-123`）→ 收到后一律 REST 反查 🔬/📄 |
+| 5 | payload 能直接用吗？ | **不能照文档写死**：发布版 base 里没有 `numberInProject`、`project` 里是 `key` 不是 `id`、用户对象没有 `id`（这三条 ✅ 实测已确认，源码判断正确）；但**可读 issue key 是有的**——`id` 本身就是 `TEST-11`（✅ 实测，**与源码判断相反**），所以 `task_key` 可直接取用、无需为拼 key 反查；自定义字段的当前值仍需 REST 反查 🔬/📄/✅（详见 §5.6.1） |
 | 6 | 公网入口怎么防？ | 自建 YouTrack → nginx 只需 allowlist 你自己的 YouTrack 主机 IP + 只放一个 location + POST only + 限速 ✅（方案已定稿，见 §8） |
 | 7 | 真正的风险是什么？ | **提示注入 → RCE**：任何能写 issue 正文/评论的人，其文本都会成为 opencode 的 prompt，而 opencode 有 `bash`。防线在 opencode 的 agent 权限 + 进程/文件隔离（见 §9.4、§11），**不在 nginx** |
 | 8 | 签名能不能做？ | 用官方 app 不能；改用**自定义 workflow 规则**可以（HMAC），还能顺便绕过 §4.1 的私网拦截直连 WG IP —— 代价是逻辑散在 YouTrack 侧 JS 里 ❓ |
+| 9 | 加 tag 能触发吗？ | **不能**。tag 不是自定义字段、不进 `changedFields`，`issueUpdated` 的 guard 因此不通过 → **一个事件都不发**（✅ 实测）。要"打标记驱动"请改用自定义字段（单/多选），或走 §7.2 / 通道 C（详见 §5.6.9） |
+| 10 | 收到的事件能直接拿来排序/算延迟吗？ | **只能信 `timestamp`**。`created`/`updated` 是 issue 实体字段，语义各不相同（`updated` 实测**永远落后一个事件**）→ 排序、水位线、延迟统计一律用 `timestamp`（✅ 实测，详见 §5.6.7） |
 
 ---
 
@@ -218,25 +224,31 @@
 
 ### 5.2 与官方文档的出入（🔬 源码 vs 📄 文档）
 
-| 字段 | 发布版源码实际 | 官方文档写的 | 影响 |
-|---|---|---|---|
-| `project` | `{key, name, shortName}` | `{id, name, shortName}` | 靠 `project.key`/`shortName`，别等 `id` |
-| `numberInProject` | **不存在** | 有 | 无法拼出 `PROJ-123`，必须 REST 反查 |
-| 用户对象 | `{login, fullName, email}` | 多一个 `id` | 用 `login` 做身份判断 |
-| 可读 issue key | **没有**（`id` 形如 `2-123`） | 也没有 | 见 §5.5 |
+| 字段 | 发布版源码实际 | 官方文档写的 | 影响 | 实测（§5.6.1） |
+|---|---|---|---|---|
+| `project` | `{key, name, shortName}` | `{id, name, shortName}` | 靠 `project.key`/`shortName`，别等 `id` | ✅ 源码对：实测无 `id` |
+| `numberInProject` | **不存在** | 有 | 无法拼出 `PROJ-123`，必须 REST 反查 | ✅ 源码对：12 条已解析报文均无此字段 |
+| 用户对象 | `{login, fullName, email}` | 多一个 `id` | 用 `login` 做身份判断 | ✅ 源码对：无 `id` |
+| 可读 issue key | **没有**（`id` 形如 `2-123`） | 也没有 | 见 §5.5 | ❌ **源码判断不成立**：实测 `id` 就是可读 ID（`TEST-11`），无需为拼 key 反查 |
 
 > 结论：**不要照文档写死 Go struct**。要么用宽松解析（未知字段忽略、缺失字段容忍），要么（推荐）收到后用 REST 反查权威状态。
+> 实测修正：**"一律反查"过头了**——`task_key` 可直接用 `payload.id`；需要反查的是**当前自定义字段值**（State/Assignee/Priority/估时/版本…），因为未变更的字段在 payload 里完全缺席（§5.6.10）。
 
 ### 5.3 各事件附加字段
 
-| event | 附加字段 |
-|---|---|
-| `issueCreated` | `description`、`created`(ms)、`reporter`(用户对象) |
-| `issueUpdated` | `description`、`updated`(ms)、`updatedBy`(用户对象)、`changedFields[]` |
-| `issueDeleted` | `description` |
-| `commentAdded` / `commentUpdated` / `commentDeleted` | `comments[]`：`{id, text, textPreview, created, updated, author}` |
-| `workItemAdded` / `Updated` / `Deleted` | `workItems[]`：`{id, date, duration, description, created, updated, author, type{id,name}}` |
-| `issueAttachmentAdded` / `issueAttachmentDeleted` | `attachments[]`：`{name, mimeType, size, created, author}` |
+| event | 附加字段 | 实测（§5.6） |
+|---|---|---|
+| `issueCreated` | `description`、`created`(ms)、`reporter`(用户对象) | ✅ 完全一致（8 个 key） |
+| `issueUpdated` | `description`、`updated`(ms)、`updatedBy`(用户对象)、`changedFields[]` | ✅ 一致（9 个 key） |
+| `issueDeleted` | `description` | ✅ 一致（6 个 key）；⚠️ **没有任何操作人字段** |
+| `commentAdded` / `commentUpdated` / `commentDeleted` | `comments[]`：`{id, text, textPreview, created, updated, author}` | ❌ **实测只有 `{text, created, updated, author}`——无 `id`、无 `textPreview`**；且该事件无 `updatedBy`，操作人只能取 `comments[].author.login` |
+| `workItemAdded` / `Updated` / `Deleted` | `workItems[]`：`{id, date, duration, description, created, updated, author, type{id,name}}` | ⏳ 尚未触发 |
+| `issueAttachmentAdded` / `issueAttachmentDeleted` | `attachments[]`：`{name, mimeType, size, created, author}` | ✅ 完全一致；同样无附件 `id`、无下载地址，无 `updatedBy`（操作人取 `attachments[].author.login`） |
+
+> **操作人字段的位置按事件类型不同**（实测，见 §5.6.8）：
+> `issueCreated`→`reporter`；`issueUpdated`→`updatedBy`；`comment*`→`comments[].author`；
+> `issueAttachment*`→`attachments[].author`；**`issueDeleted`→无**。
+> 因此 phase 2 的作者白名单不能统一取一个字段，且必须单独定义 `issueDeleted` 的行为（否则会被"作者不在白名单"静默丢弃）。
 
 JSON 示例（`issueUpdated`）：
 
@@ -276,10 +288,18 @@ JSON 示例（`commentAdded`）：
 序列化逻辑见 `workflow-field-changes.js`：字符串/数字/布尔原样；用户对象转 `{login, fullName, email}`；枚举/State/Priority 转 `{name, presentation}`；日期转毫秒数；`Period`（估时类字段）转 `{minutes, presentation}`；多值字段（tags/versions）转数组；其他对象尽力抽 `{id, name, presentation}`，最后兜底为字符串或 `null`。
 
 → Go 侧请用 `json.RawMessage` / `any` 接收，**不要假定是 string**。
+> ✅ 实测已集齐**六种形态**（枚举对象、纯字符串、用户对象、Period、裸毫秒数、数组），详见 §5.6.2；
+> 另实测三种"空值"表示并存（`null` / `""` / `[]`）与两个文档没写的现象（字段名重复、多值字段是全量快照），见 §5.6.3～§5.6.5。
 
 ### 5.5 缺失信息清单（必须 REST 反查的理由）
 
 payload 里**没有**：可读 issue key（`PROJ-123`）、custom fields 的当前值快照（只有变化的那几个）、State/Assignee 等字段全貌、tags、links、parent、watchers、附件下载地址。
+
+> ✅ 实测修正（§5.6.1、§5.6.10）：
+> - **可读 issue key 是有的**——`id` 本身就是 `TEST-11`，所以"拼不出 `PROJ-123`"与"必须反查才能拼 key"两条不成立；`task_key` 可直接取 `payload.id`。
+> - **未变更的字段确实完全缺席**（用 UI 截图逐字段对照确认：优先级/类型/子系统/修复版本/受影响的版本/实际用时/面板 在 payload 里一个都没有），
+>   所以需要**当前状态**时仍必须 REST 反查——但只需在"确实要读状态"的那些轮次做，不必每条事件都查。
+> - `tags` 不在 payload 里，而且**标签变更根本不触发事件**（§5.6.9）。
 
 → 统一做法：收到 webhook 后用 `id` 拉一次权威状态：
 
@@ -288,7 +308,155 @@ curl -s -H "Authorization: Bearer perm:<b64user>.<b64desc>.<secret>" \
   "https://pm.yusiwen.cn/api/issues/2-123?fields=id,idReadable,summary,description,project(shortName),customFields(name,value(name,presentation,login)),comments(id,text,author(login)),tags(name)"
 ```
 
-❓待确认：workflow API 里 `issue.id` 到底是数据库 ID（`2-123`）还是可读 ID（`SP-123`）—— 官方 app 文档示例给的是 `2-123` 形态，但 REST 的 `{issueID}` 两种形式都接受，所以**影响不大**；第一次收到真实 payload 时看一眼即可确定。
+✅ **已实测确定（2026-09-20）**：workflow API 的 `issue.id` 是**可读 ID**（实测值 `TEST-11`、`TEST-12`），不是数据库 ID。因此 payload 自带可读 key，`task_key` 直接可用；REST 两种形式都接受这一点依然成立。
+
+---
+
+### 5.6 实测记录（2026-09-20，首次真实投递）
+
+> **环境**：自建 YouTrack（Free edition，app **Webhook Triggers 1.0.5**）→ aliyun nginx → 家中路由器 DNAT（WG 网段 → LAN）→ 本机 FlowHub 接收端（绑 `192.168.8.135:8080`）。
+> **样本**：13 条投递，其中 12 条 accepted、1 条因来源白名单尚未配好被拒（`source_not_allowed`，该条未读取 body）。
+> **落盘**：`data/payload-2026-09-20.log`（人读详情）、`data/webhook-2026-09-20.jsonl`（机器可读全量）。
+> **项目**：`TEST`，issue 可读 ID 形如 `TEST-12`；事件覆盖 5/11 类。
+> **接收端耗时**：每条 `handled_ms = 0`（<1ms）；`clock_skew` 56～170ms；body 最大 556 字节。
+> **来源**：Mac 看到的对端恒为 `10.1.0.1`（路由器转发 WG→LAN 的地址）；nginx 只加了 `X-Forwarded-Proto`，未设 `X-Real-IP`/`X-Forwarded-For`。
+
+#### 5.6.1 关键差异：两处判断被推翻
+
+| 判断点 | 原判断 | 实测结果 | 结论 |
+|---|---|---|---|
+| **可读 issue key** | §5.2 源码级：`id` 形如 `2-123`，**payload 里没有可读 key**，必须 REST 反查 | `id` = `TEST-11` / `TEST-12`，**就是可读 ID** | ❌ 源码判断不成立 → `task_key` 直接用 `payload.id`，session `title` 也能直接用 |
+| **`comments[]` 字段** | §5.3 官方文档：`{id, text, textPreview, created, updated, author}` | 实际 `{text, created, updated, author}`，**无 `id`、无 `textPreview`** | ❌ 文档不成立 → 评论 id 不能做幂等键/引用；触发词只能匹配 `text` |
+| `numberInProject` | §5.2 源码级：不存在 | 12 条已解析报文全部无此字段 | ✅ 源码对 |
+| `project` 字段 | §5.2 源码级：`{key,name,shortName}`，无 `id` | 一致 | ✅ 源码对 |
+| 用户对象 | §5.2 源码级：`{login,fullName,email}`，无 `id` | 一致（`reporter`/`updatedBy`/assignee/author 均是这三个字段） | ✅ 源码对 |
+| `issueDeleted` 附加字段 | §5.3：`description` | 一致（共 6 个 key）；**另无任何操作人字段** | ✅ 文档对，但补充了操作人缺口 |
+| `issueAttachmentAdded` 附加字段 | §5.3：`{name,mimeType,size,created,author}` | 完全一致 | ✅ 文档对 |
+| token 是否为字面量 `secret` | §4.2 源码注释：**可能**是字面量 | 13 条全部是真 token（`len=64`，与配置的 64 位 hex 指纹一致） | ✅ **本环境不成立**，锁 2 是真实边界 |
+
+#### 5.6.2 `changedFields[].value` 的六种形态（§5.4 全部验证）
+
+| 形态 | 来源字段（实测名） | 实测值 |
+|---|---|---|
+| `object{name, presentation}` | State / 状态 | `{"name":"In Progress","presentation":"进行中"}` |
+| `string` | description | `"test item"` |
+| `object{email, fullName, login}` | Assignee / 被指派者 | `{"login":"yusiwen","fullName":"Siwen Yu",...}` |
+| `object{minutes, presentation}` | 预估（Period） | `{"minutes":60,"presentation":"PT1H"}` |
+| `number`（epoch 毫秒） | Due Date / 截止日期 | `1790251200000` |
+| `array[object{name,presentation}]` | 版本（多值字段） | `[{"name":"v1",...},{"name":"v2",...}]` |
+
+#### 5.6.3 "空值"有三种表示并存
+
+| 表示 | 实测出现于 | 对应类型 |
+|---|---|---|
+| `null` | Assignee、Due Date、预估（未设置时） | 对象 / 日期 / Period |
+| `""` | description（原值为空文本） | 字符串 |
+| `[]` | 版本（原值为空数组） | 多值 |
+
+→ 解析必须三种都容忍（Go 侧用 `json.RawMessage` 天然免疫）。
+
+#### 5.6.4 多值字段是"全量快照"，不是增量
+
+实测"先加 v1、再加 v2"两次变更：
+
+```json
+// 第 1 次
+{"name":"版本","oldValue":[],"value":[{"name":"v1","presentation":"v1"}]}
+// 第 2 次
+{"name":"版本","oldValue":[{"name":"v1","presentation":"v1"}],
+              "value":[{"name":"v1","presentation":"v1"},{"name":"v2","presentation":"v2"}]}
+```
+
+`oldValue` / `value` 都是**完整的数组快照**，app **不会**告诉你"加了哪个元素"。
+→ 判断"新增了 v2"必须自己做集合差：`added = set(value) - set(oldValue)`。
+
+#### 5.6.5 自定义字段会重复报两条（内部名 + 本地化名）
+
+| 字段（类型） | `changedFields` 条目 | 原因 |
+|---|---|---|
+| State（内置） | `State` + `状态` | 内部名 ≠ 本地化名 → 两条 |
+| Assignee（内置） | `Assignee` + `被指派者` | 同上 |
+| Due Date（内置） | `Due Date` + `截止日期` | 同上 |
+| 预估（自建，中文命名） | 仅 `预估` | 两个名字相同 → 一条 |
+| 版本（自建，中文命名） | 仅 `版本` | 同上 |
+| description（原生属性） | 仅 `description` | 原生属性无本地化名 |
+
+→ phase 2 匹配时：**遍历全部条目**（不要按索引/数量判断）；名字匹配容忍两种写法，或只认 `value.name`。
+
+#### 5.6.6 `presentation` 的语义随字段类型变（不等于 UI 文本）
+
+UI 截图逐字段对照：
+
+| 字段 | UI 显示 | payload | 是否一致 |
+|---|---|---|---|
+| 状态 | `进行中` | `presentation: "进行中"` | ✅ |
+| 预估 | **`1时`** | `presentation: "PT1H"` | ❌ **不是 UI 文本**（ISO-8601 时长） |
+| 版本 | `v1, v2` | `"v1"` / `"v2"` | ✅ |
+
+→ **判定用 `name`（稳定内部值），展示自己格式化**；不要把 `presentation` 当展示层字段。
+
+#### 5.6.7 时间戳语义（phase 2 只应使用 `timestamp`）
+
+| 字段 | 实测含义 | 与事件时间的关系 |
+|---|---|---|
+| `timestamp` | **事件时间**（app 处理时刻） | 基准；与接收时刻差 56～170ms |
+| `created`（issueCreated） | issue 创建时间 | **早 14.5～15.3 秒**（原因未定，疑为草稿→reported 的间隔） |
+| `updated`（issueUpdated） | **上一次**修改时间（提交前快照） | **落后一个事件**（实测 7 次：比上一条事件晚 135～362ms） |
+| `comments[].created` | 评论创建时间 | 早 26ms |
+| `attachments[].created` | 附件添加时间 | 早 17ms |
+
+→ **排序、水位线、延迟统计一律用 `timestamp`**；`updated` 天生是旧一条的值，拿它做游标必然错位一个事件。
+
+#### 5.6.8 操作人字段按事件类型不同
+
+| 事件 | 操作人来自 |
+|---|---|
+| `issueCreated` | `reporter` |
+| `issueUpdated` | `updatedBy` |
+| `commentAdded` | `comments[].author` |
+| `issueAttachmentAdded` | `attachments[].author` |
+| **`issueDeleted`** | **无**（报文里没有任何带作者的字段） |
+
+→ 作者白名单按事件类型取字段；`issueDeleted` 必须单独定义行为（建议只做项目白名单，不做作者校验）。
+
+#### 5.6.9 不触发事件的操作：加 tag
+
+实测：给 issue 加 tag 之后 FlowHub **没有收到任何投递**（审计文件与 `/healthz` 计数器均无变化）；
+而同一 issue 前后两分钟内的自定义字段变更（Due Date）正常秒到 → 投递链路健康，**是 guard 跳过了**。
+
+推断原因：tag 不是自定义字段、不进 `changedFields`，而 `issueUpdated` 的 guard 要求 `changedFields` 非空 → 不发事件。
+（§5.4 里"多值字段（tags/versions）转数组"指的是**自定义字段的多值类型**，不是 issue 的标签集合。）
+
+→ 想用"打标记驱动流程"，改用自定义字段（单/多选），或走 §7.2 自定义 workflow / 通道 C 轮询。
+> 最终确认方式：看 YouTrack 侧 app 日志（§6.2）——有 `Sending…` 说明是投递失败；完全没有说明是 guard 跳过。
+
+#### 5.6.10 未变更的字段完全缺席（UI 对照）
+
+同一时刻 UI 状态与 payload 对照（TEST-12）：
+
+| UI 里有 | payload 里有吗 |
+|---|---|
+| 状态、被指派者、描述、评论、截止日期、预估、版本 | ✅ 出现过（都是"本次被改动"的字段） |
+| 优先级、类型、子系统、修复版本、受影响的版本、在以下内部版本中修复、实际用时、面板 | ❌ **完全没有** |
+
+→ 需要"当前状态"时必须 REST 反查；但**只需在真正要读状态的轮次做**，不必每条事件都查。
+
+#### 5.6.11 仍未见过的事件（5/11 已见）
+
+未见：`commentUpdated`、`commentDeleted`、`workItemAdded`、`workItemUpdated`、`workItemDeleted`、`issueAttachmentDeleted`。
+按 §9.3 的映射这些只入湖、不唤起 agent，因此**不阻塞 phase 2 的触发设计**。
+
+#### 5.6.12 对 phase 2 的直接结论
+
+1. `task_key = payload.id`（可读 ID）；session `title` 同样直接用；
+2. 评论触发：`(?i)^\s*/opencode\b` 匹配 `comments[].text`，作者取 `comments[].author.login`（**没有评论 id 可用**）；
+3. 状态触发：遍历 `changedFields` 匹配 `value.name == "In Progress"`（**不要用 `presentation`**，也不要按索引/数量判断）；
+4. 多值字段触发：必须做集合差，不能只看"字段出现过"；
+5. 开关/标记**不要用 tag**（不触发），用自定义字段；
+6. 事件时间、排序、延迟一律用 `timestamp`；
+7. `issueDeleted` 不做作者校验；
+8. 日期锚点实测：UI 显示 **24 9月 2026**，payload 为 `1790251200000` = `2026-09-24T12:00:00Z`（+08 的 20:00）
+   → "纯日期"值锚定在中午 UTC，**不要直接与 `now` 比较毫秒数**，要按项目时区取日期并按天比较。
 
 ---
 
@@ -686,16 +854,30 @@ nginx 单 location + IP allowlist + POST only + body/限速；FlowHub 绑 WG IP 
 
 ## 13. 未验证 / 待确认清单
 
-1. ❓ **header token 的真实值**：到底是配置的 token 还是字面量 `secret`（§4.2）—— 第一次投递看日志即可确定。**这一条决定 §9.1 第二把锁是否有效。**
-2. ❓ **payload 里是否真的没有 `numberInProject`**：以发布版源码判断为"没有"（🔬），第一次真实投递复核。
-3. ❓ **workflow API 的 `issue.id` 是数据库 ID 还是可读 ID**（REST 两种都接受，影响很小）。
+> **2026-09-20 实测后状态**：第 1、2、3、5、6、7 条已解决（见 §5.6）；新增第 11～14 条。原有编号保留，便于对照历史结论。
+
+1. ✅ **已解决（2026-09-20）header token 的真实值**：13 条投递全部是**真 token**（`len=64`，与配置的 64 位 hex 指纹一致，非字面量 `secret`）。
+   → **§9.1 第二把锁有效**，不必按"token 可能是公开常量"降级处理。（若将来换 YouTrack 版本，值得重测。）
+2. ✅ **已解决 `numberInProject`**：12 条已解析报文**均无**此字段（源码判断正确，官方文档错误）。
+3. ✅ **已解决 `issue.id` 形式**：**可读 ID**（实测 `TEST-11`/`TEST-12`），与源码判断相反；`task_key` 可直接用 `payload.id`。
 4. ❓ **自定义 workflow 的 `http` 调用能否直连私网/WG IP**（§7.2）—— 若能，可省掉公网入口。
-5. ❓ **Mac 是否直接跑 WG 客户端**（§8.2 第 3 点）—— 决定 nginx 的 `proxy_pass` 目标与路由配置。
-6. ❓ **nginx 看到的真实来源 IP**（同机/内网/hairpin）—— 首次投递后据此收窄白名单。
-7. ❓ **event 顺序保证**：同一 issue 的连续变更，app 顺序发送同一 URL（🔬 forEach），但不同事件类型是不同 workflow 规则，**并发投递的顺序无保证**；FlowHub 不应依赖顺序（按 `timestamp` + 幂等处理）。
+5. ✅ **已解决（2026-09-20）Mac 不跑 WG 客户端**：WG 在 LAN 网关（路由器）上，采用"静态路由 + DNAT 到 Mac 的 LAN IP"。
+   → FlowHub 绑 **Mac 的 LAN 地址**（`192.168.8.135:8080`），**不是** `0.0.0.0`（通配需显式确认，见 §8.2）；客户端是笔记本时建议改用 SSH 反隧道（§8.5）。
+6. ✅ **已解决 nginx 看到的真实来源**：Mac 侧看到的对端恒为 `10.1.0.1`（路由器转发 WG→LAN 的地址），
+   `X-Real-IP`/`X-Forwarded-For` **未设置**（日志里为空），nginx 只加了 `X-Forwarded-Proto: https`。
+   → `FLOWHUB_ALLOWED_SOURCES` 必须填 **`10.1.0.1`**（不是 YouTrack 的公网 IP）；建议补上两个 `proxy_set_header` 以便同时看到两级来源。
+7. ✅ **已解决（部分）事件顺序**：仍不应依赖顺序，但拿到了可直接用的替代锚点——
+   `timestamp` 是唯一可信的事件时间；**`updated` 实测落后一个事件**（§5.6.7），用它排序必然错位。
+   §2.3 的 guard 语义也已验证：**评论不触发 `issueUpdated`**。
 8. ❓ **YouTrack 升级到 2026.2+ 的时间点**（决定阻塞问题何时消失、是否需要 shim 长期保留）。
 9. ❓ **触发语义最终形态**：issue 创建即触发？State 变成某值触发？还是评论 `/opencode` 触发？（当前建议见 §9.3，需你确认业务规则）
 10. ❓ **是否验收 `python`/构建类命令自动放行**（§9.4 裁决表的白名单内容需要按你实际仓库的构建/测试命令细化）。
+11. ❓ **"加 tag 不触发事件"的最终确认**：实测无任何投递（§5.6.9），但严格区分"guard 跳过"与"投递失败"仍需看 YouTrack 侧 app 日志（§6.2）。
+12. ❓ **`created`（issueCreated）比事件时间早 14.5～15.3 秒的原因**：疑为"草稿创建 → becomesReported"的间隔，也可能是投递延迟；
+    验证方法：新建 issue 并在数秒内提交，观察差值是否缩小。
+13. ❓ **剩余 6 类事件的实际报文**：`commentUpdated`、`commentDeleted`、`workItem*`、`issueAttachmentDeleted`（只入湖，不阻塞触发设计）。
+14. ❓ **日期类字段的锚点是否恒为 12:00 UTC**：目前只有一条样本（Due Date → `2026-09-24T12:00:00Z`，UI 显示 24 日）。
+    需要再设一次不同日期确认；这决定 phase 2 的"超期"判定实现。
 
 ---
 

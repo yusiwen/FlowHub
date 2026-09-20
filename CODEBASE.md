@@ -122,15 +122,40 @@ Two gotchas worth remembering:
   "filesystem". `scripts/smoke.sh` detects the implementation instead of relying
   on `stat -f '%Lp' || stat -c '%a'`, which silently returns the wrong value.
 
+## Verified payload facts (2026-09-20, 13 real deliveries)
+
+Measured against the live YouTrack instance; full evidence and per-delivery samples
+in `youtrack-webhook-and-flowhub-security.md` **§5.6**. These are the facts phase 2
+must build on — do not re-derive them from the released app's source, which was
+wrong about `issue.id`.
+
+| Fact | Consequence for code |
+| --- | --- |
+| `payload.id` **is** the readable issue key (`TEST-11`) | `task_key = payload.id`; no REST round-trip needed to build it |
+| `numberInProject`, `project.id`, user `id` do **not** exist | never wait for them |
+| `comments[]` has **no `id` and no `textPreview`** | comment ids cannot be used as idempotency keys; match the trigger against `text` only |
+| `issueDeleted` carries **no actor field** | the author allowlist cannot be applied to deletions |
+| Adding a **tag fires no event at all** | use a custom field (single/multi-select) as a switch, not a tag |
+| `timestamp` is the only usable event time | `updated` lags one event; `created` is ~15 s early; never sort or watermark on them |
+| `changedFields[].value` has **six shapes** (enum object, string, user object, Period, epoch-ms number, array) | keep `json.RawMessage`; never assume `string` |
+| Custom fields appear **twice** (`State` + `状态`) when the internal and localized names differ | iterate all entries; never index or count |
+| Multi-value fields are **full snapshots**, not deltas | set-difference to detect what was added |
+| `presentation` is not the UI string (Period gives `PT1H`) | decide with `value.name`, format for display yourself |
+| Unchanged fields are **entirely absent** | REST-query the state only when a round actually needs it |
+| Date values are anchored at **12:00 UTC** | compare dates in the project timezone, not raw milliseconds |
+
 ## Open items carried from the design documents
 
-These are still unanswered; the receiver is built to answer them from its audit
-log on the first real delivery.
+These were answered by the first real deliveries (2026-09-20); see the table above
+and `youtrack-webhook-and-flowhub-security.md` §5.6.
 
-1. Is the header token the configured value or the literal `secret`? (§4.2)
-2. Does the payload really lack `numberInProject`? (§5.2)
-3. Is `issue.id` the database form (`2-123`) or the readable form? (§13.3)
-4. What is the real source IP nginx presents? (§13.6)
+1. ~~Is the header token the configured value or the literal `secret`?~~ → the real token (13/13 deliveries). Lock 2 is a genuine boundary.
+2. ~~Does the payload really lack `numberInProject`?~~ → confirmed absent.
+3. ~~Is `issue.id` the database form or the readable form?~~ → **readable** (`TEST-11`), contradicting the released app's source.
+4. ~~What is the real source IP nginx presents?~~ → `10.1.0.1` (the router forwarding WG→LAN); `X-Real-IP`/`X-Forwarded-For` are not set by nginx.
+
+Still open: the 6 unseen event types, the `created` ~15 s offset, the date anchor
+with a second sample, and whether a tag change is truly skipped (needs the app log).
 
 ## Next steps (not started)
 
@@ -138,6 +163,8 @@ log on the first real delivery.
    subscription to `/event`, `devops` agent, permission arbiter (see
    `opencode-headless-automation-and-permissions.md` §5 and §6).
 2. Phase 2: YouTrack trigger rules (author allowlist, `/opencode` trigger,
-   project allowlist) and comment reply-back.
+   project allowlist) and comment reply-back — build them on the verified payload
+   facts above and the measured constraints in
+   `opencode-devops-orchestration-design.md` §9.1.
 3. Phase 3: alerting, key rotation, budget circuit breaker, optional HMAC signing
    through a custom workflow rule, aliyun always-on shim.
