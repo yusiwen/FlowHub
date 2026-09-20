@@ -74,6 +74,7 @@ internal/config/    Environment parsing, validation, masked reporting
 internal/logging/   Application logger: stderr tee + size-rotated log file
 internal/webhook/   Lenient payload model, payload schema report, delivery pipeline
 internal/projectmap/ YouTrack project -> repository routing table (~/.config/flowhub/config.json)
+internal/opencode/  opencode client, permission arbiter, one-turn runner (make test-live)
 internal/dedupe/    TTL idempotency cache
 internal/store/     Audit record, non-blocking queue, JSONL audit, payload log
 internal/metrics/   Counters behind /healthz
@@ -129,6 +130,17 @@ documents. The rules below are load-bearing; do not relax them casually.
    repository" fallback: silently editing the wrong repository is the worst
    failure this project can have. This layer only validates and reports today —
    dispatching to opencode comes next.
+8. **An unattended turn needs two permission layers.** `internal/opencode` passes
+   a session ruleset at session creation (deny `edit`, `external_directory`,
+   `webfetch`, `websearch`; `bash: ask`) and then answers the `ask` requests with
+   the arbiter. The arbiter is an allowlist over shell segments, and it must keep
+   rejecting absolute paths and `~`: the ruleset's `external_directory` does not
+   cover a command run inside a shell. Never reply `always` by default, never
+   widen the allowlist to "make the agent work", and remember that allowed build
+   and test commands are arbitrary code execution — the per-task worktree is the
+   real containment. Completion detection needs all three signals (new completed
+   assistant message, status not busy, no pending permission): status lags, and a
+   pending permission keeps a session busy.
 
 ## Code Conventions
 

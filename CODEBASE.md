@@ -29,6 +29,7 @@ is tested, and only records deliveries. It does **not** talk to opencode yet.
 | `internal/store/jsonl.go` | Daily rotating append-only JSONL writer (`webhook-YYYY-MM-DD.jsonl`, `0600`) |
 | `internal/store/detail.go` | Human readable per-delivery payload log (`payload-YYYY-MM-DD.log`, `0600`) |
 | `internal/projectmap/` | YouTrack project → repository routing table (`projectmap.go` loader/matching, `validate.go` filesystem+remote checks, `strip.go` `_`-prefixed doc keys) |
+| `internal/opencode/` | opencode client (`client.go`, `types.go`), permission arbiter (`arbiter.go`) and the one-turn runner (`runner.go`) |
 | `internal/metrics/metrics.go` | Counters behind `/healthz` |
 | `README.md` | Operator-facing documentation: config table, log formats, pipeline, jq recipes, verification checklist |
 
@@ -80,6 +81,13 @@ clean; `gofmt -l .` reports nothing.
   when set), resolved to an absolute path with `~` expanded; the committed
   template is `config/config.example.json`. Nothing dispatches to opencode yet: this layer
   loads, validates and reports.
+* **opencode permissions are decided in two layers.** The session-level ruleset
+  (passed at session creation) denies edit/external_directory/webfetch/websearch
+  and sets `bash: ask`; the arbiter then answers those requests on an allowlist
+  over shell *segments*. Absolute paths and `~` are rejected, because the ruleset's
+  `external_directory` does not police a shell command. Rejections carry a reason so
+  the model can adapt. The live check is `make test-live` (skipped unless
+  `OPENCODE_LIVE=1`).
 * **Two-tier validation.** `config.Load` → `validate()` rejects syntactic
   mistakes (unparsable values, an address without a port). `Config.Problems()`
   is the security gate checked in `main` before any file is touched: today it

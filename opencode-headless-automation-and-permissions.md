@@ -303,6 +303,18 @@ evaluate(permission, pattern, ...rulesets):
 
 注意 `always` 字段：它是「答复 `always` 时会被记住的模式」，由 bash 命令的 arity 表推导出来（`whoami` → `whoami *`，`uname -s` → `uname *`）。
 
+> ✅ **补充实测（2026-09-20，opencode 1.18.31）**：**一条复合命令会作为单个权限请求到达**——
+> `patterns` 每段一项，而 `metadata.command` 是完整命令行。实测样例：
+> `patterns: ["git status --short","echo \"---\"","git log --oneline -3","echo \"---\"","git branch --show-current"]`，
+> `metadata.command: "git status --short && echo \"---\" && git log --oneline -3 && …"`。
+> 两个直接结论：
+> 1. 裁决器必须判**整条命令**（按 `&&`/`||`/`;`/`|` 拆段后逐段判定）。只看 `patterns[0]` 会漏掉后半段——
+>    而 `patterns` 与 `command` 理论上也可能不一致，两者都要校验。
+> 2. `reject` 带 `message` 时模型能读到反馈并**换一种写法**，实测有效（`reject` 不会挂死 run，可放心作为无人值守默认动作）。
+>
+> 另实测：`edit/external_directory/webfetch/websearch` 在会话级 ruleset 里设 `deny` 后，运行期**根本不会**产生权限请求
+> （工具直接消失）；只有 `bash: ask` 会产生请求。因此「会话 ruleset + 逐条裁决」两层是互补且不重复的。
+
 服务端日志（排障用，`~/.local/share/opencode/log/opencode.log`）：
 
 ```

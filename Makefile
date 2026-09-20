@@ -19,7 +19,7 @@ PLATFORM_LIST = \
 	linux-arm64 \
 	darwin-arm64
 
-.PHONY: default build run secrets test test-race test-repeat lint staticcheck \
+.PHONY: default build run secrets test test-race test-live test-repeat lint staticcheck \
 	fmt fmt-check smoke clean all releases
 
 default: build
@@ -52,6 +52,13 @@ test:
 # the Nix dev shell does not force off (see flake.nix).
 test-race:
 	CGO_ENABLED=1 go test -race ./... -count=1
+
+# Live integration check against a running `opencode serve` (default
+# http://127.0.0.1:4096). Skipped by the normal suite because it spends tokens and
+# creates real sessions. Point it at a repository to verify the routing table:
+#   OPENCODE_LIVE_DIR=/path/to/repo make test-live
+test-live:
+	OPENCODE_LIVE=1 go test -count=1 -timeout 5m -run TestLiveTask ./internal/opencode/
 
 # Repeat the suite in one process to catch leaked global state between runs.
 test-repeat:

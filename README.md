@@ -189,6 +189,62 @@ file — whatever the working directory was. The committed template is
 > nothing dispatches to opencode. Turning a match into a session (worktree,
 > `POST /session`, the `task_session` registry) is the next step.
 
+## opencode integration
+
+The receiver is being wired to a local `opencode serve` (default
+`http://127.0.0.1:4096`). `internal/opencode` holds the client and the runner that
+drives one unattended turn; the dispatcher that decides *when* to run one is the
+next step, so nothing in the delivery path calls opencode yet.
+
+```bash
+make test-live                                        # throwaway directory
+OPENCODE_LIVE_DIR=/path/to/repo make test-live        # read-only inspection of a real repository
+```
+
+Both are skipped by `make test` unless `OPENCODE_LIVE=1`, because a live run
+spends tokens and creates real sessions.
+
+### The turn lifecycle
+
+```
+POST /session?directory=<worktree>   session-level ruleset, agent, task key
+POST /session/{id}/prompt_async      204, then the model works
+  loop: GET /permission?directory=   answer what the ruleset chose to ask about
+        GET /session/status?         busy / idle
+        GET /session/{id}/message    a new assistant message with time.completed
+  -> final text, cost, tokens, and every permission decision
+```
+
+Completion needs all three signals: `status` alone lags after a turn ends, and a
+pending permission keeps a session `busy` — so "busy" never means "working" and
+"idle" never means "finished".
+
+### Permissions are decided in two layers
+
+1. **Session-level ruleset** (first line): denies `edit`, `external_directory`,
+   `webfetch` and `websearch` outright, which removes those tools entirely, and
+   sets `bash: ask`.
+2. **Arbiter** (second line): answers the `ask` requests, which would otherwise
+   hang the turn forever. It is an allowlist over shell *segments*:
+   * the command is split on `&&`, `||`, `;`, `|` and newlines, and **every**
+     segment must match an allow entry;
+   * redirection, command substitution and background execution are rejected;
+   * **paths outside the worktree are rejected** — `cat ~/.ssh/id_rsa`,
+     `tail -f /var/log/system.log`, `ls /Users/…`. The ruleset's
+     `external_directory` does not cover a shell command, so this is the check
+     that does;
+   * the request's own `patterns` must agree with its `metadata.command`;
+   * build and test commands are allowed because they are the agent's job — and
+     they are also arbitrary code execution, so the containment that matters is
+     the per-task worktree, not this list.
+   A rejection carries a reason, which opencode hands to the model as feedback, so
+   the model adapts instead of repeating the call.
+
+Measured on 2026-09-20 against opencode 1.18.31: a read-only turn finishes in
+about 6 seconds, and the model often submits a *compound* command
+(`git status && echo --- && git log -3 && git branch --show-current`) as a single
+permission request with one pattern per command.
+
 ## Endpoints
 
 | Endpoint | Behaviour |
@@ -446,6 +502,7 @@ make fmt-check    # fail if any Go file is not gofmt-clean
 make smoke        # end-to-end: real process, real HTTP, asserts the logs
 make secrets      # print a fresh FLOWHUB_HOOK_KEY / FLOWHUB_TOKEN pair
 make fuzz         # fuzz the webhook parser (FUZZTIME=30s)
+make test-live    # live turn against opencode (OPENCODE_LIVE=1, spends tokens)
 make all          # cross-compile linux-amd64, linux-arm64, darwin-arm64
 make releases     # cross-compile and produce .tar.gz archives
 ```
@@ -476,6 +533,7 @@ Layout:
 | `internal/dedupe` | TTL idempotency cache |
 | `internal/store` | Audit record, non-blocking queue, daily JSONL writer, human readable payload log |
 | `internal/projectmap` | YouTrack project → repository routing table: strict loader, canonical paths, fail-closed validation |
+| `internal/opencode` | opencode client, permission arbiter and the runner that drives one unattended turn |
 | `internal/metrics` | Counters used by `/healthz` |
 | `config/config.example.json` | Committed template for the routing table |
 | `scripts/smoke.sh` | The end-to-end check behind `make smoke` |
