@@ -1,0 +1,330 @@
+// Package worktree gives every task its own git worktree.
+//
+// Isolation is the point: an agent that edits code must not be able to touch
+// another task's checkout, and must never work in the shared clone. The design
+// documents put this in the core of the defence (one worktree per task, with the
+// permission arbiter as the only other layer), so a failure here is a failure of
+// the containment story, not a convenience bug.
+package worktree
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// DefaultBranchPrefix namespaces the branches FlowHub creates, so they are easy
+// to list and delete without touching a human's branches.
+const DefaultBranchPrefix = "flowhub/"
+
+// ignoreEntry is added to the worktree's own exclude file (not the repository's
+// .gitignore) so downloaded attachments and other task scratch never show up as
+// untracked files in the agent's `git status`.
+const ignoreEntry = ".flowhub/"
+
+// ScratchDir is where a task's non-repository files live, inside the worktree.
+const ScratchDir = ".flowhub"
+
+// gitTimeout bounds one git invocation. `git worktree add` on a large repository
+// can take a while, but it must never hang a worker forever.
+const gitTimeout = 2 * time.Minute
+
+// Options configures a Manager.
+type Options struct {
+	// Base is the directory that holds one subdirectory per task. It must be an
+	// absolute path outside any repository; Validate rejects anything else.
+	Base string
+	// BranchPrefix defaults to DefaultBranchPrefix.
+	BranchPrefix string
+	// Fetch runs `git fetch --prune origin` before creating a worktree, so the
+	// task starts from the newest default branch. Off by default: it needs
+	// network access and credentials, and a failure must not block a task.
+	Fetch bool
+}
+
+// Manager creates and removes task worktrees.
+type Manager struct {
+	opts Options
+	// run is the git runner, replaced in tests.
+	run func(ctx context.Context, dir string, args ...string) (string, error)
+}
+
+// Request describes one task's worktree.
+type Request struct {
+	// Repo is the canonical path of the shared clone.
+	Repo string
+	// TaskKey is the YouTrack issue ID, e.g. BEAP_BE-20.
+	TaskKey string
+	// DefaultBranch is the branch the task branches from, e.g. master. It must
+	// already exist in the clone: guessing one would silently base the task on
+	// the wrong code.
+	DefaultBranch string
+}
+
+// Worktree is a prepared checkout.
+type Worktree struct {
+	Path   string
+	Branch string
+	Repo   string
+	// Reused reports that the worktree already existed and was not created now.
+	Reused bool
+}
+
+// New builds a Manager.
+func New(opts Options) (*Manager, error) {
+	if strings.TrimSpace(opts.Base) == "" {
+		return nil, errors.New("worktree: Base is required")
+	}
+	if !filepath.IsAbs(opts.Base) {
+		return nil, fmt.Errorf("worktree: Base %q must be absolute", opts.Base)
+	}
+	if opts.BranchPrefix == "" {
+		opts.BranchPrefix = DefaultBranchPrefix
+	}
+	// Canonicalise the base once: opencode keys sessions by the literal directory
+	// string, so /tmp and /private/tmp must not both appear.
+	if resolved, err := filepath.EvalSymlinks(filepath.Dir(opts.Base)); err == nil {
+		opts.Base = filepath.Join(resolved, filepath.Base(opts.Base))
+	}
+	return &Manager{opts: opts, run: runGit}, nil
+}
+
+// Base returns the directory that holds the task worktrees.
+func (m *Manager) Base() string { return m.opts.Base }
+
+// Prepare creates (or reuses) the worktree for one task.
+//
+// It is idempotent: calling it twice for the same task returns the same path, so
+// a retried delivery can never create a second checkout or a second branch.
+func (m *Manager) Prepare(ctx context.Context, req Request) (Worktree, error) {
+	req.Repo = canonical(req.Repo)
+	if err := m.validate(req); err != nil {
+		return Worktree{}, err
+	}
+
+	path := filepath.Join(m.opts.Base, req.TaskKey)
+	branch := m.opts.BranchPrefix + req.TaskKey
+
+	// Reuse an existing worktree: a second event for the same task must land in
+	// the same checkout, otherwise the agent loses its own previous work.
+	if registered, err := m.registered(ctx, req.Repo, path); err != nil {
+		return Worktree{}, err
+	} else if registered {
+		if err := m.ensureScratch(path); err != nil {
+			return Worktree{}, err
+		}
+		return Worktree{Path: path, Branch: branch, Repo: req.Repo, Reused: true}, nil
+	}
+
+	if err := os.MkdirAll(m.opts.Base, 0o700); err != nil {
+		return Worktree{}, fmt.Errorf("worktree: create base %s: %w", m.opts.Base, err)
+	}
+	if m.opts.Fetch {
+		// A failed fetch is not fatal: the task should still start, from whatever
+		// the clone already has.
+		_, _ = m.run(ctx, req.Repo, "fetch", "--prune", "origin")
+	}
+
+	if exists, err := m.branchExists(ctx, req.Repo, branch); err != nil {
+		return Worktree{}, err
+	} else if exists {
+		// The branch survived a previous task; attach to it rather than failing.
+		if _, err := m.run(ctx, req.Repo, "worktree", "add", path, branch); err != nil {
+			return Worktree{}, err
+		}
+	} else {
+		if _, err := m.run(ctx, req.Repo, "worktree", "add", "-b", branch, path, req.DefaultBranch); err != nil {
+			return Worktree{}, err
+		}
+	}
+
+	if err := m.ensureScratch(path); err != nil {
+		return Worktree{}, err
+	}
+	return Worktree{Path: path, Branch: branch, Repo: req.Repo}, nil
+}
+
+// Remove drops a task's worktree. The branch is kept: it holds the agent's work
+// and is what a human reviews.
+func (m *Manager) Remove(ctx context.Context, repo string, wt Worktree) error {
+	args := []string{"worktree", "remove"}
+	if _, err := os.Stat(wt.Path); err != nil {
+		// Already gone: prune the bookkeeping and move on.
+		_, _ = m.run(ctx, repo, "worktree", "prune")
+		return nil
+	}
+	if _, err := m.run(ctx, repo, append(args, wt.Path)...); err != nil {
+		return err
+	}
+	return nil
+}
+
+// List returns the worktrees git knows about for a repository.
+func (m *Manager) List(ctx context.Context, repo string) ([]string, error) {
+	out, err := m.run(ctx, repo, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		if after, found := strings.CutPrefix(strings.TrimSpace(line), "worktree "); found {
+			paths = append(paths, after)
+		}
+	}
+	return paths, nil
+}
+
+func (m *Manager) validate(req Request) error {
+	if strings.TrimSpace(req.Repo) == "" {
+		return errors.New("worktree: Request.Repo is required")
+	}
+	if strings.TrimSpace(req.TaskKey) == "" {
+		return errors.New("worktree: Request.TaskKey is required")
+	}
+	// A task key becomes a path segment and a branch name, so keep it boring.
+	if strings.ContainsAny(req.TaskKey, "/\\ \t\n") || strings.HasPrefix(req.TaskKey, ".") {
+		return fmt.Errorf("worktree: TaskKey %q is not a safe path or branch segment", req.TaskKey)
+	}
+	if strings.TrimSpace(req.DefaultBranch) == "" {
+		return errors.New("worktree: Request.DefaultBranch is required (guessing one would base the task on the wrong code)")
+	}
+	if !filepath.IsAbs(req.Repo) {
+		return fmt.Errorf("worktree: Repo %q must be absolute", req.Repo)
+	}
+	if _, err := os.Stat(filepath.Join(req.Repo, ".git")); err != nil {
+		return fmt.Errorf("worktree: %s is not a git work tree", req.Repo)
+	}
+	target := filepath.Join(m.opts.Base, req.TaskKey)
+	if isBeneath(target, req.Repo) {
+		return fmt.Errorf("worktree: %s would be created inside the repository %s; keep task checkouts outside", target, req.Repo)
+	}
+	if isBeneath(m.opts.Base, req.Repo) {
+		return fmt.Errorf("worktree: Base %s is inside the repository %s", m.opts.Base, req.Repo)
+	}
+	exists, err := m.branchExists(context.Background(), req.Repo, req.DefaultBranch)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("worktree: default branch %q does not exist in %s", req.DefaultBranch, req.Repo)
+	}
+	return nil
+}
+
+// canonical resolves symlinks so that the paths compared here are the ones
+// opencode will see: it keys sessions and projects by the literal directory
+// string, so /tmp and /private/tmp must never both appear.
+func canonical(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return path
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
+}
+
+// ensureScratch creates the task's scratch directory and makes git ignore it via
+// the worktree's own exclude file, so the repository's .gitignore stays untouched.
+func (m *Manager) ensureScratch(path string) error {
+	scratch := filepath.Join(path, ScratchDir)
+	if err := os.MkdirAll(scratch, 0o700); err != nil {
+		return fmt.Errorf("worktree: create %s: %w", scratch, err)
+	}
+	// Ask git where this worktree's exclude file lives: for a linked worktree it
+	// is inside the repository's .git/worktrees/<name>/, not .git/info/exclude.
+	exclude, err := m.run(context.Background(), path, "rev-parse", "--git-path", "info/exclude")
+	if err != nil {
+		return err
+	}
+	if !filepath.IsAbs(exclude) {
+		exclude = filepath.Join(path, exclude)
+	}
+	existing, err := os.ReadFile(exclude)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("worktree: read %s: %w", exclude, err)
+	}
+	for _, line := range strings.Split(string(existing), "\n") {
+		if strings.TrimSpace(line) == ignoreEntry {
+			return nil
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(exclude), 0o755); err != nil {
+		return err
+	}
+	content := string(existing)
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	content += ignoreEntry + "\n"
+	if err := os.WriteFile(exclude, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("worktree: write %s: %w", exclude, err)
+	}
+	return nil
+}
+
+func (m *Manager) registered(ctx context.Context, repo, path string) (bool, error) {
+	paths, err := m.List(ctx, repo)
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range paths {
+		if samePath(candidate, path) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *Manager) branchExists(ctx context.Context, repo, branch string) (bool, error) {
+	_, err := m.run(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	if err == nil {
+		return true, nil
+	}
+	// A missing ref is the expected "no" answer; anything else (not a repository,
+	// git missing) must surface.
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	if strings.Contains(err.Error(), "exit status 1") {
+		return false, nil
+	}
+	return false, err
+}
+
+func runGit(ctx context.Context, dir string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
+	defer cancel()
+
+	command := exec.CommandContext(ctx, "git", args...)
+	command.Dir = dir
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = strings.TrimSpace(stdout.String())
+		}
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, message)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+func samePath(a, b string) bool {
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func isBeneath(path, parent string) bool {
+	relative, err := filepath.Rel(parent, path)
+	if err != nil || relative == "." {
+		return false
+	}
+	return !strings.HasPrefix(relative, "..")
+}
