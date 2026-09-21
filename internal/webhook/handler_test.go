@@ -549,3 +549,63 @@ func parseTestNetworks(spec string) ([]*net.IPNet, error) {
 	}
 	return []*net.IPNet{network}, nil
 }
+
+// captureDispatcher records what the phase-2 bridge was handed.
+type captureDispatcher struct {
+	mu     sync.Mutex
+	queued []*store.Record
+}
+
+func (c *captureDispatcher) Dispatch(rec *store.Record) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.queued = append(c.queued, rec)
+}
+
+func (c *captureDispatcher) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.queued)
+}
+
+func TestDispatcherSeesAcceptedDeliveriesOnly(t *testing.T) {
+	bridge := &captureDispatcher{}
+	h := newHarness(t, func(o *Options) { o.Dispatcher = bridge })
+
+	// Accepted, then the same bytes again (duplicate), then a bad token.
+	body := issueUpdatedBody(freshTimestamp())
+	assertRejected(t, h.post(t, keyedPath(), testToken, body), "")
+	assertRejected(t, h.post(t, keyedPath(), testToken, body), "")
+	assertRejected(t, h.post(t, keyedPath(), "bad", issueUpdatedBody(freshTimestamp())), "")
+
+	if got := bridge.count(); got != 1 {
+		t.Fatalf("dispatch calls = %d, want 1 (only the accepted delivery)", got)
+	}
+	// The dispatched record must be the same one that was audited, and it must
+	// already carry the derived fields the rules need.
+	var audited *store.Record
+	h.sink.mu.Lock()
+	for _, rec := range h.sink.records {
+		if rec.Accepted {
+			audited = rec
+		}
+	}
+	h.sink.mu.Unlock()
+	if audited == nil {
+		t.Fatal("no accepted record was audited")
+	}
+	if bridge.queued[0] != audited {
+		t.Fatal("the dispatched record is not the audited record")
+	}
+	if audited.IssueID != "2-123" || audited.RawBody == "" || audited.Event != "issueUpdated" {
+		t.Fatalf("dispatched record is incomplete: %+v", audited)
+	}
+}
+
+func TestNilDispatcherIsAllowed(t *testing.T) {
+	h := newHarness(t, nil)
+	assertRejected(t, h.post(t, keyedPath(), testToken, issueUpdatedBody(freshTimestamp())), "")
+	if h.sink.last(t).Accepted != true {
+		t.Fatal("the delivery was not accepted")
+	}
+}

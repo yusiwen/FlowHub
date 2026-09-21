@@ -185,6 +185,17 @@ func TestPromptsCarryTheContract(t *testing.T) {
 	if !strings.Contains(policy.Prompt(ActionExecute, delivery, ctx), "never push") {
 		t.Error("the execution prompt does not forbid pushing")
 	}
+
+	// A read-only turn has to hand the maintainer the exact next step, and that
+	// step has to be the configured trigger rather than a hardcoded phrase.
+	custom := Policy{Trigger: "/flowhub go", StartStates: []string{"Doing"}}.Defaults()
+	analysis := custom.Prompt(ActionAnalyze, delivery, ctx)
+	if !strings.Contains(analysis, "/flowhub go") || !strings.Contains(analysis, "Doing") {
+		t.Errorf("the analysis prompt does not name the configured trigger:\n%s", analysis)
+	}
+	if strings.Contains(custom.Prompt(ActionExecute, delivery, ctx), "/flowhub go") {
+		t.Error("the execution prompt must not tell the maintainer how to start")
+	}
 }
 
 func TestPromptForAnUnknownActionIsEmpty(t *testing.T) {

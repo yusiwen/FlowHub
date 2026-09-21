@@ -33,6 +33,10 @@ type Task struct {
 	Prompt string
 	// Agent selects the opencode agent; empty means the server default.
 	Agent string
+	// Model selects the model as "provider/model-id" (the spelling opencode uses
+	// in its own configuration). Empty means the agent's default, which is the
+	// honest default: the agent definition should own the model it was tuned for.
+	Model string
 	// Title is the session title, used as a human hint only (opencode rewrites
 	// it after the first turn).
 	Title string
@@ -120,12 +124,16 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 	if strings.TrimSpace(task.Prompt) == "" {
 		return result, fmt.Errorf("opencode: task has no prompt")
 	}
+	if err := validateModel(task.Model); err != nil {
+		return result, err
+	}
 
 	sessionID := strings.TrimSpace(task.SessionID)
 	if sessionID == "" {
 		session, err := r.client.CreateSession(ctx, task.Directory, CreateSessionRequest{
 			Title:      task.Title,
 			Agent:      task.Agent,
+			Model:      sessionModel(task.Model),
 			Permission: task.Ruleset,
 			Metadata:   task.Metadata,
 		})
@@ -147,6 +155,7 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 
 	if err := r.client.PromptAsync(ctx, task.Directory, sessionID, PromptRequest{
 		Agent: task.Agent,
+		Model: promptModel(task.Model),
 		Parts: []TextPart{{Type: "text", Text: task.Prompt}},
 	}); err != nil {
 		return result, fmt.Errorf("opencode: deliver prompt to session %s: %w", sessionID, err)
@@ -370,4 +379,51 @@ func textOf(message Message) string {
 		builder.WriteString(part.Text)
 	}
 	return builder.String()
+}
+
+// SplitModel splits the "provider/model-id" spelling opencode uses for a model
+// reference. It is exported so the routing-table validation can reject a typo at
+// startup instead of at the first turn.
+func SplitModel(model string) (provider, id string, ok bool) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "", "", false
+	}
+	// Cut on the first slash: a model id may itself contain one
+	// (for example "accounts/fireworks/models/llama"), a provider id may not.
+	provider, id, found := strings.Cut(model, "/")
+	provider, id = strings.TrimSpace(provider), strings.TrimSpace(id)
+	if !found || provider == "" || id == "" {
+		return "", "", false
+	}
+	return provider, id, true
+}
+
+func validateModel(model string) error {
+	if strings.TrimSpace(model) == "" {
+		return nil
+	}
+	if _, _, ok := SplitModel(model); !ok {
+		return fmt.Errorf("opencode: model %q must be spelled provider/model-id", model)
+	}
+	return nil
+}
+
+// sessionModel renders the model for session creation, which uses the lowercase
+// {providerID, id} spelling. A nil result leaves the agent's own default alone.
+func sessionModel(model string) *SessionModel {
+	provider, id, ok := SplitModel(model)
+	if !ok {
+		return nil
+	}
+	return &SessionModel{ProviderID: provider, ID: id}
+}
+
+// promptModel renders the model for a prompt, which uses {providerID, modelID}.
+func promptModel(model string) *ModelRef {
+	provider, id, ok := SplitModel(model)
+	if !ok {
+		return nil
+	}
+	return &ModelRef{ProviderID: provider, ModelID: id}
 }

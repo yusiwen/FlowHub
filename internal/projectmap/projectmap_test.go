@@ -272,6 +272,18 @@ func TestValidateReportsFilesystemProblems(t *testing.T) {
 			entry: Entry{YouTrackKey: "F", Repo: Repo{Path: good}, Agent: "dev ops/../x"},
 			want:  "not a valid agent name",
 		},
+		"bare model name": {
+			entry: Entry{YouTrackKey: "H", Repo: Repo{Path: good}, Model: "gpt-5"},
+			want:  "must be spelled provider/model-id",
+		},
+		"model without a name": {
+			entry: Entry{YouTrackKey: "I", Repo: Repo{Path: good}, Model: "deepseek/"},
+			want:  "must be spelled provider/model-id",
+		},
+		"provider qualified model": {
+			entry: Entry{YouTrackKey: "J", Repo: Repo{Path: good}, Model: "deepseek/deepseek-v4-flash"},
+			want:  "",
+		},
 		"ok": {
 			entry: Entry{YouTrackKey: "G", Repo: Repo{Path: good, Remote: "git@example.cn:me/app.git"}, Agent: "devops"},
 			want:  "",

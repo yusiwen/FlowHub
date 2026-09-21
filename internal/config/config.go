@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,6 +42,24 @@ const (
 	// the XDG config directory.
 	DefaultProjectsDir  = "flowhub"
 	DefaultProjectsName = "config.json"
+
+	// Defaults for the opencode dispatcher. Dispatch itself defaults to OFF: an
+	// unattended agent that edits repositories has to be an explicit decision,
+	// and an unset FLOWHUB_DISPATCH leaves the receiver recording only.
+	DefaultOpenCodeURL   = "http://127.0.0.1:4096"
+	DefaultDispatchAgent = "devops"
+	DefaultDispatchQueue = 32
+	DefaultTaskDeadline  = 15 * time.Minute
+	DefaultMaxTurns      = 8
+	DefaultTrigger       = "/opencode start"
+	DefaultStartState    = "In Progress"
+
+	// DefaultRegistryName and DefaultPauseName live inside DataDir. The pause
+	// file is the kill switch: touching it stops dispatch without an API, a
+	// restart or a credential, which is the only kind of switch that works
+	// during an incident.
+	DefaultRegistryName = "registry.jsonl"
+	DefaultPauseName    = "DISPATCH_OFF"
 )
 
 // Config is the fully resolved receiver configuration.
@@ -126,6 +145,60 @@ type Config struct {
 
 	// ShutdownTimeout bounds the graceful drain on SIGINT/SIGTERM.
 	ShutdownTimeout time.Duration
+
+	// --- Phase 2: the opencode dispatcher ---------------------------------
+
+	// Dispatch turns on the dispatcher. It is off by default so the receiver
+	// can run (and be audited) without an agent that edits repositories.
+	Dispatch bool
+
+	// OpenCodeURL is the base URL of the headless opencode server. It is
+	// expected to be a loopback address: opencode 1.x has no authentication, so
+	// the only safe boundary is the machine itself.
+	OpenCodeURL string
+
+	// DispatchAgent is the opencode agent used when a routing entry does not
+	// name one. Which agent runs matters for the permission model, so it is
+	// never silently defaulted to "build".
+	DispatchAgent string
+
+	// DispatchQueueSize bounds the deliveries waiting for the single worker. A
+	// full queue drops work instead of blocking the publisher's request.
+	DispatchQueueSize int
+
+	// TaskDeadline bounds one opencode turn. A deadline is not a failure: the
+	// session keeps running and the task is marked executing.
+	TaskDeadline time.Duration
+
+	// MaxTurns stops a task that keeps triggering; the cheap runaway guard.
+	MaxTurns int
+
+	// Trigger is the comment phrase that means "start implementing".
+	Trigger string
+
+	// StartStates are the workflow state values that mean "start implementing".
+	StartStates []string
+
+	// SkipAnalyzeOnCreate turns off the automatic read-only analysis of a newly
+	// created issue, which is on by default.
+	SkipAnalyzeOnCreate bool
+
+	// RegistryFile is the append-only task registry (issue -> repository,
+	// worktree, session). Empty resolves to <DataDir>/registry.jsonl.
+	RegistryFile string
+
+	// PauseFile disables dispatch while it exists. Empty resolves to
+	// <DataDir>/DISPATCH_OFF.
+	PauseFile string
+
+	// TaskMaxCost stops a task whose accumulated opencode cost passes this
+	// value. Zero disables the check.
+	TaskMaxCost float64
+
+	// WorktreeBase is the fallback worktree directory for routing entries that
+	// do not declare one. Entries normally declare their own, because the base
+	// has to sit outside the repository it belongs to.
+	WorktreeBase string
 }
 
 // Load reads the configuration from the environment and validates it.
@@ -179,6 +252,32 @@ func Load() (Config, error) {
 	}
 	if cfg.AllowedSources, err = ParseSources(os.Getenv("FLOWHUB_ALLOWED_SOURCES")); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_ALLOWED_SOURCES: %w", err)
+	}
+
+	cfg.OpenCodeURL = env("FLOWHUB_OPENCODE_URL", DefaultOpenCodeURL)
+	cfg.DispatchAgent = env("FLOWHUB_DISPATCH_AGENT", DefaultDispatchAgent)
+	cfg.Trigger = env("FLOWHUB_TRIGGER", DefaultTrigger)
+	cfg.StartStates = splitList(env("FLOWHUB_START_STATES", DefaultStartState))
+	cfg.RegistryFile = env("FLOWHUB_REGISTRY_FILE", "")
+	cfg.PauseFile = env("FLOWHUB_PAUSE_FILE", "")
+	cfg.WorktreeBase = env("FLOWHUB_WORKTREE_BASE", "")
+	if cfg.Dispatch, err = envBool("FLOWHUB_DISPATCH", false); err != nil {
+		return Config{}, fmt.Errorf("FLOWHUB_DISPATCH: %w", err)
+	}
+	if cfg.SkipAnalyzeOnCreate, err = envBool("FLOWHUB_SKIP_ANALYZE_ON_CREATE", false); err != nil {
+		return Config{}, fmt.Errorf("FLOWHUB_SKIP_ANALYZE_ON_CREATE: %w", err)
+	}
+	if cfg.DispatchQueueSize, err = envInt("FLOWHUB_DISPATCH_QUEUE", DefaultDispatchQueue); err != nil {
+		return Config{}, fmt.Errorf("FLOWHUB_DISPATCH_QUEUE: %w", err)
+	}
+	if cfg.MaxTurns, err = envInt("FLOWHUB_MAX_TURNS", DefaultMaxTurns); err != nil {
+		return Config{}, fmt.Errorf("FLOWHUB_MAX_TURNS: %w", err)
+	}
+	if cfg.TaskDeadline, err = envDuration("FLOWHUB_TASK_DEADLINE", DefaultTaskDeadline); err != nil {
+		return Config{}, fmt.Errorf("FLOWHUB_TASK_DEADLINE: %w", err)
+	}
+	if cfg.TaskMaxCost, err = envFloat("FLOWHUB_TASK_MAX_COST", 0); err != nil {
+		return Config{}, fmt.Errorf("FLOWHUB_TASK_MAX_COST: %w", err)
 	}
 	cfg.ProjectsFile = ResolveProjectsFile(cfg.ProjectsFile)
 
@@ -278,6 +377,31 @@ func (c Config) validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("FLOWHUB_LOG_LEVEL %q: want debug, info, warn or error", c.LogLevel)
+	}
+	if c.DispatchQueueSize <= 0 {
+		return fmt.Errorf("FLOWHUB_DISPATCH_QUEUE must be positive, got %d", c.DispatchQueueSize)
+	}
+	if c.TaskDeadline <= 0 {
+		return fmt.Errorf("FLOWHUB_TASK_DEADLINE must be positive, got %s", c.TaskDeadline)
+	}
+	if c.MaxTurns <= 0 {
+		return fmt.Errorf("FLOWHUB_MAX_TURNS must be positive, got %d", c.MaxTurns)
+	}
+	if c.TaskMaxCost < 0 {
+		return fmt.Errorf("FLOWHUB_TASK_MAX_COST must not be negative, got %v", c.TaskMaxCost)
+	}
+	// The URL is checked even when dispatch is off, because a typo in the
+	// environment is a mistake either way and startup is the only cheap place
+	// to catch it.
+	url, err := neturl.Parse(c.OpenCodeURL)
+	if err != nil {
+		return fmt.Errorf("FLOWHUB_OPENCODE_URL %q: %w", c.OpenCodeURL, err)
+	}
+	if url.Scheme != "http" && url.Scheme != "https" {
+		return fmt.Errorf("FLOWHUB_OPENCODE_URL %q: want an http or https URL", c.OpenCodeURL)
+	}
+	if url.Host == "" {
+		return fmt.Errorf("FLOWHUB_OPENCODE_URL %q: missing host", c.OpenCodeURL)
 	}
 	return nil
 }
@@ -422,6 +546,25 @@ func (c Config) ResolvedLogFile() string {
 // DetailLogDir returns the directory holding the human readable payload log.
 func (c Config) DetailLogDir() string { return c.DataDir }
 
+// ResolvedRegistryFile returns the task registry path. An unset
+// FLOWHUB_REGISTRY_FILE defaults to <DataDir>/registry.jsonl, so the registry
+// travels with the audit trail.
+func (c Config) ResolvedRegistryFile() string {
+	if c.RegistryFile != "" {
+		return c.RegistryFile
+	}
+	return filepath.Join(c.DataDir, DefaultRegistryName)
+}
+
+// ResolvedPauseFile returns the dispatcher kill switch. An unset
+// FLOWHUB_PAUSE_FILE defaults to <DataDir>/DISPATCH_OFF.
+func (c Config) ResolvedPauseFile() string {
+	if c.PauseFile != "" {
+		return c.PauseFile
+	}
+	return filepath.Join(c.DataDir, DefaultPauseName)
+}
+
 // Report renders the effective configuration for `flowhub -print-config`.
 func (c Config) Report() string {
 	var b strings.Builder
@@ -449,6 +592,23 @@ func (c Config) Report() string {
 	fmt.Fprintf(&b, "log_level:          %s\n", c.LogLevel)
 	fmt.Fprintf(&b, "log_format:         %s\n", c.LogFormat)
 	fmt.Fprintf(&b, "shutdown_timeout:   %s\n", c.ShutdownTimeout)
+	fmt.Fprintf(&b, "dispatch:           %t\n", c.Dispatch)
+	fmt.Fprintf(&b, "opencode_url:       %s\n", c.OpenCodeURL)
+	fmt.Fprintf(&b, "dispatch_agent:     %s\n", c.DispatchAgent)
+	fmt.Fprintf(&b, "dispatch_queue:     %d\n", c.DispatchQueueSize)
+	fmt.Fprintf(&b, "task_deadline:      %s\n", c.TaskDeadline)
+	fmt.Fprintf(&b, "max_turns:          %d\n", c.MaxTurns)
+	fmt.Fprintf(&b, "task_max_cost:      %s\n", formatCost(c.TaskMaxCost))
+	fmt.Fprintf(&b, "trigger:            %q\n", c.Trigger)
+	fmt.Fprintf(&b, "start_states:       %s\n", strings.Join(c.StartStates, ","))
+	fmt.Fprintf(&b, "skip_analyze_on_create: %t\n", c.SkipAnalyzeOnCreate)
+	fmt.Fprintf(&b, "registry_file:      %s\n", c.ResolvedRegistryFile())
+	fmt.Fprintf(&b, "pause_file:         %s (touch it to pause dispatch)\n", c.ResolvedPauseFile())
+	worktreeBase := c.WorktreeBase
+	if worktreeBase == "" {
+		worktreeBase = "<none: every routing entry must declare worktrees>"
+	}
+	fmt.Fprintf(&b, "worktree_base:      %s\n", worktreeBase)
 	locks := c.ActiveLocks()
 	fmt.Fprintf(&b, "active_locks:       %s\n", orNone(strings.Join(locks, ",")))
 	for _, w := range c.Warnings() {
@@ -465,6 +625,26 @@ func orNone(s string) string {
 		return "<none>"
 	}
 	return s
+}
+
+// formatCost renders the cost budget so that "disabled" is visible instead of
+// looking like a budget of zero dollars.
+func formatCost(cost float64) string {
+	if cost == 0 {
+		return "<disabled>"
+	}
+	return "$" + strconv.FormatFloat(cost, 'f', -1, 64)
+}
+
+// splitList parses a comma separated list, dropping empty items.
+func splitList(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func env(key, fallback string) string {
@@ -519,6 +699,18 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 		return 0, nil
 	}
 	v, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%q: %w", raw, err)
+	}
+	return v, nil
+}
+
+func envFloat(key string, fallback float64) (float64, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%q: %w", raw, err)
 	}

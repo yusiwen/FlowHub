@@ -99,6 +99,14 @@ func (p Policy) Prompt(action Action, d Delivery, ctx PromptContext) string {
 	fmt.Fprintf(&b, "The last line of the comment must be exactly: %s\n", SelfMarker)
 	b.WriteString("That marker lets the automation recognise its own replies; without it the reply is treated as a human\n")
 	b.WriteString("instruction and starts another turn.\n")
+	if action != ActionExecute {
+		// The agent is the only thing the maintainer talks to, so it has to name
+		// the exact command that starts the implementation; it comes from the
+		// policy rather than being written out here, so a configured trigger
+		// cannot drift away from what the agent tells people to type.
+		fmt.Fprintf(&b, "Close by telling the maintainer how to proceed: comment `%s` on the issue, or move it to %s.\n",
+			p.Trigger, strings.Join(p.StartStates, " / "))
+	}
 	return b.String()
 }
 

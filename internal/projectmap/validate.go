@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	// opencode is a leaf package (it imports nothing from this module), so the
+	// model-reference parser is shared instead of duplicated here.
+	"github.com/yusiwen/flowhub/internal/opencode"
 )
 
 // agentNamePattern keeps the agent name safe to hand to opencode as a JSON field
@@ -77,6 +81,15 @@ func (e *Entry) validate() []string {
 
 	if e.Agent != "" && !agentNamePattern.MatchString(e.Agent) {
 		problems = append(problems, fmt.Sprintf("%s: agent %q is not a valid agent name", label, e.Agent))
+	}
+	// The opencode API takes a provider id and a model id separately, so a bare
+	// model name cannot be honoured. Rejected here rather than silently ignored:
+	// a task that quietly runs on a different model than the operator configured
+	// is worse than one that does not start.
+	if e.Model != "" {
+		if _, _, ok := opencode.SplitModel(e.Model); !ok {
+			problems = append(problems, fmt.Sprintf("%s: model %q must be spelled provider/model-id", label, e.Model))
+		}
 	}
 	return problems
 }

@@ -122,8 +122,13 @@ func New(opts Options) (*Dispatcher, error) {
 
 // Dispatch queues a delivery. It never blocks: the webhook request path is
 // synchronous on the publisher's side, so a full queue drops work instead.
+//
+// A nil receiver does nothing. This is not decoration: a typed nil
+// (*Dispatcher)(nil) held in the webhook's Dispatcher interface is not == nil,
+// so the receiving path can reach this method with no dispatcher behind it, and
+// panicking there would cost the publisher its response.
 func (d *Dispatcher) Dispatch(rec *store.Record) {
-	if rec == nil || !rec.Accepted {
+	if d == nil || rec == nil || !rec.Accepted {
 		return
 	}
 	select {
@@ -230,6 +235,16 @@ func (d *Dispatcher) handle(ctx context.Context, rec *store.Record) {
 			"issue", rec.IssueID, "project", rec.ProjectKey)
 		return
 	}
+	if !authorAllowed(match.Entry.Authors, rec.PrimaryActor) {
+		// A per-project allowlist is a restriction, so an actor it does not name
+		// gets no work — including the no-actor events (issueDeleted carries no
+		// actor), which can therefore never pass this gate.
+		d.ignored.Add(1)
+		d.log.Warn("actor is not on the project's author allowlist; delivery ignored",
+			"issue", rec.IssueID, "project", rec.ProjectKey, "actor", rec.PrimaryActor,
+			"authors", strings.Join(match.Entry.Authors, ","))
+		return
+	}
 
 	task, err = d.ensureTask(ctx, rec, match.Entry, task, known)
 	if err != nil {
@@ -292,6 +307,45 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 	})
 }
 
+// authorAllowed applies a routing entry's author allowlist. An empty list allows
+// everyone the entry matches; a non-empty list allows only the logins it names.
+func authorAllowed(allowed []string, actor string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, want := range allowed {
+		if strings.EqualFold(strings.TrimSpace(want), strings.TrimSpace(actor)) {
+			return true
+		}
+	}
+	return false
+}
+
+// Problems lists routing entries that cannot be dispatched to. It is checked at
+// startup because a misconfiguration should stop the process, not fail one issue
+// at a time after the operator believes the hub is running.
+func Problems(projects *projectmap.Map, fallbackWorktreeBase string) []string {
+	if projects == nil {
+		return nil
+	}
+	var problems []string
+	for _, entry := range projects.Entries() {
+		if !entry.IsEnabled() {
+			// A disabled entry is never matched and is not validated, so it may
+			// legitimately point at a checkout this host does not have.
+			continue
+		}
+		label := entry.YouTrackKey
+		if entry.Repo.DefaultBranch == "" {
+			problems = append(problems, fmt.Sprintf("%s: repo.default_branch is empty, so no task worktree can be based on it", label))
+		}
+		if strings.TrimSpace(entry.Worktrees) == "" && strings.TrimSpace(fallbackWorktreeBase) == "" {
+			problems = append(problems, fmt.Sprintf("%s: neither the entry's worktrees directory nor FLOWHUB_WORKTREE_BASE is set, so a task worktree has nowhere to live", label))
+		}
+	}
+	return problems
+}
+
 // managerFor returns the worktree manager for a base directory, creating it on
 // first use. The base comes from the routing entry, because it has to sit outside
 // the repository that entry points at.
@@ -335,11 +389,20 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 	// has to come first and the specific entries after it.
 	ruleset := sessionRuleset()
 
+	// The routing entry owns the agent when it names one: which agent runs is a
+	// permission decision (that agent's own rules and tools), so it belongs next
+	// to the repository, not only in the environment.
+	agent := strings.TrimSpace(match.Entry.Agent)
+	if agent == "" {
+		agent = d.opts.Agent
+	}
+
 	runner := opencode.NewRunner(d.opts.Client, arbiter, d.log)
 	result, err := runner.Run(ctx, opencode.Task{
 		Directory: task.Worktree,
 		Prompt:    prompt,
-		Agent:     d.opts.Agent,
+		Agent:     agent,
+		Model:     strings.TrimSpace(match.Entry.Model),
 		Title:     rec.IssueID,
 		SessionID: task.SessionID,
 		Ruleset:   ruleset,

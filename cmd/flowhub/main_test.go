@@ -3,6 +3,10 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/yusiwen/flowhub/internal/config"
+	"github.com/yusiwen/flowhub/internal/dispatch"
 )
 
 // versionLine feeds -version, the startup banner and /healthz. The Makefile
@@ -54,5 +58,35 @@ func TestVersionLineDoesNotRepeatTheCommit(t *testing.T) {
 				t.Fatalf("versionLine() = %q repeats the commit", got)
 			}
 		})
+	}
+}
+
+// TestWebhookOptionsNeverHoldATypedNilDispatcher guards a regression measured
+// against a real process: with FLOWHUB_DISPATCH off, the receiver answered every
+// delivery with an empty reply. The cause was a typed nil (*dispatch.Dispatcher)
+// stored in the webhook.Dispatcher interface, which is not == nil, so the hook
+// was called and panicked after the 202 had been written.
+func TestWebhookOptionsNeverHoldATypedNilDispatcher(t *testing.T) {
+	var absent *dispatch.Dispatcher
+	if absent != nil {
+		t.Fatal("precondition: a nil pointer must compare equal to nil")
+	}
+	if opts := webhookOptions(config.Config{}, absent); opts.Dispatcher != nil {
+		t.Fatal("webhookOptions put a nil dispatcher behind the interface")
+	}
+}
+
+func TestWebhookOptionsCarryTheReceiverLocks(t *testing.T) {
+	cfg := config.Config{
+		HookKey:      "k",
+		TokenHeader:  "X-YouTrack-Token",
+		Token:        "t",
+		MaxBodyBytes: 1024,
+		ReplayWindow: time.Minute,
+		LogHeaders:   true,
+	}
+	opts := webhookOptions(cfg, &dispatch.Dispatcher{})
+	if opts.HookKey != "k" || opts.Token != "t" || opts.Dispatcher == nil {
+		t.Fatalf("options = %+v", opts)
 	}
 }

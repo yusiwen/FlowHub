@@ -28,13 +28,12 @@ import (
 type fakeOpencode struct {
 	t *testing.T
 
-	mu          sync.Mutex
-	prompts     []string
-	sessions    int
-	continued   int
-	permissions []string
-	toolCalls   []string
-	directory   string
+	mu        sync.Mutex
+	prompts   []string
+	sessions  int
+	continued int
+	toolCalls []string
+	directory string
 	// messages accumulates one completed assistant message per prompt, which is
 	// what makes a second turn on the same session observable.
 	messages []opencode.Message
@@ -46,6 +45,10 @@ type fakeOpencode struct {
 	postComment bool
 	// ruleset records what the session was created with.
 	ruleset []opencode.PermissionRule
+	// sessionBody and promptBody keep the whole request so an entry's agent and
+	// model override can be asserted.
+	sessionBody opencode.CreateSessionRequest
+	promptBody  opencode.PromptRequest
 }
 
 func newFakeOpencode(t *testing.T) *fakeOpencode {
@@ -64,6 +67,7 @@ func (f *fakeOpencode) start() *httptest.Server {
 		var body opencode.CreateSessionRequest
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.ruleset = body.Permission
+		f.sessionBody = body
 		writeJSON(w, opencode.Session{ID: "ses_fake", Directory: f.directory})
 	})
 	handler.HandleFunc("/session/ses_fake/prompt_async", func(w http.ResponseWriter, r *http.Request) {
@@ -71,6 +75,7 @@ func (f *fakeOpencode) start() *httptest.Server {
 		defer f.mu.Unlock()
 		var body opencode.PromptRequest
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.promptBody = body
 		if len(body.Parts) > 0 {
 			f.prompts = append(f.prompts, body.Parts[0].Text)
 		}
@@ -153,15 +158,21 @@ func testRepo(t *testing.T) string {
 	return repo
 }
 
-// newTestDispatcher wires a dispatcher against a temp repository and routing table.
-func newTestDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.Server) (*Dispatcher, *registry.Registry, string) {
+// newTestDispatcher wires a dispatcher against a temp repository and routing
+// table. entryExtra is appended to the routing entry verbatim, so a test can
+// declare an agent, a model or an author allowlist.
+func newTestDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.Server, entryExtra ...string) (*Dispatcher, *registry.Registry, string) {
 	t.Helper()
 	repo := testRepo(t)
 	base := filepath.Join(t.TempDir(), "worktrees")
 
 	// The routing table is a file, because that is the only supported source.
 	projectsFile := filepath.Join(t.TempDir(), "config.json")
-	body := `{"projects":[{"youtrack_key":"TEST","repo":{"path":"` + repo + `","default_branch":"main"},"worktrees":"` + base + `"}]}`
+	extra := ""
+	if len(entryExtra) > 0 {
+		extra = "," + strings.Join(entryExtra, ",")
+	}
+	body := `{"projects":[{"youtrack_key":"TEST","repo":{"path":"` + repo + `","default_branch":"main"},"worktrees":"` + base + `"` + extra + `}]}`
 	if err := os.WriteFile(projectsFile, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +196,7 @@ func newTestDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.Server
 		Projects: projects,
 		Rules:    rules.Policy{}.Defaults(),
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Agent:    "devops",
+		Agent:    "flowhub-default-agent",
 		Deadline: 5 * time.Second,
 	})
 	if err != nil {
@@ -431,5 +442,128 @@ func TestTurnWithoutAReplyIsRecordedAsSuch(t *testing.T) {
 	// application log, which is where an operator looks.
 	if task.Turns != 1 {
 		t.Fatalf("turns = %d", task.Turns)
+	}
+}
+
+func TestEntryAgentAndModelOverrideTheDefaults(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, _, _ := newTestDispatcher(t, fake, server,
+		`"agent":"flowhub-analyst","model":"deepseek/deepseek-v4-flash"`)
+
+	dispatcher.handle(context.Background(), delivery("TEST-50", "issueCreated", issueCreatedBody("TEST-50")))
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.sessionBody.Agent != "flowhub-analyst" {
+		t.Fatalf("session agent = %q, want the entry's agent", fake.sessionBody.Agent)
+	}
+	if fake.promptBody.Agent != "flowhub-analyst" {
+		t.Fatalf("prompt agent = %q, want the entry's agent", fake.promptBody.Agent)
+	}
+	model := fake.sessionBody.Model
+	if model == nil || model.ProviderID != "deepseek" || model.ID != "deepseek-v4-flash" {
+		t.Fatalf("session model = %+v, want deepseek/deepseek-v4-flash", model)
+	}
+	if ref := fake.promptBody.Model; ref == nil || ref.ProviderID != "deepseek" || ref.ModelID != "deepseek-v4-flash" {
+		t.Fatalf("prompt model = %+v, want the provider/model split", ref)
+	}
+}
+
+func TestDefaultAgentAppliesWhenTheEntryNamesNone(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, _, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-51", "issueCreated", issueCreatedBody("TEST-51")))
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.sessionBody.Agent != "flowhub-default-agent" {
+		t.Fatalf("session agent = %q, want the configured default", fake.sessionBody.Agent)
+	}
+	if fake.sessionBody.Model != nil || fake.promptBody.Model != nil {
+		t.Fatal("an entry without a model must leave the agent's own default alone")
+	}
+}
+
+func TestAuthorAllowlistBlocksEveryoneElse(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server, `"authors":["yusiwen"]`)
+
+	stranger := delivery("TEST-52", "issueCreated", issueCreatedBody("TEST-52"))
+	stranger.PrimaryActor = "someone.else"
+	dispatcher.handle(context.Background(), stranger)
+
+	fake.mu.Lock()
+	sessions := fake.sessions
+	fake.mu.Unlock()
+	if sessions != 0 {
+		t.Fatalf("sessions = %d, want none for an actor outside the allowlist", sessions)
+	}
+	if _, ok := reg.Get("TEST-52"); ok {
+		t.Fatal("a blocked delivery must not create a task")
+	}
+
+	// The named author still gets work through the same dispatcher.
+	dispatcher.handle(context.Background(), delivery("TEST-53", "issueCreated", issueCreatedBody("TEST-53")))
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.sessions != 1 {
+		t.Fatalf("sessions = %d, want the allowlisted author's turn", fake.sessions)
+	}
+}
+
+func TestNoActorNeverPassesAnAuthorAllowlist(t *testing.T) {
+	// issueDeleted carries no actor, so a project with an allowlist can never
+	// accept it. Asserted directly because it is the fail-closed branch.
+	if authorAllowed([]string{"yusiwen"}, "") {
+		t.Fatal("an empty actor must not match an allowlist")
+	}
+	if !authorAllowed(nil, "") {
+		t.Fatal("an absent allowlist must allow every actor")
+	}
+	if !authorAllowed([]string{"YuSiWen"}, "yusiwen") {
+		t.Fatal("the allowlist comparison must be case-insensitive")
+	}
+}
+
+func TestProblemsReportsEntriesThatCannotBeDispatched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	body := `{"projects":[` +
+		`{"youtrack_key":"A","repo":{"path":"/tmp/a"}},` +
+		`{"youtrack_key":"B","repo":{"path":"/tmp/b","default_branch":"main"},"worktrees":"/tmp/wt"},` +
+		`{"youtrack_key":"C","repo":{"path":"/tmp/c"},"enabled":false}` +
+		`]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+
+	problems := Problems(projects, "")
+	if len(problems) != 2 {
+		t.Fatalf("problems = %v, want the missing branch and the missing worktrees directory", problems)
+	}
+	if !strings.Contains(problems[0], "A") || !strings.Contains(problems[0], "default_branch") {
+		t.Fatalf("first problem = %q", problems[0])
+	}
+	if !strings.Contains(problems[1], "worktrees directory") {
+		t.Fatalf("second problem = %q", problems[1])
+	}
+
+	// A fallback base makes the entry above dispatchable again.
+	if got := Problems(projects, "/tmp/fallback"); len(got) != 1 {
+		t.Fatalf("problems with a fallback base = %v, want only the missing branch", got)
+	}
+	if got := Problems(nil, ""); got != nil {
+		t.Fatalf("Problems(nil) = %v, want nil", got)
 	}
 }

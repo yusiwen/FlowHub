@@ -80,6 +80,18 @@ type Options struct {
 	// values masked) plus a token fingerprint, in the audit log. It is what makes
 	// the real wire format — including anything nginx adds — inspectable.
 	LogHeaders bool
+	// Dispatcher, when set, is handed every accepted delivery after it has been
+	// audited. It is the phase-2 bridge to opencode and it must not block: the
+	// publisher waits for our response.
+	Dispatcher Dispatcher
+}
+
+// Dispatcher receives accepted deliveries for asynchronous work.
+//
+// The interface lives here rather than in the dispatch package so the webhook
+// pipeline keeps depending on nothing but its own types.
+type Dispatcher interface {
+	Dispatch(rec *store.Record)
 }
 
 // AuditSink is the destination for audit records. Implementations must not
@@ -304,6 +316,15 @@ func (h *Handler) respond(w http.ResponseWriter, rec *store.Record, reason strin
 
 	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(status)
+
+	// Dispatch only after the answer is on the wire, so nothing in the agent
+	// path can delay or fail the publisher. Rejected and duplicate deliveries
+	// are never dispatched: a duplicate was already handled by the delivery
+	// that created the key, and answering a rejection 202 is not a request for
+	// work.
+	if rec.Accepted && h.opts.Dispatcher != nil {
+		h.opts.Dispatcher.Dispatch(rec)
+	}
 }
 
 var errBodyTooLarge = errors.New("body too large")
