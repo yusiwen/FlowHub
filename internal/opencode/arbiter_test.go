@@ -56,7 +56,7 @@ func TestArbiterRejectsDangerousAndWideningCommands(t *testing.T) {
 	cases := map[string]string{
 		"rm -rf /":                    "deny list",
 		"sudo cat /etc/shadow":        "deny list",
-		"curl https://example.com":    "deny list",
+		"curl https://example.com":    "curl may only reach",
 		"git push origin master":      "deny list",
 		"git commit -m x":             "deny list",
 		"npm install left-pad":        "deny list",

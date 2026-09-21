@@ -17,53 +17,85 @@ func (d Decision) Allowed() bool { return d.Reply == ReplyOnce || d.Reply == Rep
 
 // Arbiter answers permission requests without a human.
 //
-// It is the second line of defence, not the first: the session-level ruleset
-// already denies edit, external_directory, webfetch and websearch outright, so a
-// request reaching the arbiter is one the ruleset chose to ask about. The arbiter
-// exists because "ask" would otherwise hang the turn forever.
+// It is the second line of defence, not the first: the session ruleset already
+// denies edit-adjacent permissions it never wants to reason about, and the phase
+// only matters because the gated permission is set to "ask" — "allow" would bypass
+// the arbiter and "deny" would remove the tool, making a per-phase decision
+// impossible.
 //
-// The policy is an allowlist over shell *segments*, not a shell parser:
+// The bash policy is an allowlist over shell *segments*, not a shell parser:
 //
 //   - the command is split on &&, ||, ;, | and newlines, and every segment must
-//     match an allow entry;
+//     match an allow entry (or the narrow curl exception);
 //   - redirection, command substitution and background execution are rejected
 //     outright, because they turn a read into a write or hide a second command;
-//   - the deny list runs first, so a forbidden command yields a clear reason
-//     instead of a generic "not allowlisted".
+//   - the deny list runs before the allowlist, so a forbidden command yields a
+//     clear reason instead of a generic one;
+//   - paths outside the worktree are rejected: the ruleset's external_directory
+//     does not police a command run inside a shell.
 //
-// This is deliberately conservative. Build and test commands are on the default
-// allowlist because they are the agent's job, and they are also arbitrary code
-// execution: the containment that matters is the per-task worktree plus the
-// session ruleset, not this list.
+// Build and test commands are on the default allowlist because they are the
+// agent's job, and they are also arbitrary code execution: the containment that
+// matters is the per-task worktree plus the session ruleset, not this list.
 type Arbiter struct {
 	// Allow matches a whole command segment.
 	Allow []*regexp.Regexp
 	// Deny matches a whole command segment and wins over Allow.
 	Deny []*regexp.Regexp
-	// AllowKinds are non-bash permissions granted without inspecting a command.
-	// "read" is safe here: the ruleset already denies external_directory, so a
-	// read cannot leave the task worktree.
+	// ExecutionAllow are whole-segment patterns permitted only in the execution
+	// phase. They are checked before Deny, which is how `git add` and
+	// `git commit` stay impossible during a read-only analysis turn.
+	ExecutionAllow []*regexp.Regexp
+	// AllowKinds are built-in read-only tool permissions granted without
+	// inspecting a command.
 	AllowKinds map[string]bool
+	// AllowTools are MCP and plugin tools granted by exact name. Anything not
+	// listed is refused, because those tools are `allow` by default and the
+	// available set includes web crawlers and cross-system writers.
+	AllowTools map[string]bool
 	// Remember replies "always" instead of "once" for allowed commands. It
 	// removes repeat prompts at the cost of visibility, so it defaults to false.
 	Remember bool
+	// Phase selects the read-only or the execution policy.
+	Phase Phase
+	// CurlHosts whitelists hosts an attachment download may reach. Empty
+	// disables the download exception entirely.
+	CurlHosts []string
+	// CurlOutputPrefix is the only directory a download may write into, relative
+	// to the worktree.
+	CurlOutputPrefix string
 }
 
-// DefaultArbiter returns the policy used for unattended runs.
+// DefaultArbiter returns the read-only policy used for unattended runs.
 func DefaultArbiter() *Arbiter {
 	return &Arbiter{
+		Phase: PhaseAnalysis,
 		Allow: []*regexp.Regexp{
 			// Inspection.
 			mustCompile(`(pwd|ls|cat|head|tail|wc|grep|rg|find|file|stat|uname|whoami|id|date|diff|sort|uniq|cut|tr|jq|echo|printf|sed -n|awk)(\s.*)?`),
 			// Git, read-only. git remote/config are excluded on purpose: remote
 			// URLs can embed credentials.
 			mustCompile(`git\s+(status|log|diff|show|branch|rev-parse|describe|ls-files|blame|tag|shortlog|whatchanged|cat-file|grep|stash\s+list)(\s.*)?`),
-			// Build and test: the agent's actual job. See the type comment for why
-			// these are allowed despite being arbitrary code execution.
-			mustCompile(`go\s+(build|vet|test|list|fmt|mod\s+(tidy|download|verify)|generate)(\s.*)?`),
-			mustCompile(`(make|npm|pnpm|yarn|bun)\s+(test|tests|lint|build|check|fmt|typecheck|verify)(\s.*)?`),
-			mustCompile(`(pytest|ruff|black|mypy|eslint|tsc|gofmt|golangci-lint|staticcheck)(\s.*)?`),
+			// Build and test: the agent's actual job.
+			mustCompile(`go\s+(build|vet|test|list|fmt|generate)(\s.*)?`),
+			mustCompile(`go\s+mod\s+(verify)(\s.*)?`),
+			mustCompile(`(make|npm|pnpm|yarn|bun)\s+(test|tests|lint|build|check|typecheck|verify)(\s.*)?`),
 			mustCompile(`(npm|pnpm|yarn|bun)\s+run\s+(test|lint|build|check|typecheck)(\s.*)?`),
+			// Checkers that only report. Formatters that rewrite files are in
+			// ExecutionAllow instead, so a read-only turn cannot change the tree.
+			mustCompile(`(ruff\s+check|mypy|eslint|tsc|staticcheck|golangci-lint|gofmt\s+-[ld])(\s.*)?`),
+		},
+		ExecutionAllow: []*regexp.Regexp{
+			// The user approved local commits in the task worktree, and never a
+			// push: `git push` stays on the deny list.
+			mustCompile(`git\s+add(\s.*)?`),
+			mustCompile(`git\s+commit(\s.*)?`),
+			mustCompile(`git\s+restore\s+--staged(\s.*)?`),
+			// Formatters and dependency updates that write.
+			mustCompile(`gofmt\s+-w(\s.*)?`),
+			mustCompile(`black(\s.*)?`),
+			mustCompile(`(prettier|ruff|eslint)(\s.*)?(--write|--fix|-w)(\s.*)?`),
+			mustCompile(`go\s+mod\s+(tidy|download)(\s.*)?`),
 		},
 		Deny: []*regexp.Regexp{
 			mustCompile(`(sudo|su|doas)\b.*`),
@@ -73,90 +105,17 @@ func DefaultArbiter() *Arbiter {
 			mustCompile(`git\s+(push|fetch|pull|clone|remote|config|reset|checkout|switch|clean|apply|rebase|merge|commit|add|rm|restore)\b.*`),
 			mustCompile(`(docker|podman|kubectl|helm|systemctl|launchctl|service|kill|pkill|killall|shutdown|reboot)\b.*`),
 			mustCompile(`(npm|pnpm|yarn|bun|pip|pip3|gem|cargo|go)\s+(install|publish|add|remove|uninstall|get)\b.*`),
-			mustCompile(`(sh|bash|zsh|fish|python|python3|perl|ruby|node|osascript|env)\b.*`),
+			mustCompile(`(sh|bash|zsh|fish|python|python3|perl|ruby|node|osascript|env|printenv)\b.*`),
 			mustCompile(`.*[;&|].*`), // any separator that survived splitting is suspicious
 		},
-		AllowKinds: map[string]bool{"read": true},
+		AllowKinds: map[string]bool{
+			// Read-only built-ins. `read` cannot leave the worktree because the
+			// ruleset denies external_directory outright.
+			"read": true, "glob": true, "grep": true, "list": true, "todowrite": true,
+		},
+		CurlHosts:        append([]string(nil), DefaultCurlHosts...),
+		CurlOutputPrefix: DefaultAttachmentPathPrefix,
 	}
-}
-
-// Decide answers one permission request.
-func (a *Arbiter) Decide(req PermissionRequest) Decision {
-	if a == nil {
-		return Decision{Reply: ReplyReject, Reason: "no permission policy is configured"}
-	}
-	if req.Permission != "bash" {
-		if a.AllowKinds[req.Permission] {
-			return a.allow("permission kind " + req.Permission + " is allowed")
-		}
-		return Decision{
-			Reply:  ReplyReject,
-			Reason: "permission kind \"" + req.Permission + "\" is not granted to unattended runs",
-		}
-	}
-
-	command := strings.TrimSpace(req.Metadata.Command)
-	if command == "" {
-		// Fall back to the request's own patterns: the server sends them
-		// alongside the command, and an empty command must not mean "allow".
-		command = strings.Join(req.Patterns, " && ")
-	}
-	if command == "" {
-		return Decision{Reply: ReplyReject, Reason: "permission request carries no command to judge"}
-	}
-
-	if unsafe, why := unsafeShell(command); unsafe {
-		return Decision{Reply: ReplyReject, Reason: why}
-	}
-
-	segments := splitSegments(command)
-	if len(segments) == 0 {
-		return Decision{Reply: ReplyReject, Reason: "permission request carries no command to judge"}
-	}
-
-	// The deny list runs before the other checks so a known-dangerous command gets
-	// the clearer reason ("rm is on the deny list") rather than a generic one.
-	for _, segment := range segments {
-		for _, deny := range a.Deny {
-			if deny.MatchString(segment) {
-				return Decision{
-					Reply:  ReplyReject,
-					Reason: fmt.Sprintf("command segment %q is on the deny list; run it yourself if it is really needed", segment),
-				}
-			}
-		}
-	}
-
-	if escapes, why := escapesWorktree(command); escapes {
-		return Decision{Reply: ReplyReject, Reason: why}
-	}
-
-	for _, segment := range segments {
-		if !a.matchesAny(segment) {
-			return Decision{
-				Reply:  ReplyReject,
-				Reason: fmt.Sprintf("command segment %q is not on the read-only allowlist; rephrase using inspection commands, or ask a human", segment),
-			}
-		}
-	}
-
-	// The patterns array must agree with the command: a pattern the policy has
-	// not seen means the metadata and the request disagree, which is not a state
-	// to guess in.
-	for _, pattern := range req.Patterns {
-		pattern = strings.TrimSpace(pattern)
-		if pattern == "" {
-			continue
-		}
-		if !a.matchesAny(pattern) {
-			return Decision{
-				Reply:  ReplyReject,
-				Reason: fmt.Sprintf("request pattern %q is not on the read-only allowlist", pattern),
-			}
-		}
-	}
-
-	return a.allow("all " + plural(len(segments), "segment") + " are read-only")
 }
 
 func (a *Arbiter) matchesAny(segment string) bool {
@@ -165,12 +124,7 @@ func (a *Arbiter) matchesAny(segment string) bool {
 			return false
 		}
 	}
-	for _, allow := range a.Allow {
-		if allow.MatchString(segment) {
-			return true
-		}
-	}
-	return false
+	return matchesAny(a.Allow, segment)
 }
 
 func (a *Arbiter) allow(reason string) Decision {
@@ -210,28 +164,62 @@ func escapesWorktree(command string) (bool, string) {
 
 // unsafeShell reports shell constructs that make a command impossible to judge by
 // looking at its segments alone.
+//
+// The scan is quote aware: a URL query string contains `&` and a grep pattern may
+// contain `>`, and neither is shell syntax inside quotes. Only unquoted
+// metacharacters change what a command does, so only those are rejected. Command
+// substitution is checked inside double quotes too, because it executes there,
+// while single quotes are literal.
 func unsafeShell(command string) (bool, string) {
-	switch {
-	case strings.Contains(command, "`"):
-		return true, "command substitution with backticks is not allowed"
-	case strings.Contains(command, "$("):
-		return true, "command substitution $(…) is not allowed"
-	case strings.Contains(command, ">"):
-		return true, "output redirection is not allowed (it turns a read into a write)"
-	case strings.Contains(command, "<"):
-		return true, "input redirection is not allowed"
-	case strings.Contains(command, "\x00"):
-		return true, "NUL byte in command"
-	}
-	for index, char := range command {
-		if char != '&' {
+	var quote byte
+	for index := 0; index < len(command); index++ {
+		char := command[index]
+		switch quote {
+		case '\'':
+			if char == '\'' {
+				quote = 0
+			}
+			continue
+		case '"':
+			switch {
+			case char == '\\':
+				index++
+			case char == '"':
+				quote = 0
+			case char == '`':
+				return true, "command substitution with backticks is not allowed"
+			case char == '$' && index+1 < len(command) && command[index+1] == '(':
+				return true, "command substitution $(…) is not allowed"
+			}
 			continue
 		}
-		previous := index > 0 && command[index-1] == '&'
-		next := index+1 < len(command) && command[index+1] == '&'
-		if !previous && !next {
-			return true, "background execution with & is not allowed"
+		switch char {
+		case 0:
+			return true, "NUL byte in command"
+		case '\'':
+			quote = '\''
+		case '"':
+			quote = '"'
+		case '`':
+			return true, "command substitution with backticks is not allowed"
+		case '$':
+			if index+1 < len(command) && command[index+1] == '(' {
+				return true, "command substitution $(…) is not allowed"
+			}
+		case '>':
+			return true, "output redirection is not allowed (it turns a read into a write)"
+		case '<':
+			return true, "input redirection is not allowed"
+		case '&':
+			previous := index > 0 && command[index-1] == '&'
+			next := index+1 < len(command) && command[index+1] == '&'
+			if !previous && !next {
+				return true, "background execution with & is not allowed"
+			}
 		}
+	}
+	if quote != 0 {
+		return true, "unbalanced quotes make the command impossible to judge"
 	}
 	return false, ""
 }
