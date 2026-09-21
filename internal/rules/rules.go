@@ -38,6 +38,12 @@ var DefaultSelfMarkers = []string{
 	"opencode 分析后自动生成",
 	"opencode 自动生成",
 	"请确认后再继续",
+	// The prompt requires this phrase in the sign-off, so an English reply that
+	// lost the HTML marker is still recognisable. The trade-off is deliberate and
+	// symmetric with the Chinese sentences above: a human who quotes our own
+	// sign-off loses that one comment, while a missed marker would start a turn
+	// that the human never asked for.
+	"generated automatically by opencode",
 }
 
 // SelfMarker is the literal the prompt requires on the last line of every reply.
@@ -111,10 +117,25 @@ func (p Policy) Defaults() Policy {
 	return p
 }
 
+// Trigger names what caused a turn. It exists so the reply can state, truthfully,
+// what the agent was reacting to: the model is told the basis and only renders it
+// in the issue's language, instead of inventing a reason for its own reply.
+type Trigger string
+
+const (
+	// TriggerCreated is the automatic read-only analysis of a new issue.
+	TriggerCreated Trigger = "issue_created"
+	// TriggerComment is a comment that matched the trigger or the analyze form.
+	TriggerComment Trigger = "comment"
+	// TriggerState is a workflow state change into one of the start states.
+	TriggerState Trigger = "state"
+)
+
 // Decision is the outcome of applying the policy.
 type Decision struct {
-	Action Action
-	Reason string
+	Action  Action
+	Trigger Trigger
+	Reason  string
 }
 
 // Decide applies the policy to one delivery.
@@ -143,18 +164,18 @@ func (p Policy) Decide(d Delivery, task TaskView) Decision {
 	if d.Event == "commentAdded" || d.Event == "commentUpdated" {
 		switch {
 		case startPattern(p.Trigger).MatchString(d.CommentText):
-			return p.startDecision(task, "comment matched "+p.Trigger)
+			return p.startDecision(task, TriggerComment, "comment matched "+p.Trigger)
 		case analyzePattern().MatchString(d.CommentText):
-			return Decision{Action: ActionAnalyze, Reason: "comment asked for analysis"}
+			return Decision{Action: ActionAnalyze, Trigger: TriggerComment, Reason: "comment asked for analysis"}
 		}
 	}
 
 	if value, field, ok := p.stateTransition(d); ok {
-		return p.startDecision(task, fmt.Sprintf("%s changed to %q", field, value))
+		return p.startDecision(task, TriggerState, fmt.Sprintf("%s changed to %q", field, value))
 	}
 
 	if d.Event == "issueCreated" && !p.SkipAnalyzeOnCreate {
-		return Decision{Action: ActionAnalyze, Reason: "issue was created"}
+		return Decision{Action: ActionAnalyze, Trigger: TriggerCreated, Reason: "issue was created"}
 	}
 
 	return Decision{Action: ActionIgnore, Reason: "no rule matched this event"}
@@ -163,11 +184,11 @@ func (p Policy) Decide(d Delivery, task TaskView) Decision {
 // startDecision picks between planning and executing, which is the "check whether
 // a plan exists first" step of the agreed workflow: with no plan yet, the turn
 // produces one and asks the questions that block implementation.
-func (p Policy) startDecision(task TaskView, reason string) Decision {
+func (p Policy) startDecision(task TaskView, trigger Trigger, reason string) Decision {
 	if task.Plan == registry.PlanNone {
-		return Decision{Action: ActionPlan, Reason: reason + "; no plan exists yet, so plan first"}
+		return Decision{Action: ActionPlan, Trigger: trigger, Reason: reason + "; no plan exists yet, so plan first"}
 	}
-	return Decision{Action: ActionExecute, Reason: reason + "; a plan exists"}
+	return Decision{Action: ActionExecute, Trigger: trigger, Reason: reason + "; a plan exists"}
 }
 
 // stateTransition reports the first configured state field that moved into one of
@@ -237,4 +258,50 @@ func startPattern(trigger string) *regexp.Regexp {
 // unambiguous, and the reply of the agent itself must never look like one.
 func analyzePattern() *regexp.Regexp {
 	return regexp.MustCompile(`(?i)^\s*/opencode\s*(analyze)?\s*$`)
+}
+
+// Basis renders what triggered a turn as a short English clause, for the reply's
+// sign-off. It is derived from the delivery and the policy rather than asked of
+// the model: a model asked to explain its own reply writes something plausible
+// instead of something true.
+func (p Policy) Basis(decision Decision, d Delivery) string {
+	p = p.Defaults()
+	switch decision.Trigger {
+	case TriggerCreated:
+		return "the creation of this issue"
+	case TriggerComment:
+		if text := firstLine(d.CommentText, 80); text != "" {
+			return fmt.Sprintf("the comment %q", text)
+		}
+		return "a comment on this issue"
+	case TriggerState:
+		for _, name := range p.StateFields {
+			value, present := d.States[name]
+			if !present {
+				continue
+			}
+			for _, wanted := range p.StartStates {
+				if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(wanted)) {
+					return fmt.Sprintf("the state change of %s to %q", name, value)
+				}
+			}
+		}
+		return "a workflow state change"
+	default:
+		return "a FlowHub automation trigger"
+	}
+}
+
+// firstLine collapses a comment to one short line, so a quoted comment cannot
+// turn the sign-off into a copy of the issue thread.
+func firstLine(text string, limit int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) > limit {
+		return string(runes[:limit]) + "…"
+	}
+	return text
 }

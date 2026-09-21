@@ -181,7 +181,13 @@ documents. The rules below are load-bearing; do not relax them casually.
     reply, a probe against the task's recorded last reply (for when the marker is
     lost), and an anchored trigger (`^\s*/opencode start\b`) so a reply that
     merely *mentions* the trigger cannot fire one. Do not loosen the anchoring,
-    and do not add a natural-language trigger.
+    and do not add a natural-language trigger. The reply must also end with a
+    blockquote that says opencode generated it and **what triggered the turn**,
+    because a reader has to be able to tell an automated reply from a human one
+    and judge whether the turn answered the right question. That basis comes from
+    `Policy.Basis(decision, delivery)` — never from the model, which will invent a
+    plausible reason when asked to explain itself. The marker stays the last line,
+    inside the blockquote.
 11. **Dispatch must be stoppable without a restart.** `FLOWHUB_PAUSE_FILE`
     (default `<DataDir>/DISPATCH_OFF`) is checked before every delivery: while it
     exists, deliveries are audited and ignored. A kill switch that needs an API, a

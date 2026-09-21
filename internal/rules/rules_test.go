@@ -205,3 +205,93 @@ func TestPromptForAnUnknownActionIsEmpty(t *testing.T) {
 		t.Fatalf("prompt = %q, want empty", got)
 	}
 }
+
+func TestBasisNamesTheRealTrigger(t *testing.T) {
+	policy := Policy{}.Defaults()
+
+	comment := Delivery{
+		Event: "commentAdded", IssueID: "TEST-20", ProjectKey: "TEST",
+		CommentText: "/opencode start\n\n请开始实施",
+	}
+	state := Delivery{
+		Event: "issueUpdated", IssueID: "TEST-20", ProjectKey: "TEST",
+		States: map[string]string{"State": "In Progress"},
+	}
+	cases := map[string]struct {
+		decision Decision
+		delivery Delivery
+		want     string
+	}{
+		"created": {Decision{Trigger: TriggerCreated}, Delivery{Event: "issueCreated"}, "the creation of this issue"},
+		"comment": {Decision{Trigger: TriggerComment}, comment, `the comment "/opencode start 请开始实施"`},
+		"state":   {Decision{Trigger: TriggerState}, state, `the state change of State to "In Progress"`},
+		"unknown": {Decision{}, Delivery{}, "a FlowHub automation trigger"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := policy.Basis(tc.decision, tc.delivery); got != tc.want {
+				t.Fatalf("Basis = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// A long comment must not be copied into the sign-off whole.
+	long := Delivery{CommentText: strings.Repeat("很长的一段话", 40)}
+	if got := policy.Basis(Decision{Trigger: TriggerComment}, long); len([]rune(got)) > 120 {
+		t.Fatalf("Basis copied too much of the comment: %d runes", len([]rune(got)))
+	}
+}
+
+func TestPromptRequiresABlockquoteSignOff(t *testing.T) {
+	policy := Policy{}.Defaults()
+	delivery := Delivery{Event: "issueCreated", IssueID: "TEST-20", ProjectKey: "TEST", Summary: "s"}
+	decision := Decision{Action: ActionAnalyze, Trigger: TriggerCreated}
+	ctx := PromptContext{
+		Worktree: "/wt/TEST-20", Repository: "mine/test", Author: "yusiwen",
+		Basis: policy.Basis(decision, delivery),
+	}
+	prompt := policy.Prompt(ActionAnalyze, delivery, ctx)
+
+	for _, want := range []string{
+		"> This comment was generated automatically by opencode, from the creation of this issue.",
+		"> " + SelfMarker,
+		"blockquote",
+		"in the language of the issue",
+		"The final line of the comment must be `> " + SelfMarker + "`",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt is missing %q", want)
+		}
+	}
+
+	// The sign-off is the last element: the "how to proceed" line has to come
+	// before it, or the marker stops being the final line of the reply.
+	proceed := strings.Index(prompt, "how to proceed")
+	signoff := strings.Index(prompt, "Sign-off")
+	if proceed < 0 || signoff < 0 || proceed > signoff {
+		t.Fatalf("ordering is wrong: proceed=%d signoff=%d", proceed, signoff)
+	}
+
+	// The execution turn has no "how to proceed" line but still signs off.
+	exec := policy.Prompt(ActionExecute, delivery, PromptContext{Basis: ctx.Basis})
+	if strings.Contains(exec, "how to proceed") {
+		t.Error("the execution prompt tells the maintainer how to start")
+	}
+	if !strings.Contains(exec, "> "+SelfMarker) {
+		t.Error("the execution prompt has no sign-off")
+	}
+
+	// A caller that forgot the basis still gets a usable sentence.
+	bare := policy.Prompt(ActionAnalyze, delivery, PromptContext{})
+	if !strings.Contains(bare, "from a FlowHub automation trigger.") {
+		t.Error("the prompt has no fallback basis")
+	}
+}
+
+func TestTheNewEnglishSignOffIsRecognisedAsOurOwn(t *testing.T) {
+	policy := Policy{}.Defaults()
+	reply := "## Analysis\n\nNothing blocking.\n\n> This comment was generated automatically by opencode, from the creation of this issue.\n> \n"
+	if self, why := policy.isSelfComment(reply, ""); !self {
+		t.Fatalf("an English sign-off was not recognised as ours: %q", why)
+	}
+}

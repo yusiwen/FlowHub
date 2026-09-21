@@ -231,7 +231,13 @@ func TestIssueCreatedRunsAReadOnlyAnalysisTurn(t *testing.T) {
 		t.Fatalf("sessions=%d prompts=%d, want one turn", fake.sessions, len(fake.prompts))
 	}
 	prompt := fake.prompts[0]
-	for _, want := range []string{"READ-ONLY", "TEST-40", rules.SelfMarker, "youtrack_add_issue_comment", ".flowhub/attachments"} {
+	for _, want := range []string{
+		"READ-ONLY", "TEST-40", rules.SelfMarker, "youtrack_add_issue_comment", ".flowhub/attachments",
+		// The sign-off has to state what triggered the turn, and the basis must
+		// come from the decision rather than from the model's own account.
+		"from the creation of this issue.",
+		"The final line of the comment must be `> " + rules.SelfMarker + "`",
+	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt is missing %q", want)
 		}

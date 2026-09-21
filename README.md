@@ -290,8 +290,14 @@ What a maintainer sees, once `FLOWHUB_DISPATCH=1`:
    in its worktree, runs the narrowest test or build it can find, and commits
    locally on branch `flowhub/<issue key>`. It never pushes and never touches the
    shared checkout. The branch is what a human reviews.
-4. Every turn ends with exactly one YouTrack comment, ending in
-   `<!-- flowhub-auto -->`. That marker is how FlowHub recognises its own replies.
+4. Every turn ends with exactly one YouTrack comment. The last element of that
+   comment is a Markdown blockquote that says the reply was produced
+   automatically by opencode and names what triggered the turn — measured
+   rendering: `> 本评论由 opencode 自动生成，触发来源是本问题的创建。` — and its
+   final line is `> <!-- flowhub-auto -->`. The marker is how FlowHub recognises
+   its own replies; the blockquote is how a *reader* can tell an automated reply
+   from a human one, and the trigger it names comes from the decision rather than
+   from the model's own account of why it replied.
 
 Which deliveries become work is a pure function of the delivery and the recorded
 task (`internal/rules`), so it is unit tested without opencode, git or the
@@ -359,7 +365,8 @@ and the YouTrack comments themselves.
 | `issueCreated` | analyze | read-only turn, 19s, $0.0035, three bash permissions answered, one comment posted with the marker; no file changed |
 | `commentAdded` `/opencode start` (plan on file) | execute | 26s, $0.0022, edited `README.md`, committed `d1bae41` on `flowhub/TEST-13` (signed, not pushed), one comment posted |
 | `issueUpdated` State → `In Progress` (no plan yet) | plan | 31s, $0.0051, plan comment with its blocking questions |
-| the agent's own comment, marker included | ignore | `our own comment (contains <!-- flowhub-auto -->)` |
+| the agent's own comment, marker included | ignore | `our own comment (contains <!-- flowhub-auto -->)` — the marker is found inside the sign-off blockquote |
+| `issueCreated` TEST-18, after the sign-off change | analyze | 11s, $0.0031, reply ended with `> This comment was generated automatically by opencode, from the creation of this issue.` rendered in Chinese |
 | the same reply with the marker stripped | ignore | `our own comment (repeats our previous reply)` |
 | a comment that merely mentions `/opencode start` | ignore | `no rule matched this event` — the trigger is anchored |
 

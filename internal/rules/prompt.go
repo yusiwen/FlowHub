@@ -16,6 +16,10 @@ type PromptContext struct {
 	Repository string
 	// Author is the YouTrack login whose action triggered this turn.
 	Author string
+	// Basis is what caused the turn, as a short English clause the sign-off can
+	// translate ("the creation of this issue", `the comment "/opencode start"`).
+	// It comes from the decision, so the reply cannot claim a reason of its own.
+	Basis string
 }
 
 // Prompt writes the instruction for one turn.
@@ -104,17 +108,35 @@ func (p Policy) Prompt(action Action, d Delivery, ctx PromptContext) string {
 	fmt.Fprintf(&b, "Post exactly one comment on issue %s with the `youtrack_add_issue_comment` tool.\n", d.IssueID)
 	b.WriteString("Write it for the maintainer reading the issue: what you found or changed, what you verified, and what\n")
 	b.WriteString("you need from them. Keep it short. Do not post any other comment.\n")
-	fmt.Fprintf(&b, "The last line of the comment must be exactly: %s\n", SelfMarker)
-	b.WriteString("That marker lets the automation recognise its own replies; without it the reply is treated as a human\n")
-	b.WriteString("instruction and starts another turn.\n")
 	if action != ActionExecute {
 		// The agent is the only thing the maintainer talks to, so it has to name
 		// the exact command that starts the implementation; it comes from the
 		// policy rather than being written out here, so a configured trigger
 		// cannot drift away from what the agent tells people to type.
-		fmt.Fprintf(&b, "Close by telling the maintainer how to proceed: comment `%s` on the issue, or move it to %s.\n",
+		fmt.Fprintf(&b, "Before the sign-off, tell the maintainer how to proceed: comment `%s` on the issue, or move it to %s.\n",
 			p.Trigger, strings.Join(p.StartStates, " / "))
 	}
+
+	// The sign-off is a blockquote so a reader can tell an automated reply from a
+	// human one at a glance, and it states the basis because the recipient has to
+	// judge whether the turn was even asking for what it answered. The basis is
+	// computed from the decision, not from the model's own account of itself: a
+	// model asked "why did you reply?" will invent a plausible reason.
+	basis := ctx.Basis
+	if strings.TrimSpace(basis) == "" {
+		basis = "a FlowHub automation trigger"
+	}
+	b.WriteString("\n### Sign-off (the last element of the comment)\n")
+	b.WriteString("End the comment with a Markdown blockquote of at most two lines that says the reply was produced\n")
+	b.WriteString("automatically by opencode and what triggered this turn. Use the trigger given here verbatim in\n")
+	b.WriteString("meaning — do not substitute your own explanation of why you replied:\n\n")
+	fmt.Fprintf(&b, "> This comment was generated automatically by opencode, from %s.\n", basis)
+	fmt.Fprintf(&b, "> %s\n", SelfMarker)
+	b.WriteString("\nWrite that statement in the language of the issue (translate the sentence above; keep the code,\n")
+	b.WriteString("paths and identifiers inside it as they are). The example is English only because this prompt is.\n")
+	fmt.Fprintf(&b, "The final line of the comment must be `> %s`: a blockquote line whose only content is the marker.\n", SelfMarker)
+	b.WriteString("That marker lets the automation recognise its own replies; without it the reply is treated as a human\n")
+	b.WriteString("instruction and starts another turn.\n")
 	return b.String()
 }
 

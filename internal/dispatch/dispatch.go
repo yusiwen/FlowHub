@@ -373,6 +373,9 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 		AttachmentsDir: d.opts.AttachmentsDir,
 		Repository:     match.Entry.Repo.Path,
 		Author:         rec.PrimaryActor,
+		// The sign-off states what the agent was reacting to; it comes from the
+		// decision, so the reply cannot invent a reason for itself.
+		Basis: d.opts.Rules.Basis(decision, delivery),
 	})
 	if prompt == "" {
 		d.log.Error("no prompt was built for the action", "action", decision.Action, "issue", rec.IssueID)

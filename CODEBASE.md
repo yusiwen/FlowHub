@@ -34,7 +34,7 @@ turn inside a per-task git worktree.
 | `internal/opencode/` | opencode client (`client.go`, `types.go`), permission arbiter (`arbiter.go`), phase-aware policy (`phase.go`) and the one-turn runner (`runner.go`) |
 | `internal/worktree/` | One git worktree per task, branch `flowhub/<task key>`, `.flowhub/` scratch excluded through `info/exclude` |
 | `internal/registry/` | Append-only task registry (`registry.jsonl`): issue → repository, worktree, session, state, plan state, turns, cost, last reply |
-| `internal/rules/` | Trigger policy (`rules.go`: ignore/analyze/plan/execute, self-comment detection, turn budget) and the per-turn prompt (`prompt.go`) |
+| `internal/rules/` | Trigger policy (`rules.go`: ignore/analyze/plan/execute, trigger origin, `Basis`, self-comment detection, turn budget) and the per-turn prompt (`prompt.go`: ground rules, phase instructions, the reply sign-off contract) |
 | `internal/dispatch/` | The worker: queue, routing, worktree cache, phase arbiter, session reuse, registry update, audit log |
 | `internal/metrics/metrics.go` | Counters behind `/healthz` |
 | `README.md` | Operator-facing documentation: config table, log formats, pipeline, jq recipes, verification checklist |
