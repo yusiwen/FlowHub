@@ -1,9 +1,9 @@
 {
   "_comment": "FlowHub routing table: which local repository each YouTrack project drives.",
-  "_comment_usage": "Copy to config/projects.json (or point FLOWHUB_PROJECTS_FILE at it) and replace every placeholder below. This file is NOT loaded by default: the default path is config/projects.json.",
+  "_comment_usage": "Copy to ~/.config/flowhub/config.json ($XDG_CONFIG_HOME/flowhub/config.json when set) and replace every placeholder below; that is the default path, and FLOWHUB_PROJECTS_FILE overrides it. This file in the repository is NOT loaded by default.",
   "_comment_why": "This mapping cannot be read from YouTrack: the webhook payload carries only {key, name, shortName}, and YouTrack exposes no REST field or endpoint for the VCS-integration repository URL. Routing is therefore declared here, and an unmapped project is refused rather than guessed.",
   "_comment_matching": "youtrack_key is matched against the payload's project.key, case-insensitively. If a payload carries no project object, the prefix of the issue ID (TEST-11 -> TEST) is used as a fallback. A project key that is present but unmapped is a hard miss.",
-  "_comment_startup": "Validation runs before any file is created: every path must exist, look like a git work tree, and match repo.remote. A problem stops the process — including the placeholders below, which is intentional. Leave 'remote' empty to skip only the remote comparison.",
+  "_comment_startup": "Validation runs before any file is created: every path must exist, look like a git work tree, and match repo.remote. A problem stops the process. Leave 'remote' empty to skip only the remote comparison. A *disabled* entry is skipped entirely, which is why the placeholder below is disabled.",
 
   "projects": [
     {
@@ -16,12 +16,12 @@
         "remote": "git@your-git-host:owner/repo.git",
         "default_branch": "main"
       },
-      "_comment_worktrees": "Base directory for the one-git-worktree-per-task isolation. Must be absolute and outside repo.path. Created on demand, so it does not have to exist yet.",
+      "_comment_worktrees": "Base directory for the one-git-worktree-per-task isolation. Must be absolute and outside repo.path. Created on demand, so it does not have to exist yet. Required once dispatch is on (FLOWHUB_DISPATCH=1), unless the global FLOWHUB_WORKTREE_BASE provides a fallback.",
       "worktrees": "/absolute/path/to/flowhub-worktrees",
-      "_comment_agent": "Passed to opencode when the task session is created. Leave model empty to use the agent's own default.",
+      "_comment_agent": "Passed to opencode when the task session is created; it wins over FLOWHUB_DISPATCH_AGENT. Leave model empty to use the agent's own default.",
       "agent": "devops",
       "model": "deepseek/deepseek-v4-flash",
-      "_comment_authors": "Optional per-project author allowlist (YouTrack logins). Empty means the global allowlist decides. issueDeleted carries no actor, so it can never match an author list.",
+      "_comment_authors": "Optional per-project author allowlist (YouTrack logins, case-insensitive). Empty means every actor the routing matches; a non-empty list gets no work from anyone it does not name. issueDeleted carries no actor, so a project with an allowlist can never act on one.",
       "authors": ["your-youtrack-login"],
       "_comment_enabled": "enabled defaults to true. A disabled entry is never matched and is not validated, so it may point at a checkout this host does not have.",
       "enabled": false

@@ -1,12 +1,19 @@
-# FlowHub — YouTrack webhook receiver (phase 1)
+# FlowHub — YouTrack webhook receiver and opencode dispatcher
 
-The first implemented slice of FlowHub: a Go service that receives YouTrack
-webhook deliveries, authenticates and validates them, deduplicates, writes an
-audit record, and answers `202 Accepted` in well under a millisecond.
+A Go service that turns DevOps events into work for a headless `opencode`
+instance. One process, two halves:
 
-It is intentionally a **pure receiver**. It never calls YouTrack, opencode or any
-other network service on the request path. Wiring the events to `opencode serve`
-is phase 2 (`opencode-devops-orchestration-design.md` §12.1).
+* **the receiver**, always on: authenticates and validates each YouTrack webhook
+  delivery, deduplicates it, writes an audit record, and answers `202 Accepted` in
+  well under a millisecond. It never calls YouTrack, opencode or any other
+  network service on the request path.
+* **the dispatcher**, opt-in through `FLOWHUB_DISPATCH=1`: takes an *accepted*
+  delivery off a queue and runs one opencode turn for it, inside a git worktree
+  created for that issue alone. The agent reads the issue, replies with a
+  comment, and — once a human says so — implements the change on its own branch.
+
+With dispatch off, the process is exactly the receiver described above: it
+records, it audits, and it does nothing else.
 
 The three documents in the repository root are the specification:
 
@@ -14,7 +21,7 @@ The three documents in the repository root are the specification:
 | --- | --- |
 | `youtrack-webhook-and-flowhub-security.md` | YouTrack side, payload facts, layered security design (§8, §9, §12) |
 | `opencode-devops-orchestration-design.md` | Overall FlowHub architecture, session ownership, event-driven model |
-| `opencode-headless-automation-and-permissions.md` | opencode HTTP API and the permission loop used in phase 2 |
+| `opencode-headless-automation-and-permissions.md` | opencode HTTP API and the permission loop the dispatcher drives |
 
 ## Why the receiver looks like this
 
@@ -108,6 +115,30 @@ Flags: `-version`, `-print-config`.
 | `FLOWHUB_SHUTDOWN_TIMEOUT` | `10s` | Graceful drain budget on `SIGINT`/`SIGTERM` |
 | `FLOWHUB_PROJECTS_FILE` | `~/.config/flowhub/config.json` | Routing table: YouTrack project → local repository. `$XDG_CONFIG_HOME/flowhub/config.json` when that is set. A leading `~` is expanded, and the path is made absolute at startup. A missing file only warns; a file that exists but fails validation stops startup |
 
+The dispatcher (`opencode-devops-orchestration-design.md` §12) is off until it is
+switched on explicitly:
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `FLOWHUB_DISPATCH` | `false` | Run opencode turns for accepted deliveries. Off means record-only |
+| `FLOWHUB_OPENCODE_URL` | `http://127.0.0.1:4096` | Base URL of the local headless opencode server. Startup probes `/global/health` and refuses to start if it does not answer |
+| `FLOWHUB_DISPATCH_AGENT` | `devops` | opencode agent for turns whose routing entry names none |
+| `FLOWHUB_DISPATCH_QUEUE` | `32` | Deliveries waiting for the single worker. A full queue drops work instead of blocking the publisher |
+| `FLOWHUB_TASK_DEADLINE` | `15m` | One turn's budget. A deadline is not a failure: the session keeps running and is marked `executing` |
+| `FLOWHUB_MAX_TURNS` | `8` | A task that triggers more often than this stops and asks for a human |
+| `FLOWHUB_TASK_MAX_COST` | `0` | Stop a task whose accumulated opencode cost passes this many dollars. `0` disables the check |
+| `FLOWHUB_TRIGGER` | `/opencode start` | The comment that means "implement it" |
+| `FLOWHUB_START_STATES` | `In Progress` | Comma separated workflow states that mean "implement it" |
+| `FLOWHUB_SKIP_ANALYZE_ON_CREATE` | `false` | Skip the automatic read-only analysis of a newly created issue |
+| `FLOWHUB_REGISTRY_FILE` | `<DataDir>/registry.jsonl` | Task registry: issue → repository, worktree, session, state, cost |
+| `FLOWHUB_PAUSE_FILE` | `<DataDir>/DISPATCH_OFF` | Kill switch. While this file exists, deliveries are audited and ignored |
+| `FLOWHUB_WORKTREE_BASE` | *(unset)* | Fallback worktree directory for routing entries that declare none |
+
+`FLOWHUB_DISPATCH=1` refuses to start when dispatching cannot work: no routing
+table, an entry with no `default_branch`, an entry with no `worktrees` directory
+and no fallback, or an opencode server that is not answering. A hub that accepts
+deliveries and then fails every one of them is worse than one that does not start.
+
 Disabled locks produce a loud startup warning, and `-print-config` lists the
 active locks. All three locks are expected to be set once the public entry exists
 (`youtrack-webhook-and-flowhub-security.md` §12.2).
@@ -174,7 +205,7 @@ before any file is created:
 Keys whose name starts with `_` are documentation and are ignored, which is how
 the example carries its explanations in a format without comments.
 
-A **missing** file is only a warning: phase 1 records deliveries without routing
+A **missing** file is only a warning: the receiver records deliveries without routing
 them.
 
 The table lives **outside the repository**, at `~/.config/flowhub/config.json`
@@ -190,11 +221,6 @@ file — whatever the working directory was. The committed template is
 > `POST /session`, the `task_session` registry) is the next step.
 
 ## opencode integration
-
-The receiver is being wired to a local `opencode serve` (default
-`http://127.0.0.1:4096`). `internal/opencode` holds the client and the runner that
-drives one unattended turn; the dispatcher that decides *when* to run one is the
-next step, so nothing in the delivery path calls opencode yet.
 
 ```bash
 make test-live                                        # throwaway directory
@@ -221,9 +247,12 @@ pending permission keeps a session `busy` — so "busy" never means "working" an
 
 ### Permissions are decided in two layers
 
-1. **Session-level ruleset** (first line): denies `edit`, `external_directory`,
-   `webfetch` and `websearch` outright, which removes those tools entirely, and
-   sets `bash: ask`.
+1. **Session-level ruleset** (first line): a short allowlist — reads and the
+   YouTrack tools the turn needs — over a catch-all `ask`. The catch-all has to
+   come **first**, because the ruleset is an array evaluated *last-match-wins*: a
+   trailing catch-all overrides every specific entry before it. `edit` is `ask`
+   rather than `deny`, because only the phase can decide whether a change is
+   allowed, and the arbiter is what answers it.
 2. **Arbiter** (second line): answers the `ask` requests, which would otherwise
    hang the turn forever. It is an allowlist over shell *segments*:
    * the command is split on `&&`, `||`, `;`, `|` and newlines, and **every**
@@ -243,7 +272,113 @@ pending permission keeps a session `busy` — so "busy" never means "working" an
 Measured on 2026-09-20 against opencode 1.18.31: a read-only turn finishes in
 about 6 seconds, and the model often submits a *compound* command
 (`git status && echo --- && git log -3 && git branch --show-current`) as a single
-permission request with one pattern per command.
+permission request with one pattern per command. A live two-turn task (analysis,
+then implementation of a one-file change) costs roughly half a cent.
+
+## The dispatch workflow
+
+What a maintainer sees, once `FLOWHUB_DISPATCH=1`:
+
+1. **An issue is created.** The agent gets a read-only turn: it inspects the
+   repository in a fresh worktree, then posts one comment with what it found, the
+   risks and the open questions. It cannot edit, commit or change YouTrack state
+   in this phase.
+2. **Either** somebody comments `/opencode start`, **or** the issue moves to a
+   state listed in `FLOWHUB_START_STATES`. If no plan has been produced yet, that
+   turn produces the plan and the blocking questions instead of implementing.
+3. **With a plan in hand, the same trigger implements it**: the agent edits files
+   in its worktree, runs the narrowest test or build it can find, and commits
+   locally on branch `flowhub/<issue key>`. It never pushes and never touches the
+   shared checkout. The branch is what a human reviews.
+4. Every turn ends with exactly one YouTrack comment, ending in
+   `<!-- flowhub-auto -->`. That marker is how FlowHub recognises its own replies.
+
+Which deliveries become work is a pure function of the delivery and the recorded
+task (`internal/rules`), so it is unit tested without opencode, git or the
+network:
+
+| Delivery | Action |
+| --- | --- |
+| Our own comment (marker, a distinctive repeat of our last reply, or `/opencode` in any other form) | ignore |
+| Task already at `FLOWHUB_MAX_TURNS` | ignore, and ask for a human |
+| `/opencode start` comment, or the configured state change, **and** no plan yet | plan |
+| `/opencode start` comment, or the configured state change, **with** a plan | execute |
+| `issueCreated` (unless `FLOWHUB_SKIP_ANALYZE_ON_CREATE=1`) | analyze |
+| Anything else, including a project with no repository mapped | ignore |
+
+The trigger is anchored, so a reply that merely *mentions* `/opencode start` — as
+the agent's own analysis does, when it tells the maintainer how to continue —
+cannot start anything. Loop prevention therefore has three independent layers:
+the marker, a probe against the text of our last reply (for when the marker gets
+lost), and the anchored trigger.
+
+### The task registry and the worktree
+
+One task is one YouTrack issue. The registry
+(`<DataDir>/registry.jsonl`, append-only) records, per task: the repository, the
+worktree, the opencode session id, the agent, the state, the plan state, the
+number of turns, the accumulated cost, and the agent's last reply text. State
+moves `analyzing → awaiting_input → executing → done`, with `failed` for a turn
+that broke.
+
+The worktree is the real containment. Each task gets its own checkout from the
+entry's `default_branch`, on its own branch, under the entry's `worktrees`
+directory (which validation requires to be outside the repository). The agent
+therefore cannot walk into another task's checkout, and the dispatcher refuses to
+reuse a session when the routing table now points at a different repository than
+the task was created against.
+
+One worker runs turns, on purpose: the session model is one turn at a time, and a
+prompt delivered to a busy session is silently swallowed. More workers would need
+per-task locking first.
+
+### The agent definition
+
+FlowHub passes `agent: devops` when it creates the session; the agent itself lives
+outside this repository, in the opencode configuration
+(`~/.config/opencode/agents/devops.md` on this host). That file owns the model,
+the step budget and the durable part of the contract — untrusted issue text, only
+your own worktree, never push, never touch secrets, one reply with the marker.
+The per-turn prompt (`internal/rules/prompt.go`) restates the parts that must hold
+even if the agent file is changed. A routing entry may name its own `agent`
+instead, and that wins over `FLOWHUB_DISPATCH_AGENT`.
+
+The session-level ruleset in `internal/opencode/phase.go` stays the first
+permission layer and the arbiter the second, in both phases. The execution phase
+is the only phase in which `edit` is granted, which is what keeps an analysis turn
+harmless even if the model decides to be helpful.
+
+### Measured on this host
+
+Live run on 2026-09-21 against opencode 1.18.31, TEST project, a repository whose
+only file is `README.md`. Every row is from the application log, the task registry
+and the YouTrack comments themselves.
+
+| Delivery | Action | Result |
+| --- | --- | --- |
+| `issueCreated` | analyze | read-only turn, 19s, $0.0035, three bash permissions answered, one comment posted with the marker; no file changed |
+| `commentAdded` `/opencode start` (plan on file) | execute | 26s, $0.0022, edited `README.md`, committed `d1bae41` on `flowhub/TEST-13` (signed, not pushed), one comment posted |
+| `issueUpdated` State → `In Progress` (no plan yet) | plan | 31s, $0.0051, plan comment with its blocking questions |
+| the agent's own comment, marker included | ignore | `our own comment (contains <!-- flowhub-auto -->)` |
+| the same reply with the marker stripped | ignore | `our own comment (repeats our previous reply)` |
+| a comment that merely mentions `/opencode start` | ignore | `no rule matched this event` — the trigger is anchored |
+
+Two arbiter decisions from the same run are worth keeping: `git remote -v` was
+rejected by the deny list, and an absolute path (`ls -la /Users/…/TEST-14`) was
+rejected as outside the worktree. In both cases the model read the reason and
+rephrased, which is why a rejection is a safe default rather than a dead end. The
+one rough edge: a `git commit -m "<multi-line message>"` is split on the newline
+inside the message, so the second line is judged as a command and rejected; the
+model recovered by sending a single-line subject.
+
+### Stopping it
+
+* `touch <FLOWHUB_PAUSE_FILE>` (default `<DataDir>/DISPATCH_OFF`) — every delivery
+  is still audited, nothing runs. Remove the file to resume: no API, no restart,
+  no credential.
+* `FLOWHUB_DISPATCH=0` and a restart.
+* `GET /healthz` shows `dispatch.{queued,handled,ignored,dropped,paused,agent}`,
+  and `-print-config` prints the effective policy.
 
 ## Endpoints
 
@@ -251,7 +386,7 @@ permission request with one pattern per command.
 | --- | --- |
 | `POST /hooks/youtrack/<key>` | The webhook entry point |
 | `POST /hooks/youtrack?k=<key>` | Same, for deployments that prefer a query string (the app only requires a URL that is not comma separated) |
-| `GET /healthz` | Local only; counters, active locks, queue depth, current audit file. nginx does not proxy this path |
+| `GET /healthz` | Local only; counters, active locks, queue depth, current audit file, dispatch counters and pause state. nginx does not proxy this path |
 
 ## Pipeline and rejection reasons
 
@@ -377,7 +512,7 @@ jq -r '.handled_ms' data/*.jsonl | sort -n | tail -3
 jq -r 'select(.payload_schema) | "\(.event)\t\(.payload_schema | join(" "))"' data/*.jsonl | sort -u
 ```
 
-## Phase 1 verification: closing the open questions
+## Receiver verification: closing the open questions
 
 The design documents list facts that could only be confirmed by a real delivery
 (§13). Every one of them is answerable from the logs without changing code.
@@ -547,9 +682,21 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 Siwen Yu.
 
 ## Not implemented yet
 
-* Phase 2: `task_key → session_id` registry, per-session serial queue, SSE
-  subscription, the `devops` agent and the permission arbiter.
-* Phase 2: YouTrack rules (author allowlist, `/opencode` trigger, project
-  allowlist) and reply-back to the issue.
-* Phase 3: alerting, key rotation, budget circuit breaker, optional HMAC signing
-  through a custom workflow rule, and the always-on aliyun shim.
+* Structured "are there blocking questions?" output. Today the agent is asked to
+  say so in prose and a human starts the implementation; a later version can use
+  opencode's `json_schema` output format to gate `/opencode start` on a machine
+  readable answer.
+* **Enforced refusal of credential-shaped reads.** opencode's own `read *.env`
+  gate is overridden by FlowHub's session ruleset (`read` is allowed so the agent
+  can read source), and the arbiter allows the `read` tool by name without looking
+  at the path. The prompt and the agent definition both forbid reading secrets, so
+  the layer that is missing is the mechanical one; closing it needs the shape of a
+  `read` permission request measured first, then a pattern check in the arbiter.
+* Reconciliation polling: a delivery lost while FlowHub was down is lost, because
+  the published webhook app does not retry. A periodic sweep of issues in the
+  start states would close that gap.
+* FlowHub posting the reply itself (today the agent posts it through the YouTrack
+  MCP server, so FlowHub holds no YouTrack credential).
+* More than one dispatch worker, which needs per-task locking first.
+* Phase 3: alerting, key rotation, and optional HMAC signing through a custom
+  workflow rule.

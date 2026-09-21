@@ -58,6 +58,14 @@ func (p Policy) Prompt(action Action, d Delivery, ctx PromptContext) string {
 		fmt.Fprintf(&b, "- The comment that triggered this turn (from %s):\n\n```\n%s\n```\n",
 			authorOrUnknown(d.Actor), strings.TrimSpace(d.CommentText))
 	}
+	// The text above is copied from the payload, which is partial by design: a
+	// comment delivery carries no description, and every delivery can be stale by
+	// the time it is processed. YouTrack is the source of truth, so the agent has
+	// to know it may go and read it.
+	b.WriteString("\nYouTrack is the source of truth for this issue. The text above is a copy taken from the event\n")
+	b.WriteString("payload, so it can be incomplete or out of date. Read the live issue with `youtrack_get_issue`\n")
+	b.WriteString("(fields and attachment list) and `youtrack_get_issue_comments` (the discussion) before you decide\n")
+	b.WriteString("anything, and fetch those attachments you actually need.\n")
 	if ctx.Worktree != "" {
 		fmt.Fprintf(&b, "\n## Workspace\n\n- Working directory: `%s` (a dedicated git worktree for this task)\n", ctx.Worktree)
 	}

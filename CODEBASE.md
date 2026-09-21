@@ -9,8 +9,10 @@ FlowHub is a Go service that turns DevOps events into work for a headless
 `opencode` instance. Target event sources are YouTrack, Gitea and Drone; the
 first implemented source is YouTrack.
 
-Current state: **phase 1 complete** — the YouTrack webhook receiver exists,
-is tested, and only records deliveries. It does **not** talk to opencode yet.
+Current state: the YouTrack webhook receiver and the opencode dispatcher are
+both implemented and tested. The receiver always records; the dispatcher is
+opt-in (`FLOWHUB_DISPATCH=1`) and turns an accepted delivery into one opencode
+turn inside a per-task git worktree.
 
 ## Where things live
 
@@ -29,7 +31,11 @@ is tested, and only records deliveries. It does **not** talk to opencode yet.
 | `internal/store/jsonl.go` | Daily rotating append-only JSONL writer (`webhook-YYYY-MM-DD.jsonl`, `0600`) |
 | `internal/store/detail.go` | Human readable per-delivery payload log (`payload-YYYY-MM-DD.log`, `0600`) |
 | `internal/projectmap/` | YouTrack project → repository routing table (`projectmap.go` loader/matching, `validate.go` filesystem+remote checks, `strip.go` `_`-prefixed doc keys) |
-| `internal/opencode/` | opencode client (`client.go`, `types.go`), permission arbiter (`arbiter.go`) and the one-turn runner (`runner.go`) |
+| `internal/opencode/` | opencode client (`client.go`, `types.go`), permission arbiter (`arbiter.go`), phase-aware policy (`phase.go`) and the one-turn runner (`runner.go`) |
+| `internal/worktree/` | One git worktree per task, branch `flowhub/<task key>`, `.flowhub/` scratch excluded through `info/exclude` |
+| `internal/registry/` | Append-only task registry (`registry.jsonl`): issue → repository, worktree, session, state, plan state, turns, cost, last reply |
+| `internal/rules/` | Trigger policy (`rules.go`: ignore/analyze/plan/execute, self-comment detection, turn budget) and the per-turn prompt (`prompt.go`) |
+| `internal/dispatch/` | The worker: queue, routing, worktree cache, phase arbiter, session reuse, registry update, audit log |
 | `internal/metrics/metrics.go` | Counters behind `/healthz` |
 | `README.md` | Operator-facing documentation: config table, log formats, pipeline, jq recipes, verification checklist |
 
@@ -79,15 +85,33 @@ clean; `gofmt -l .` reports nothing.
   work-tree or `origin` does not check out. The live table is
   the XDG path `~/.config/flowhub/config.json` (`$XDG_CONFIG_HOME/flowhub/config.json`
   when set), resolved to an absolute path with `~` expanded; the committed
-  template is `config/config.example.json`. Nothing dispatches to opencode yet: this layer
-  loads, validates and reports.
+  template is `config/config.example.json`. A second, dispatch-specific check runs
+  at startup (`dispatch.Problems`): every routable entry needs a `default_branch`
+  and a worktrees directory (its own or `FLOWHUB_WORKTREE_BASE`).
 * **opencode permissions are decided in two layers.** The session-level ruleset
-  (passed at session creation) denies edit/external_directory/webfetch/websearch
-  and sets `bash: ask`; the arbiter then answers those requests on an allowlist
-  over shell *segments*. Absolute paths and `~` are rejected, because the ruleset's
-  `external_directory` does not police a shell command. Rejections carry a reason so
-  the model can adapt. The live check is `make test-live` (skipped unless
-  `OPENCODE_LIVE=1`).
+  (passed at session creation) is a short allowlist over a catch-all `ask`, and the
+  catch-all comes **first** because the ruleset is an array evaluated
+  last-match-wins. `edit` is `ask`, never `allow`, so the phase decides: the
+  analysis arbiter rejects it, the execution arbiter allows it. The arbiter then
+  answers those requests on an allowlist over shell *segments*. Absolute paths and
+  `~` are rejected, because the ruleset's `external_directory` does not police a
+  shell command. Rejections carry a reason so the model can adapt. The live check
+  is `make test-live` (skipped unless `OPENCODE_LIVE=1`).
+* **The dispatcher is a pure decision plus a dumb worker.** `internal/rules.Decide`
+  turns (delivery, recorded task) into one of ignore/analyze/plan/execute with no
+  I/O, so the whole workflow is unit tested without opencode, git or a network.
+  `internal/dispatch` then does the I/O: route, worktree, session, prompt, arbiter,
+  registry. The prompt is built by `internal/rules.Prompt` so the wording of the
+  contract lives next to the decisions that depend on it.
+* **One worktree manager per base directory.** A routing entry may declare its own
+  `worktrees` path, and a manager owns exactly one base, so `dispatch` caches
+  managers by path. The manager fails closed: a worktree inside the repository, an
+  existing branch checked out elsewhere, or a repo path that is not a git work
+  tree is an error, not a fallback.
+* **The dispatcher hook is an interface on the audit path but never blocking.**
+  `webhook.Dispatcher` has one method that queues and returns; a full queue drops
+  work and increments a counter instead of slowing the publisher. It is called
+  only after the 202 is written, and only for accepted deliveries.
 * **Two-tier validation.** `config.Load` → `validate()` rejects syntactic
   mistakes (unparsable values, an address without a port). `Config.Problems()`
   is the security gate checked in `main` before any file is touched: today it
@@ -175,14 +199,42 @@ and `youtrack-webhook-and-flowhub-security.md` §5.6.
 Still open: the 6 unseen event types, the `created` ~15 s offset, the date anchor
 with a second sample, and whether a tag change is truly skipped (needs the app log).
 
+## Dispatcher: what was measured live (2026-09-21)
+
+Two-turn live task in the TEST project (opencode 1.18.31, agent `devops`):
+
+| Step | Result |
+| --- | --- |
+| `issueCreated` → analyze | 19s, $0.0035, read-only turn, comment posted with the marker |
+| `/opencode start` with a plan → execute | 26s, $0.0022, `README.md` edited and committed (signed) on `flowhub/TEST-13`, never pushed |
+| State → `In Progress` with no plan → plan | 31s, $0.0051, plan comment plus its blocking questions |
+| Own comment (marker, then marker-stripped) | ignored by both layers; the turn count stayed at 2 |
+
+Facts worth remembering:
+
+- The session ruleset is an array evaluated **last-match-wins**, so the catch-all
+  `ask` must be the first entry. A trailing catch-all made an allowed tool ask
+  again (measured).
+- A compound shell command arrives as **one** permission request whose `patterns`
+  hold one entry per segment while `metadata.command` holds the whole line. Judge
+  the command, and treat `patterns` as a second opinion, not the source of truth.
+- `reject` with a reason reaches the model as feedback and it rephrases; `reject`
+  does not stall the turn. `always` is never the default.
+- A new opencode **agent file** is only picked up by a new directory instance: an
+  already-used directory needs a server restart. The per-task worktree is always
+  new, so this only bites when testing against a repository path directly.
+- A typed-nil `*dispatch.Dispatcher` stored in the webhook's interface is not
+  `== nil`; that panic cost the publisher its response while the log said 202.
+  `webhookOptions` sets the interface only when there is a dispatcher, and
+  `Dispatch` tolerates a nil receiver.
+
 ## Next steps (not started)
 
-1. Phase 2: `task_key → session_id` registry, per-session serial queue, SSE
-   subscription to `/event`, `devops` agent, permission arbiter (see
-   `opencode-headless-automation-and-permissions.md` §5 and §6).
-2. Phase 2: YouTrack trigger rules (author allowlist, `/opencode` trigger,
-   project allowlist) and comment reply-back — build them on the verified payload
-   facts above and the measured constraints in
-   `opencode-devops-orchestration-design.md` §9.1.
-3. Phase 3: alerting, key rotation, budget circuit breaker, optional HMAC signing
+1. Structured output: ask the agent for `json_schema` output so "no blocking
+   questions" can be a machine-readable gate on `/opencode start` instead of prose.
+2. Reconciliation polling for deliveries lost while FlowHub was down (the
+   published webhook app does not retry).
+3. More than one dispatch worker, which needs per-task locking first (a prompt to
+   a busy session is silently swallowed).
+4. Phase 3: alerting, key rotation, budget circuit breaker, optional HMAC signing
    through a custom workflow rule, aliyun always-on shim.

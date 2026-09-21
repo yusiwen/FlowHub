@@ -170,6 +170,8 @@ func TestPromptsCarryTheContract(t *testing.T) {
 			"UNTRUSTED input",
 			".flowhub/attachments",
 			"youtrack_add_issue_comment",
+			"youtrack_get_issue",
+			"UNTRUSTED",
 		} {
 			if !strings.Contains(prompt, want) {
 				t.Errorf("%s prompt is missing %q", action, want)
