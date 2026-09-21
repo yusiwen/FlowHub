@@ -216,9 +216,10 @@ path at startup, so the loader, the logs and `-print-config` all name the same
 file — whatever the working directory was. The committed template is
 `config/config.example.json`.
 
-> **Not wired up yet.** Today this layer loads, validates and reports the table;
-> nothing dispatches to opencode. Turning a match into a session (worktree,
-> `POST /session`, the `task_session` registry) is the next step.
+A match becomes work only when `FLOWHUB_DISPATCH=1`. The dispatcher then turns
+the match into a per-task git worktree, an opencode session bound to that
+directory, and a row in the task registry; an unmapped project is refused before
+any of that happens. See "The dispatch workflow" below.
 
 ## opencode integration
 
@@ -356,19 +357,24 @@ harmless even if the model decides to be helpful.
 
 ### Measured on this host
 
-Live run on 2026-09-21 against opencode 1.18.31, TEST project, a repository whose
-only file is `README.md`. Every row is from the application log, the task registry
-and the YouTrack comments themselves.
+Runs on 2026-09-21 against opencode 1.18.31, TEST project, a repository whose only
+file is `README.md`. Every row is from the application log, the task registry and
+the YouTrack comments themselves. The **source** column matters: the first three
+rows were driven by a recorded payload posted at the receiver, the rest arrived as
+real webhooks from the YouTrack app through the gateway (`remote_ip 10.1.0.1`,
+all three locks passing) on a receiver listening on the fixed LAN address.
 
-| Delivery | Action | Result |
-| --- | --- | --- |
-| `issueCreated` | analyze | read-only turn, 19s, $0.0035, three bash permissions answered, one comment posted with the marker; no file changed |
-| `commentAdded` `/opencode start` (plan on file) | execute | 26s, $0.0022, edited `README.md`, committed `d1bae41` on `flowhub/TEST-13` (signed, not pushed), one comment posted |
-| `issueUpdated` State → `In Progress` (no plan yet) | plan | 31s, $0.0051, plan comment with its blocking questions |
-| the agent's own comment, marker included | ignore | `our own comment (contains <!-- flowhub-auto -->)` — the marker is found inside the sign-off blockquote |
-| `issueCreated` TEST-18, after the sign-off change | analyze | 11s, $0.0031, reply ended with `> This comment was generated automatically by opencode, from the creation of this issue.` rendered in Chinese |
-| the same reply with the marker stripped | ignore | `our own comment (repeats our previous reply)` |
-| a comment that merely mentions `/opencode start` | ignore | `no rule matched this event` — the trigger is anchored |
+| Source | Delivery | Action | Result |
+| --- | --- | --- | --- |
+| replayed payload | `issueCreated` TEST-13 | analyze | 19s, $0.0035, read-only, three bash permissions answered, one comment; no file changed |
+| replayed payload | `commentAdded` `/opencode start` (plan on file) | execute | 26s, $0.0022, edited `README.md`, committed `d1bae41` on `flowhub/TEST-13` (signed, not pushed) |
+| replayed payload | `issueUpdated` State → `In Progress` (no plan yet) | plan | 31s, $0.0051, plan comment with its blocking questions |
+| **real webhook** | `issueCreated` TEST-17 | analyze | 14s, $0.0034, read-only analysis and one comment |
+| **real webhook** | the agent's own comment coming back | ignore | `our own comment (contains <!-- flowhub-auto -->)` |
+| **real webhook** | `commentAdded` `/opencode start` | execute | 22s, $0.0023, edited `README.md`, committed `3856d80` on `flowhub/TEST-17`, registry `state=done, turns=2, cost=$0.0057` |
+| replayed payload | the agent's reply with the marker stripped | ignore | `our own comment (repeats our previous reply)` |
+| replayed payload | a comment that merely mentions `/opencode start` | ignore | `no rule matched this event` — the trigger is anchored |
+| **real webhook** | `issueCreated` TEST-18, after the sign-off change | analyze | 11s, $0.0031, reply ended with the blockquote below, rendered in Chinese |
 
 Two arbiter decisions from the same run are worth keeping: `git remote -v` was
 rejected by the deny list, and an absolute path (`ls -la /Users/…/TEST-14`) was
@@ -586,7 +592,7 @@ to, including the office LAN and any Wi-Fi it joins. Measured behaviour with
 ```
 lsof: flowhub ... TCP *:18099 (LISTEN)
 curl 127.0.0.1:18099/healthz     -> 200
-curl 192.168.8.135:18099/healthz -> 200     # the LAN address, no tunnel involved
+curl 192.168.8.20:18099/healthz  -> 200     # the LAN address, no tunnel involved
 ```
 
 So it is refused at startup unless it is acknowledged:

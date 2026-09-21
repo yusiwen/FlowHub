@@ -5,13 +5,18 @@
 > 包含官方 app 的**源码级**行为、payload 规范、暴露公网后的分层防护、FlowHub 自身加固、以及 opencode 侧 agent 权限设计。
 > 姊妹文档：
 > - [`opencode-devops-orchestration-design.md`](./opencode-devops-orchestration-design.md) —— 总体方案（本文是它的 YouTrack 章节展开）
-> - [`opencode-headless-automation-and-permissions.md`](./opencode-headless-automation-permissions.md) —— opencode serve API 与权限机制实测（本文 §9.4、§11 依赖其结论）
+> - [`opencode-headless-automation-and-permissions.md`](./opencode-headless-automation-and-permissions.md) —— opencode serve API 与权限机制实测（本文 §9.4、§11 依赖其结论）
 >
 > 标记约定：**✅ 实测** ｜ **📄 官方文档** ｜ **🔬 源码级**（读代码得出，未在运行实例上复现） ｜ **❓ 未验证/待确认**
 >
 > **本轮实测（2026-09-20）**：自建 YouTrack（app 1.0.5）→ nginx → 路由器 DNAT → 本机 FlowHub 接收端跑通真实链路，
 > 收到 **13 条投递（12 accepted + 1 因来源白名单尚未配好被拒）**。逐条报文与校验结果见 **§5.6**；
 > §0、§5.2、§5.3、§5.5、§13 已就地标注实测结论（保留原有 🔬/📄 判断，另加 ✅ 实测结果与差异说明）。
+
+> **实现状态（2026-09-21 更新）**：本文是调研与设计记录，正文按当时原貌保留。
+> 当前实现、配置项与实测结论以 [`README.md`](./README.md) 与 [`CODEBASE.md`](./CODEBASE.md) 为准。
+> 文中出现的接收端地址 `192.168.8.135:8080` 已失效（DHCP 变更），现固定为 `192.168.8.20`，
+> 或改用 `0.0.0.0:8080` + `FLOWHUB_ALLOW_WILDCARD_LISTEN=1`。
 
 ---
 
@@ -806,8 +811,17 @@ permission:
 
 ### 11.4 启用与验证
 
-1. 写入 `~/.config/opencode/agent/devops.md`；
-2. 重启 opencode（或重开 server，agent 列表在实例加载时读取）；
+1. 写入 agent 文件。**2026-09-21 落地位置**：`~/.config/opencode/agents/devops.md`（复数，
+   与本机既有的 `triage.md` / `translator.md` 同目录；§11.1 的扫描规则 `{agent,agents}/**/*.md`
+   两种拼写都认）。实际使用的字段：`mode: primary`、`hidden: true`、
+   `model: deepseek/deepseek-v4-flash`、`temperature: 0.1`、`steps: 40`，以及只收紧
+   `edit/bash` → `ask`、`external_directory/webfetch/websearch` → `deny` 的 `permission`
+   （不设 `"*": deny`，否则会把 `youtrack_*` 这类 MCP 工具一并移除）。
+   回帖格式（引用块落款 + `<!-- flowhub-auto -->`）**不放在 agent 文件里**：它由 FlowHub 每轮的
+   prompt 强约束，见 `internal/rules/prompt.go`。agent 文件只管身份、模型、步数上限与长期约束；
+2. 重启 opencode（或重开 server，agent 列表在实例加载时读取）。⚠️ **实测补充**：agent 列表是
+   **按目录实例**缓存的 —— 已用过的目录必须重启 server 才能看到新 agent，而 FlowHub 每个任务用的
+   都是新建的 worktree，因此正式使用不受影响；只有在直接把某个已有仓库目录当 `directory` 测试时才会踩到；
 3. `GET http://127.0.0.1:4096/agent` 应能看到 `devops`（对照现有列表：`build`、`plan`、`general`、`explore` + 你的自定义 agent）；
 4. FlowHub 建会话时传 `{"agent":"devops"}`（或在投递的 prompt body 里带），并**同时挂会话级 ruleset** 作为最后一道，双保险。
 
@@ -821,12 +835,15 @@ permission:
 
 ### 12.1 三个阶段
 
-**阶段 1（先跑通，全部只读）**
+**阶段 1（先跑通，全部只读）** — ✅ 2026-09-20 完成（13 条真实投递）
 nginx 单 location + IP allowlist + POST only + body/限速；FlowHub 绑 WG IP + 三道锁 + 幂等 + 200ms ack + **只落库打日志，不调 opencode**。
 这一步就能验证 §4 的三个坑（header 真实值、payload 里到底有没有 `numberInProject`、source IP 是什么）。
 
-**阶段 2（接 opencode）**
+**阶段 2（接 opencode）** — ✅ **2026-09-21 完成**（真实 webhook 端到端验证通过）
 队列/并发/预算、author 白名单与触发词、`devops` agent（含 `steps` + 权限白名单）、会话级 ruleset、worktree 隔离、bot 回帖、反循环过滤。
+落点：`internal/rules`（触发策略与 prompt）、`internal/dispatch`（worker）、`internal/worktree`、`internal/registry`；
+开关 `FLOWHUB_DISPATCH=1`（默认关）。未纳入本阶段的：结构化"是否有阻塞问题"输出、断线补偿轮询、多 worker、
+以及**凭证类读取的机械拦截**（见 `README.md` 的 Not implemented yet）。
 
 **阶段 3（加固与搬迁）**
 告警、密钥轮换、熔断、可选的 HMAC 签名（自定义 workflow 路线）、aliyun shim（如果需要）、FlowHub 迁到 aliyun。
@@ -843,6 +860,11 @@ nginx 单 location + IP allowlist + POST only + body/限速；FlowHub 绑 WG IP 
 - [ ] 任务隔离：独立 git worktree、专用非特权用户、无 SSH/云凭据
 - [ ] 预算熔断：单任务 token / wall-clock 上限、日预算、`pause` 开关
 - [ ] 审计：原始 payload + 决策与拒绝原因 + 源 IP 落库；403/拒签激增告警
+- [ ] **日志脱敏按位置做，不要按"匹配配置里的密钥"做** ⚠️ 实测踩坑（2026-09-21）：
+  FlowHub 原实现只把**配置中那把 key** 从 path/query 里替换掉，而**恰恰是 key 不匹配的投递才会被写进审计**
+  —— 于是按本文推荐的 `openssl rand` 习惯每次重启换一把 key 时，app 的真实 key 被明文写进
+  `data/webhook-*.jsonl`。修复方式：路径里 hook base 之后的那一段、query 里 `k` 的值一律打码，
+  与是否启用该锁无关。详见 `AGENTS.md` 不变量 3 与 `internal/webhook/handler.go` 的 `redactPath`/`redactQuery`
 
 ### 12.3 下一步可做（待你选）
 

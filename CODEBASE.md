@@ -173,9 +173,9 @@ Two gotchas worth remembering:
 ## Verified payload facts (2026-09-20, 13 real deliveries)
 
 Measured against the live YouTrack instance; full evidence and per-delivery samples
-in `youtrack-webhook-and-flowhub-security.md` **§5.6**. These are the facts phase 2
-must build on — do not re-derive them from the released app's source, which was
-wrong about `issue.id`.
+in `youtrack-webhook-and-flowhub-security.md` **§5.6**. The dispatcher is built on
+these facts — do not re-derive them from the released app's source, which was wrong
+about `issue.id`.
 
 | Fact | Consequence for code |
 | --- | --- |

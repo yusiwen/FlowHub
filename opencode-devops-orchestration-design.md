@@ -5,6 +5,12 @@
 > 来源：一次 opencode 可行性分析会话（本机 opencode 1.18.31 实测）。
 > 目的：交付给 **FlowHub**（Go）实现：统一 webhook/编排服务 + headless opencode 编排。
 
+> **实现状态（2026-09-21 更新）**：本文是调研与设计记录，正文按当时原貌保留。
+> 当前实现、配置项与实测结论以 [`README.md`](./README.md) 与 [`CODEBASE.md`](./CODEBASE.md) 为准。
+> 文中出现的接收端地址 `192.168.8.135:8080` 已失效（DHCP 变更），现固定为 `192.168.8.20`，
+> 或改用 `0.0.0.0:8080` + `FLOWHUB_ALLOW_WILDCARD_LISTEN=1`。
+> §8 提出的 `task_session(...)` 建表方案已由 append-only 的 `registry.jsonl` 落地，字段与状态机见 `CODEBASE.md`。
+
 ## 1. 背景与目标
 
 - 项目名：**FlowHub**，使用 **Go** 编写。
