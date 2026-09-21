@@ -726,3 +726,7 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 Siwen Yu.
 * More than one dispatch worker, which needs per-task locking first.
 * Phase 3: alerting, key rotation, and optional HMAC signing through a custom
   workflow rule.
+* Further event sources (Gitea, Drone) and further agent runtimes: the seam that
+  would make both additive is proposed in
+  [`docs/adr/0001-pluggable-sources-and-runtimes.md`](./docs/adr/0001-pluggable-sources-and-runtimes.md).
+  Nothing in it is implemented yet.

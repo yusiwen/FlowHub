@@ -21,6 +21,7 @@ relevant section before changing behaviour:
 | `youtrack-webhook-and-flowhub-security.md` | YouTrack app behaviour, real payload quirks, layered security (§8, §9, §12) |
 | `opencode-devops-orchestration-design.md` | Overall architecture, session ownership, event-driven model |
 | `opencode-headless-automation-and-permissions.md` | opencode HTTP API and the permission loop the dispatcher drives |
+| `docs/adr/` | Decisions taken after the design documents, with their context and consequences. Read the relevant ADR before restructuring a seam it covers |
 
 `CODEBASE.md` is the file-level map; keep it in step with structural changes.
 
