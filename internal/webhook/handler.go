@@ -64,6 +64,10 @@ func IsKnownReason(reason string) bool {
 
 // Options is the receiver half of the configuration.
 type Options struct {
+	// HookPath is the base path the handler is mounted on, without a trailing
+	// slash. It is what makes "<base>/<key>" recognisable, so the key can be
+	// redacted by position rather than by matching the configured value.
+	HookPath string
 	// HookKey is the URL embedded secret (lock 1); empty disables the lock.
 	HookKey string
 	// TokenHeader is the header name carrying the shared token (lock 2).
@@ -148,8 +152,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Time:         start.UTC(),
 		ActiveLocks:  h.activeLocks,
 		Method:       r.Method,
-		Path:         h.redact(r.URL.Path),
-		Query:        h.redact(r.URL.RawQuery),
+		Path:         h.redactPath(r.URL.Path),
+		Query:        h.redactQuery(r.URL.RawQuery),
 		RemoteIP:     remoteIP(r),
 		ForwardedFor: r.Header.Get("X-Forwarded-For"),
 		RealIP:       r.Header.Get("X-Real-IP"),
@@ -343,14 +347,64 @@ func (h *Handler) readBody(w http.ResponseWriter, r *http.Request) ([]byte, erro
 
 // redact removes the URL embedded key from a path or query string before it
 // reaches the log or the audit file.
-func (h *Handler) redact(value string) string {
-	if value == "" || h.opts.HookKey == "" {
-		return value
+// redactPath removes the URL embedded secret from a request path.
+//
+// It redacts by *shape*, never by matching the configured key. Matching the
+// configured value was the original implementation and it leaked: the audit log
+// is written for exactly the deliveries whose key did not match, so a receiver
+// started with a rotated or freshly generated key wrote the app's real key to
+// `data/webhook-*.jsonl` in plaintext. Measured 2026-09-21: a probe instance
+// with its own random key recovered the live key of the running deployment from
+// its own audit record. The route is `<hook path>/<key>`, so the position is
+// enough.
+func (h *Handler) redactPath(path string) string {
+	if path == "" {
+		return path
 	}
-	if !strings.Contains(value, h.opts.HookKey) {
-		return value
+	base := strings.TrimSuffix(h.opts.HookPath, "/")
+	if base != "" && (path == base || strings.HasPrefix(path, base+"/")) {
+		rest := strings.TrimPrefix(strings.TrimPrefix(path, base), "/")
+		if rest == "" {
+			// The base path itself carries no secret.
+			return path
+		}
+		// Only the first segment after the base is the key; anything after it is
+		// a suffix the app never sends, and keeping it makes a probe visible.
+		tail := ""
+		if cut := strings.Index(rest, "/"); cut >= 0 {
+			tail = rest[cut:]
+		}
+		return base + "/***" + tail
 	}
-	return strings.ReplaceAll(value, h.opts.HookKey, "***")
+	// An unexpected shape: a scanner, or a deployment whose hook path moved.
+	// Redacting the last segment costs nothing and still covers a key that
+	// arrived through a path this handler does not recognise.
+	// An empty HookPath (a caller that did not say where it is mounted) lands
+	// here too. For the documented route that is still correct:
+	// /hooks/youtrack/<key> becomes /hooks/youtrack/***.
+	last := strings.LastIndex(path, "/")
+	if last < 0 || last == len(path)-1 {
+		return path
+	}
+	return path[:last+1] + "***"
+}
+
+// redactQuery removes the URL embedded secret from a raw query string. The key
+// travels as `k`, and the value is redacted whatever it is; see redactPath for
+// why the configured value must not be the thing being matched.
+func (h *Handler) redactQuery(query string) string {
+	if query == "" {
+		return query
+	}
+	parts := strings.Split(query, "&")
+	for i, part := range parts {
+		name, _, found := strings.Cut(part, "=")
+		if !found || name != "k" {
+			continue
+		}
+		parts[i] = name + "=***"
+	}
+	return strings.Join(parts, "&")
 }
 
 // DedupeKey fingerprints one delivery. The app sends no delivery id and never

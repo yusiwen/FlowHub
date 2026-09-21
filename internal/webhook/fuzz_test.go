@@ -56,7 +56,7 @@ func FuzzParseAndSchema(f *testing.F) {
 		// Redaction must never turn a path into something longer than the input
 		// plus the marker, and must never echo the key back.
 		handler := &Handler{opts: Options{HookKey: "0123456789abcdef"}}
-		if got := handler.redact("/hooks/youtrack/0123456789abcdef"); got != "/hooks/youtrack/***" {
+		if got := handler.redactPath("/hooks/youtrack/0123456789abcdef"); got != "/hooks/youtrack/***" {
 			t.Fatalf("redaction = %q", got)
 		}
 	})

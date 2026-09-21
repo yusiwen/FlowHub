@@ -67,8 +67,14 @@ clean; `gofmt -l .` reports nothing.
   documented-vs-real payload differences (missing `numberInProject`, presence of
   `project.id`, polymorphic `changedFields[].value`) become visible from one real
   delivery. It is computed in `Handler.describe`, so it lands in both logs.
-* **Redaction is centralised** in `Handler.redact`, applied to path and query
-  before either reaches the log or the audit record.
+* **Redaction is centralised and positional.** `Handler.redactPath` and
+  `Handler.redactQuery` are applied to the path and the query before either
+  reaches the log or the audit record, and they work by *shape* (the segment
+  after the hook base; the value of `k`). They must never match the configured
+  key: the audited deliveries are precisely the ones whose key did not match, so
+  matching the configured value wrote a live key to disk (found and fixed
+  2026-09-21). `Options.HookPath` exists only so the handler knows its own route
+  shape.
 * **Parsing is intentionally lenient.** Nothing but `event` is required, unknown
   fields are ignored, and `changedFields[].value/oldValue` stay
   `json.RawMessage` because their type varies per field kind.

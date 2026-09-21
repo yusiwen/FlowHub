@@ -254,6 +254,7 @@ func run() error {
 // the 202 was written.
 func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher) webhook.Options {
 	opts := webhook.Options{
+		HookPath:       cfg.HookPath,
 		HookKey:        cfg.HookKey,
 		TokenHeader:    cfg.TokenHeader,
 		Token:          cfg.Token,

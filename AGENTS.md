@@ -120,7 +120,13 @@ documents. The rules below are load-bearing; do not relax them casually.
    a wrong method and `413` for an oversized body.
 3. **Secrets are never written to disk.** The token header, `Authorization`,
    `Proxy-Authorization`, `Cookie` and `Set-Cookie` values are replaced by
-   `<masked len=… sha256:…>`. The URL key is redacted from path and query. The
+   `<masked len=… sha256:…>`. The URL key is redacted **by position** — the
+   segment after the hook base in a path, the value of `k` in a query — never by
+   matching the configured value. Matching the configured value leaked: the
+   deliveries that reach the audit log are the ones whose key did not match, so a
+   receiver restarted with a fresh random key (the documented
+   `openssl rand` recipe) wrote the app's live key to disk. Measured 2026-09-21,
+   fixed the same day; the redaction runs even when lock 1 is disabled. The
    service answers the "is the app sending the literal `secret`?" question
    through `MatchesConfigured` / `LooksLikeLiteralSecret` fingerprints instead.
 4. **Parsing is lenient.** Nothing but `event` is required, unknown fields are

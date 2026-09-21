@@ -44,14 +44,16 @@ func (s *captureSink) last(t *testing.T) *store.Record {
 }
 
 type harness struct {
-	sink  *captureSink
-	stats *metrics.Counters
-	mux   *http.ServeMux
+	sink    *captureSink
+	stats   *metrics.Counters
+	mux     *http.ServeMux
+	handler *Handler
 }
 
 func newHarness(t *testing.T, mutate func(*Options)) *harness {
 	t.Helper()
 	opts := Options{
+		HookPath:     "/hooks/youtrack",
 		HookKey:      testKey,
 		TokenHeader:  "X-YouTrack-Token",
 		Token:        testToken,
@@ -71,7 +73,7 @@ func newHarness(t *testing.T, mutate func(*Options)) *harness {
 	mux.Handle("/hooks/youtrack", handler)
 	mux.Handle("/hooks/youtrack/{key}", handler)
 
-	return &harness{sink: sink, stats: stats, mux: mux}
+	return &harness{sink: sink, stats: stats, mux: mux, handler: handler}
 }
 
 // post sends a delivery; callers override RemoteAddr with withRemoteAddr.
@@ -607,5 +609,69 @@ func TestNilDispatcherIsAllowed(t *testing.T) {
 	assertRejected(t, h.post(t, keyedPath(), testToken, issueUpdatedBody(freshTimestamp())), "")
 	if h.sink.last(t).Accepted != true {
 		t.Fatal("the delivery was not accepted")
+	}
+}
+
+// TestRedactionNeverEchoesAnUnrecognisedKey is a regression test for a real
+// leak: redaction used to replace only the *configured* key, so a receiver
+// started with a rotated or freshly generated key wrote the app's live key into
+// the audit log in plaintext — which is precisely the delivery that gets
+// audited (the one whose key did not match). Measured on this deployment on
+// 2026-09-21: a probe instance recovered the running app's key from its own
+// data/webhook-*.jsonl.
+func TestRedactionNeverEchoesAnUnrecognisedKey(t *testing.T) {
+	// 64 hex characters, the shape `openssl rand -hex 32` produces. Synthetic:
+	// never paste a real key into a test, which is how one ends up in git.
+	const liveKey = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888"
+	h := newHarness(t, func(o *Options) { o.HookKey = testKey })
+
+	assertRejected(t, h.post(t, "/hooks/youtrack/"+liveKey, testToken, issueUpdatedBody(freshTimestamp())),
+		ReasonBadURLKey)
+	got := h.sink.last(t)
+	if strings.Contains(got.Path, liveKey) {
+		t.Fatalf("the app's key leaked into the audit path: %q", got.Path)
+	}
+	if got.Path != "/hooks/youtrack/***" {
+		t.Fatalf("path = %q, want /hooks/youtrack/***", got.Path)
+	}
+	// The same request with the key in the query string.
+	assertRejected(t, h.post(t, "/hooks/youtrack?k="+liveKey, testToken, issueUpdatedBody(freshTimestamp())),
+		ReasonBadURLKey)
+	got = h.sink.last(t)
+	if strings.Contains(got.Query, liveKey) || got.Query != "k=***" {
+		t.Fatalf("query = %q, want k=***", got.Query)
+	}
+}
+
+func TestRedactionCoversTheEdgesOfTheRouteShape(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.HookKey = testKey })
+	cases := map[string]string{
+		"/hooks/youtrack/" + testKey: "/hooks/youtrack/***",
+		"/hooks/youtrack":            "/hooks/youtrack",
+		// A trailing slash with no key carries no secret, so none is invented.
+		"/hooks/youtrack/":                      "/hooks/youtrack/",
+		"/hooks/youtrack/" + testKey + "/extra": "/hooks/youtrack/***/extra",
+		"/something/else/" + testKey:            "/something/else/***",
+		"/" + testKey:                           "/***",
+		"/":                                     "/",
+		"":                                      "",
+	}
+	for path, want := range cases {
+		if got := h.handler.redactPath(path); got != want {
+			t.Errorf("redactPath(%q) = %q, want %q", path, got, want)
+		}
+	}
+	if got := h.handler.redactQuery("k=" + testKey + "&other=1"); got != "k=***&other=1" {
+		t.Errorf("redactQuery = %q", got)
+	}
+	if got := h.handler.redactQuery("other=1"); got != "other=1" {
+		t.Errorf("redactQuery = %q", got)
+	}
+
+	// A receiver with the key lock disabled still must not store the key the app
+	// sends: the lock being off is a configuration choice, not a licence to leak.
+	off := newHarness(t, func(o *Options) { o.HookKey = "" })
+	if got := off.handler.redactPath("/hooks/youtrack/" + testKey); got != "/hooks/youtrack/***" {
+		t.Fatalf("with the lock off, path = %q", got)
 	}
 }

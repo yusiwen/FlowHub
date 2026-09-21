@@ -371,6 +371,19 @@ one rough edge: a `git commit -m "<multi-line message>"` is split on the newline
 inside the message, so the second line is judged as a command and rejected; the
 model recovered by sending a single-line subject.
 
+### A leak this run found (and the fix)
+
+The live run recovered the deployment's real URL key from FlowHub's own audit
+log. `Handler.redact` replaced only the *configured* key, and the deliveries that
+get audited are exactly the ones whose key did **not** match — so any receiver
+started with a rotated or freshly generated key (which is what
+`export FLOWHUB_HOOK_KEY=$(openssl rand -hex 32)` does on every restart) wrote
+the app's live key into `data/webhook-*.jsonl` and `data/payload-*.log` in
+plaintext. Redaction is now by *shape*: in a path, the segment after the hook base
+is the key; in a query string it is `k`. It is applied whether or not lock 1 is
+enabled, because a disabled lock is a configuration choice, not a licence to
+store the secret. `TestRedactionNeverEchoesAnUnrecognisedKey` pins it.
+
 ### Stopping it
 
 * `touch <FLOWHUB_PAUSE_FILE>` (default `<DataDir>/DISPATCH_OFF`) — every delivery
