@@ -68,11 +68,13 @@ type Task struct {
 	// against a runaway loop.
 	Turns int     `json:"turns"`
 	Cost  float64 `json:"cost"`
-	// LastReplyHash fingerprints the last assistant text we saw, which is how a
-	// comment that merely repeats our own output is recognised as ours.
-	LastReplyHash string    `json:"last_reply_hash,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	// LastReply is the last assistant text we saw for this task. The agent posts
+	// its replies through an MCP server as the same YouTrack user as the human, so
+	// identity cannot separate them: a comment that repeats this text is
+	// recognised as our own by content instead.
+	LastReply string    `json:"last_reply,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Registry is a concurrency-safe, file-backed task table.

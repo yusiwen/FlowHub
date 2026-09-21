@@ -36,6 +36,11 @@ type Task struct {
 	// Title is the session title, used as a human hint only (opencode rewrites
 	// it after the first turn).
 	Title string
+	// SessionID continues an existing session. The design documents require one
+	// task to keep one session across turns, and opencode lets a caller prompt a
+	// session but never choose its ID, so the registry supplies it here. Empty
+	// means "create a new session".
+	SessionID string
 	// Ruleset is the session-level permission ruleset. It is the first line of
 	// defence and overrides project and global configuration, so it should at
 	// minimum deny edit, external_directory, webfetch and websearch.
@@ -62,7 +67,18 @@ type Result struct {
 	// Tokens is the aggregate over the turn's assistant messages.
 	Tokens      Tokens
 	Permissions []Answered
-	Elapsed     time.Duration
+	// Tools lists the tool calls the turn made, which is how a caller verifies a
+	// claim such as "I posted the analysis comment" instead of trusting the prose.
+	Tools   []ToolCall
+	Elapsed time.Duration
+}
+
+// ToolCall is one tool invocation observed in a turn.
+type ToolCall struct {
+	Name   string
+	Status string
+	Input  string
+	Output string
 }
 
 // Answered records one permission decision for the audit trail.
@@ -105,31 +121,39 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 		return result, fmt.Errorf("opencode: task has no prompt")
 	}
 
-	session, err := r.client.CreateSession(ctx, task.Directory, CreateSessionRequest{
-		Title:      task.Title,
-		Agent:      task.Agent,
-		Permission: task.Ruleset,
-		Metadata:   task.Metadata,
-	})
-	if err != nil {
-		return result, fmt.Errorf("opencode: create session in %s: %w", task.Directory, err)
+	sessionID := strings.TrimSpace(task.SessionID)
+	if sessionID == "" {
+		session, err := r.client.CreateSession(ctx, task.Directory, CreateSessionRequest{
+			Title:      task.Title,
+			Agent:      task.Agent,
+			Permission: task.Ruleset,
+			Metadata:   task.Metadata,
+		})
+		if err != nil {
+			return result, fmt.Errorf("opencode: create session in %s: %w", task.Directory, err)
+		}
+		sessionID = session.ID
+		result.Tokens = session.Tokens
 	}
-	result.SessionID = session.ID
-	result.Tokens = session.Tokens
+	result.SessionID = sessionID
 
-	baseline, err := r.completedAssistantCount(ctx, task.Directory, session.ID)
+	// The baseline is taken before the prompt, so completion is detected against
+	// the turns that already exist — which is what makes a second turn on the
+	// same session work.
+	baseline, err := r.completedAssistantCount(ctx, task.Directory, sessionID)
 	if err != nil {
 		return result, err
 	}
 
-	if err := r.client.PromptAsync(ctx, task.Directory, session.ID, PromptRequest{
+	if err := r.client.PromptAsync(ctx, task.Directory, sessionID, PromptRequest{
 		Agent: task.Agent,
 		Parts: []TextPart{{Type: "text", Text: task.Prompt}},
 	}); err != nil {
-		return result, fmt.Errorf("opencode: deliver prompt to session %s: %w", session.ID, err)
+		return result, fmt.Errorf("opencode: deliver prompt to session %s: %w", sessionID, err)
 	}
 	r.log.Info("opencode turn started",
-		"session", session.ID, "directory", task.Directory, "agent", task.Agent, "deadline", task.Deadline)
+		"session", sessionID, "directory", task.Directory, "agent", task.Agent,
+		"continued", task.SessionID != "", "deadline", task.Deadline)
 
 	deadline := time.Now().Add(task.Deadline)
 	if task.Deadline <= 0 {
@@ -137,11 +161,11 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 	}
 
 	for {
-		if err := r.answerPending(ctx, task.Directory, session.ID, &result); err != nil {
+		if err := r.answerPending(ctx, task.Directory, sessionID, &result); err != nil {
 			return result, err
 		}
 
-		messages, err := r.client.Messages(ctx, task.Directory, session.ID)
+		messages, err := r.client.Messages(ctx, task.Directory, sessionID)
 		if err != nil {
 			return result, err
 		}
@@ -150,8 +174,8 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 		if err != nil {
 			return result, err
 		}
-		busy := statuses[session.ID].Busy()
-		pending, err := r.pendingFor(ctx, task.Directory, session.ID)
+		busy := statuses[sessionID].Busy()
+		pending, err := r.pendingFor(ctx, task.Directory, sessionID)
 		if err != nil {
 			return result, err
 		}
@@ -163,10 +187,11 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 		if len(completed) > baseline && !busy && len(pending) == 0 {
 			result.Finished = true
 			result.Text, result.Error = lastTurnOutput(messages, baseline)
-			result.Cost, result.Tokens = r.aggregate(ctx, task.Directory, session.ID, messages, baseline)
+			result.Tools = turnTools(messages, baseline)
+			result.Cost, result.Tokens = r.aggregate(ctx, task.Directory, sessionID, messages, baseline)
 			result.Elapsed = time.Since(started)
 			r.log.Info("opencode turn finished",
-				"session", session.ID, "elapsed", result.Elapsed.Round(time.Millisecond),
+				"session", sessionID, "elapsed", result.Elapsed.Round(time.Millisecond),
 				"cost", result.Cost, "tokens", result.Tokens.Total, "permissions", len(result.Permissions))
 			return result, nil
 		}
@@ -174,12 +199,12 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 		if time.Now().After(deadline) {
 			result.TimedOut = true
 			result.Text, result.Error = lastTurnOutput(messages, baseline)
-			result.Cost, result.Tokens = r.aggregate(ctx, task.Directory, session.ID, messages, baseline)
+			result.Cost, result.Tokens = r.aggregate(ctx, task.Directory, sessionID, messages, baseline)
 			result.Elapsed = time.Since(started)
 			// A timeout is not an error: the session may still be running, and
 			// FlowHub marks the task "still running" rather than resetting it.
 			r.log.Warn("opencode turn timed out",
-				"session", session.ID, "elapsed", result.Elapsed.Round(time.Millisecond),
+				"session", sessionID, "elapsed", result.Elapsed.Round(time.Millisecond),
 				"busy", busy, "pending_permissions", len(pending), "permissions_answered", len(result.Permissions))
 			return result, nil
 		}
@@ -308,6 +333,29 @@ func lastTurnOutput(messages []Message, baseline int) (string, string) {
 		}
 	}
 	return text, errText
+}
+
+// turnTools lists the tool calls that belong to this turn.
+func turnTools(messages []Message, baseline int) []ToolCall {
+	completed := completedAssistant(messages)
+	if len(completed) <= baseline {
+		return nil
+	}
+	var calls []ToolCall
+	for _, message := range completed[baseline:] {
+		for _, part := range message.Parts {
+			if part.Type != "tool" || part.State == nil {
+				continue
+			}
+			calls = append(calls, ToolCall{
+				Name:   part.Tool,
+				Status: part.State.Status,
+				Input:  string(part.State.Input),
+				Output: part.State.Output,
+			})
+		}
+	}
+	return calls
 }
 
 func textOf(message Message) string {

@@ -77,7 +77,7 @@ func TestStateSurvivesARestart(t *testing.T) {
 	if err := first.Put(Task{
 		Key: "TEST-9", Repo: "/repo", Worktree: "/wt/TEST-9", SessionID: "ses_9",
 		Agent: "devops", State: StateExecuting, Plan: PlanConfirmed, Turns: 3, Cost: 0.25,
-		LastReplyHash: "abc123",
+		LastReply: "the analysis text",
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -101,6 +101,9 @@ func TestStateSurvivesARestart(t *testing.T) {
 	}
 	if task.SessionID != "ses_9" || task.Worktree != "/wt/TEST-9" {
 		t.Fatalf("replay lost fields written by an earlier snapshot: %+v", task)
+	}
+	if task.LastReply != "the analysis text" {
+		t.Fatalf("the last reply did not survive a restart: %+v", task)
 	}
 }
 
