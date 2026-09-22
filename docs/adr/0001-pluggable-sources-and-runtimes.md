@@ -1,10 +1,12 @@
 # ADR 0001 — Pluggable event sources and agent runtimes
 
 **Status:** Proposed (awaiting review — nothing in this document is implemented)
+**Revision:** 2 — added "The configuration format (v2)" and the questions it raises
 **Date:** 2026-09-21
 **Scope:** the shape of the seam between "an event happened somewhere" and "an
-agent works on it". It does not change behaviour, configuration or the audit
-format on its own.
+agent works on it", including the configuration surface it needs. Nothing here is
+implemented; the configuration change is step 3 of the migration plan, and the
+audit record deliberately stays as it is.
 
 ## Context
 
@@ -228,6 +230,131 @@ type Runtime interface {
 permissions the session starts with" is a runtime property, while "which tools a
 source needs" is the source's.
 
+### The configuration format (v2)
+
+The routing table cannot carry a second source as it stands, for three
+mechanical reasons:
+
+1. **The entry names its source in the field name.** `youtrack_key`; a Gitea
+   tracker key would have to be spelled `youtrack_key` or the loader could not
+   read it.
+2. **The key index is global.** `Map.byKey` is keyed by the project key alone
+   (`internal/projectmap/projectmap.go`), so YouTrack `TEST` and Gitea `TEST`
+   collide and `register` fails with "claimed by both".
+3. **The trigger policy is process-global.** `FLOWHUB_TRIGGER`,
+   `FLOWHUB_START_STATES`, `FLOWHUB_SKIP_ANALYZE_ON_CREATE` and
+   `FLOWHUB_MAX_TURNS` are read once into `config.Config`, so two sources cannot
+   disagree about what "start implementing" means.
+
+The file also has to absorb the runtime, because `FLOWHUB_OPENCODE_URL` and
+`FLOWHUB_DISPATCH_AGENT` are runtime facts sitting in the same flat environment as
+the source facts. **Secrets stay in the environment.** The file describes which
+locks are active and which policy applies; it never holds key material, so it
+stays safe to copy, diff, back up and review.
+
+```json
+{
+  "version": 2,
+
+  "_comment": "Event sources, the agent runtime, and the project -> repository table.",
+
+  "sources": {
+    "youtrack": {
+      "enabled": true,
+      "locks": { "url_key": true, "token_header": true, "source_ip": ["10.1.0.0/24"] },
+      "policy": {
+        "trigger": "/opencode start",
+        "start_states": ["In Progress"],
+        "skip_analyze_on_create": false,
+        "max_turns": 8,
+        "self_markers": ["<!-- flowhub-auto -->", "generated automatically by opencode"]
+      },
+      "prompt_file": "prompts/youtrack.md",
+      "authors": ["yusiwen"]
+    },
+    "gitea": {
+      "enabled": false,
+      "locks": { "signature": true },
+      "policy": { "trigger": "/opencode", "start_states": ["open"] }
+    }
+  },
+
+  "runtime": {
+    "name": "opencode",
+    "url": "http://127.0.0.1:4096",
+    "agent": "devops",
+    "model": "deepseek/deepseek-v4-flash",
+    "deadline": "15m"
+  },
+
+  "projects": [
+    {
+      "source": "youtrack",
+      "project": "BEAP_BE",
+      "also": ["BEAP"],
+      "repo": {
+        "path": "/Users/yusiwen/git/work/pipechina/beap-be",
+        "remote": "git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git",
+        "default_branch": "master"
+      },
+      "worktrees": "/Users/yusiwen/git/work/pipechina/beap-be-worktrees",
+      "agent": "devops",
+      "enabled": true
+    },
+    {
+      "source": "youtrack",
+      "project": "TEST",
+      "repo": { "path": "/Users/yusiwen/git/mine/test", "default_branch": "main" },
+      "worktrees": "/Users/yusiwen/git/mine/test-worktrees"
+    }
+  ]
+}
+```
+
+Mapping from v1, which the live file uses today:
+
+| v1 | v2 |
+| --- | --- |
+| `projects[].youtrack_key: "TEST"` | `projects[].source: "youtrack"` + `projects[].project: "TEST"` |
+| `projects[].also_keys` | `projects[].also` |
+| `repo`, `worktrees`, `agent`, `model`, `authors`, `enabled` | unchanged |
+| `FLOWHUB_TRIGGER`, `FLOWHUB_START_STATES`, `FLOWHUB_SKIP_ANALYZE_ON_CREATE`, `FLOWHUB_MAX_TURNS` | `sources.<name>.policy.*`; the environment variables become the outermost default |
+| `FLOWHUB_OPENCODE_URL`, `FLOWHUB_DISPATCH_AGENT`, `FLOWHUB_TASK_DEADLINE` | `runtime.*`; the environment variables become the outermost default |
+| `FLOWHUB_ALLOWED_SOURCES` | `sources.<name>.locks.source_ip` |
+| `FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN` | stay in the environment, renamed per source (`FLOWHUB_YOUTRACK_HOOK_KEY`, `FLOWHUB_YOUTRACK_TOKEN`); the current names remain accepted as aliases for YouTrack |
+| `FLOWHUB_PROJECTS_FILE` | accepted, with `FLOWHUB_CONFIG_FILE` as the preferred spelling (the file is no longer only a routing table) |
+| (absent) | `version`; absent means 1 |
+
+**Precedence, outermost to innermost:** environment default → `sources.<name>` →
+`projects[]`. `-print-config` prints the effective value *and* which level
+supplied it, which also answers open question 2 below.
+
+**Validation stays strict and fail-closed**, because a config mistake should stop
+the process rather than route work to the wrong repository:
+
+* `DisallowUnknownFields` stays. `_`-prefixed keys remain the only comments.
+* `version` must be 1 or 2; anything else is refused by name.
+* `source` must name a *registered* adapter; the error lists what this binary
+  knows, so "I built a plugin but forgot to register it" is one line, not a
+  mystery.
+* The index becomes `(source, project)`, so the same project key in two sources is
+  legal and a duplicate *within* one source is still an error.
+* The issue-ID-prefix fallback disappears from the router. Splitting `TEST-17` on
+  its last `-` is a YouTrack convention, not a routing rule; the adapter fills
+  `event.Subject.Project` from the payload, and a payload that omits the project
+  is the adapter's problem (it may use the prefix itself).
+* `prompt_file` is resolved relative to the config file's directory, must exist,
+  and is refused if it is unreadable. Absent means the adapter's built-in prompt.
+* A `sources.<name>` block for a source that is registered but built *out* of this
+  binary (no adapter) is refused, not ignored.
+
+**Compatibility.** The binary must accept v1 with a warning rather than refuse to
+start, because the receiver is live and an upgrade that stops it silently stops
+every event. A file without `version` is translated (v1 could only mean YouTrack)
+and reported as `config format: v1 (translated; migrate to version 2)`. The
+compatibility branch is a few lines plus a test, and is deleted in the commit that
+drops v1 support — after this host's file has been migrated.
+
 ### What `dispatch` looks like afterwards
 
 It keeps: the queue, the pause file, the routing lookup, the cost and turn
@@ -272,9 +399,9 @@ staticcheck test test-race smoke` green. Behaviour must not change before step 3
 | Step | Content | Verification |
 | --- | --- | --- |
 | 0 | This ADR | reviewed and accepted |
-| 1 | Add `internal/event` and `internal/source`; move `webhook.Parse`, `describe`, `AllowedMCPTools`, the reply check and `rules.Prompt` behind a `youtrack` adapter; `dispatch` consumes only the IR | Existing tests unchanged and green; `make smoke` unchanged; `dispatch` no longer imports `webhook` |
+| 1 | Add `internal/event` and `internal/source`; move `webhook.Parse`, `describe`, `AllowedMCPTools`, the reply check and `rules.Prompt` behind a `youtrack` adapter; `dispatch` consumes only the IR. The config file is **not** touched in this step | Existing tests unchanged and green; `make smoke` unchanged; `dispatch` no longer imports `webhook` |
 | 2 | Add `internal/agent`; make `opencode` implement it; move `sessionRuleset` there; `dispatch` no longer imports `opencode` | `go list -deps` shows the cut; the live path is re-verified with one real webhook turn |
-| 3 | Per-source policy and prompt files (`sources/<name>.json` + template), with the env variables as the outermost default | A test asserts an override changes the rendered prompt; `-print-config` shows the effective per-source values |
+| 3 | Config format v2 as specified above: `sources`, `runtime`, `(source, project)` entries, per-level policy precedence, and the v1 translation branch | A v1 file and an equivalent v2 file produce the same routing and the same effective policy; `-print-config` names the level each value came from; a v2 file with `youtrack_key` is refused with the replacement named in the error |
 | 4 | Gitea adapter as the acceptance test for the seam (HMAC-SHA256 `X-Hub-Signature-256`, issue and PR text) | A real Gitea webhook drives one analysis turn; the core packages show no diff beyond registration |
 
 Step 4 is the point of the whole exercise: if adding Gitea requires touching
@@ -287,10 +414,11 @@ Step 4 is the point of the whole exercise: if adding Gitea requires touching
    keep owning the raw bytes and hand the parsed event plus a record id to the
    dispatcher? Recommendation: keep `Raw` in the event for now; revisit together
    with the `source_facts` split.
-2. **Policy precedence.** With two sources there are three levels: environment
-   default, per-source, per-project. Recommendation: per-project wins over
-   per-source wins over the environment default, and `-print-config` prints the
-   effective value with its origin. Confirm before step 3.
+2. **One config file or one per source?** The v2 sketch puts every source, the
+   runtime and the projects in one file. The alternative is a `sources/<name>.json`
+   plus a top-level file that includes them. Recommendation: one file, because the
+   projects table is shared and a project entry has to name its source anyway;
+   revisit if a source's block grows past a screen.
 3. **Are attachments first-class?** The prompt currently tells the agent to
    download to a fixed prefix, and the arbiter allows exactly that. Gitea carries
    attachments too. Recommendation: keep them as `Subject.Attachments` and let
@@ -300,5 +428,15 @@ Step 4 is the point of the whole exercise: if adding Gitea requires touching
    Recommendation: qualify the registry key with the source (`youtrack:TEST-17`)
    from the start, and migrate existing rows on first read. Confirm, because it
    changes the registry format.
-5. **One runtime per process, or per task?** Recommendation: one runtime,
-   selected by configuration, until a real need for two appears.
+5. **One runtime per process, or per task?** The v2 sketch puts `runtime` at the
+   top level, with `projects[].agent`/`model` as the per-project override.
+   Recommendation: one runtime per process until a real need for two appears.
+6. **Should `prompt_file` be per project as well as per source?** A repository may
+   want its own instructions ("this repo is Java, run `mvn -q verify`"). The
+   project entry already carries `agent`/`model`, so a per-project prompt is
+   consistent. Recommendation: not yet — the prompt already receives the
+   repository path and tells the agent to find the project's own tooling.
+7. **Does `locks.source_ip` belong in the file?** It is a deployment fact (which
+   address the gateway forwards from), not a repository fact. Recommendation: yes,
+   per source, because two sources can arrive from different addresses; the values
+   are not secrets, so the file stays safe to commit.

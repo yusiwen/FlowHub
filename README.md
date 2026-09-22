@@ -729,4 +729,8 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 Siwen Yu.
 * Further event sources (Gitea, Drone) and further agent runtimes: the seam that
   would make both additive is proposed in
   [`docs/adr/0001-pluggable-sources-and-runtimes.md`](./docs/adr/0001-pluggable-sources-and-runtimes.md).
-  Nothing in it is implemented yet.
+  Nothing in it is implemented yet. That ADR also specifies a **v2 configuration
+  format** — one file holding `sources`, the agent `runtime` and the project table,
+  with the environment variables demoted to defaults and a translated v1 — because
+  the current file names its source in a field (`youtrack_key`) and indexes project
+  keys globally.
