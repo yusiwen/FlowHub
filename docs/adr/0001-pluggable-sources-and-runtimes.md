@@ -1,7 +1,11 @@
 # ADR 0001 — Pluggable event sources and agent runtimes
 
 **Status:** Proposed (awaiting review — nothing in this document is implemented)
-**Revision:** 5 — the target topology is a control plane plus one or more agent
+**Revision:** 6 — pinned down what a `runtimes` list means: an eligibility set,
+with `runtime_policy` (`spread` by default, `first-healthy` for strict order),
+deterministic tie-breaks, failover only at task creation, and startup that refuses
+only when no runtime answers; names rather than labels (decided in review).
+Revision 5 — the target topology is a control plane plus one or more agent
 hosts, so runtimes are addressed by name, a task binds to one for life, and each
 runtime gets its own queue, worker, credentials and workspace provider; revision 4
 made FlowHub a control plane: added the `Workspace` seam and the
@@ -403,17 +407,68 @@ runtime, or a list of them for capacity:
 ```json
 { "source": "youtrack", "project": "BEAP_BE",
   "repo": { "remote": "git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git", "default_branch": "master" },
-  "runtimes": ["builder-a", "builder-b"] }
+  "runtimes": ["builder-a", "builder-b"], "runtime_policy": "spread" }
 ```
 
-With a list, the first runtime that answers its health probe *and* can prepare a
-workspace wins. **Never from event content**: which machine runs code decides
-which network, which credentials and which repositories are reachable, so it is an
-authorization decision. An issue author who could name a runtime could ask for the
-host with the production kubeconfig on it. If a per-task hint is ever wanted (a
-YouTrack custom field, say), it may only *narrow* the project's allowed list, and
-it is refused when it names anything outside it — the same shape as the existing
-"the routing table never guesses a repository" rule.
+A list means **"any of these may serve this project"** — an eligibility set, not
+an ordered preference list and not a promise to spread evenly. Two different
+questions follow from it, and conflating them is what makes a scheduler
+unpredictable:
+
+| Question | Answer |
+| --- | --- |
+| Which runtime takes this **new** task? | A policy over the eligible, currently reachable runtimes |
+| Which runtime takes the **next turn** of an existing task? | The one already bound to it, always, even if it is now unhealthy |
+
+`runtime_policy` chooses the first, with two values:
+
+* `spread` (default) — balance by task, so a second machine is actually used.
+* `first-healthy` — strict list order, for when one host should take everything
+  and the rest exist only as failover.
+
+`spread` resolves in this order, and every tie-break is deterministic:
+
+1. Keep the runtimes that are configured, healthy, and able to prepare a workspace
+   for this project.
+2. Prefer the fewest turns **in flight or queued** right now (live counters, the
+   same ones `/healthz` reports).
+3. Then prefer the fewest **active** tasks in the registry for that runtime —
+   tasks whose state is not terminal — so two idle hosts do not both look empty.
+4. Then list order, which is what makes a fresh registry behave predictably.
+
+The chosen runtime and the reason are logged in one line
+(`runtime chosen: builder-b (in_flight 0, active 1, eligible 2)`), so "why did
+this land there" is answerable from the log without re-deriving it.
+
+Failover happens at **creation** only, and it falls out of step 1: if the first
+candidate does not answer, or cannot prepare a workspace, the next eligible one is
+tried, and the task binds to whichever succeeded. Afterwards there is no failover:
+a task whose bound runtime is unreachable is refused with that reason, because a
+new session on another host is a fresh context that has lost the analysis and the
+plan. A consequence worth stating: after an outage, tasks created during it stay
+on the fallback host while new tasks go back to the preferred one under
+`first-healthy`, or are spread again under `spread`. That is intended — the
+binding is per task, not per host.
+
+Startup follows the same shape: every configured runtime is probed, each
+unreachable one is a warning naming it, and startup is refused only when **no**
+runtime answers, since the point of having several is that one may be down.
+
+**Never from event content**: which machine runs code decides which network, which
+credentials and which repositories are reachable, so it is an authorization
+decision. An issue author who could name a runtime could ask for the host with the
+production kubeconfig on it. If a per-task hint is ever wanted (a YouTrack custom
+field, say), it may only *narrow* the project's eligible set, and it is refused
+when it names anything outside it — the same shape as the existing "the routing
+table never guesses a repository" rule. Names, not labels, for now (decided in
+review): a label indirection adds a failure mode ("no runtime satisfies this
+project") that two or three machines do not yet justify.
+
+Startup also validates the set itself, so a typo fails immediately instead of
+making a project quietly unroutable: every name in `runtime`/`runtimes` must exist
+in `runtimes`, every named runtime must be able to serve that project (for
+`localworktree`, that means a `clones` entry for `<source>:<project>`), and a
+`remote` provider must be able to answer for it.
 
 **The choice is sticky, and recorded.** A task binds to the runtime that created
 its workspace and session, for the rest of its life:
@@ -550,6 +605,7 @@ work (`policy`).
         "default_branch": "master"
       },
       "runtimes": ["builder-a", "builder-b"],
+      "runtime_policy": "spread",
       "agent": "devops",
       "enabled": true
     },
@@ -665,7 +721,7 @@ staticcheck test test-race smoke` green. Behaviour must not change before step 3
 | 2 | Add `internal/agent` and `internal/workspace`; make `opencode` the runtime and today's `worktree` package the `localworktree` provider, with its local-filesystem checks moved behind it; `dispatch` imports neither vendor; wire `FLOWHUB_OPENCODE_USER`/`PASSWORD` | `go list -deps` shows both cuts; the live path is re-verified with one real webhook turn |
 | 3 | Config format v2 as specified above: `sources`, `runtime`, `(source, project)` entries, per-level policy precedence, and the v1 translation branch | A v1 file and an equivalent v2 file produce the same routing and the same effective policy; `-print-config` names the level each value came from; a v2 file with `youtrack_key` is refused with the replacement named in the error |
 | 4 | Gitea adapter as the acceptance test for the source seam (HMAC-SHA256 `X-Hub-Signature-256`, issue and PR text) | A real Gitea webhook drives one analysis turn; the core packages show no diff beyond registration |
-| 5 | Addressed runtimes: `runtimes.<name>`, `projects[].runtime`/`runtimes`, the sticky `registry.Task.Runtime` binding, and one queue and worker per runtime | Two runtimes configured, one task on each, both complete; a task bound to a runtime that is then removed from the configuration is refused with that reason rather than re-homed |
+| 5 | Addressed runtimes: `runtimes.<name>`, `projects[].runtime`/`runtimes` + `runtime_policy`, the sticky `registry.Task.Runtime` binding, one queue and worker per runtime, per-runtime startup probing, and the set validation | Two runtimes configured: with `spread`, two consecutive tasks land on different hosts and the log says why; with `first-healthy`, both land on the first; stopping one host makes the next task use the other and leaves the bound tasks refused with that reason |
 | 6 | A `remote` workspace provider, once the deployment actually splits: the helper on the runtime host, the repository attestation handshake, and branch delivery | FlowHub runs on a host with **no** copy of the repository and still completes a full task end to end on the addressed remote runtime |
 
 Step 4 is the point of the whole exercise: if adding Gitea requires touching
@@ -700,12 +756,10 @@ Step 4 is the point of the whole exercise: if adding Gitea requires touching
    project entry already carries `agent`/`model`, so a per-project prompt is
    consistent. Recommendation: not yet — the prompt already receives the
    repository path and tells the agent to find the project's own tooling.
-8. **Runtime selection: explicit names, or labels?** Names are deterministic and
-   auditable but adding a machine means editing every project that should use it.
-   Labels (`runtimes.builder-a.labels: ["java","maven"]`, `projects[].needs:
-   ["java"]`) invert that at the cost of an indirection and a new failure mode
-   ("no runtime satisfies this project"). Recommendation: names now, labels only
-   if the third runtime appears.
+8. ~~**Runtime selection: explicit names, or labels?**~~ **Decided in review:
+   names.** Labels stay out until a third runtime makes "which machine can run
+   this" a question that names cannot answer, and if they arrive they may only
+   narrow a project's eligible set.
 9. **What should a bound-but-unreachable runtime do to the task?** The
    recommendation above is "refuse and say so". The alternative is an operator
    command to re-home a task explicitly (`flowhub task move TEST-17 builder-b`),
