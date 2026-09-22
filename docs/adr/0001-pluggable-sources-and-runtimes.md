@@ -1,7 +1,11 @@
 # ADR 0001 — Pluggable event sources and agent runtimes
 
 **Status:** Proposed (awaiting review — nothing in this document is implemented)
-**Revision:** 6 — pinned down what a `runtimes` list means: an eligibility set,
+**Revision:** 7 — made the baseline an input: resolve the base ref to a commit
+through the origin once per task, pin it, require every host to produce exactly
+that commit, and refuse to attach to a same-named branch that is not its
+descendant. Worktrees are never synced between hosts; commits travel through the
+origin. Revision 6 — pinned down what a `runtimes` list means: an eligibility set,
 with `runtime_policy` (`spread` by default, `first-healthy` for strict order),
 deterministic tie-breaks, failover only at task creation, and startup that refuses
 only when no runtime answers; names rather than labels (decided in review).
@@ -299,10 +303,10 @@ type Request struct {
 // opaque: FlowHub never stats, joins or globs it, because it names a directory on
 // somebody else's machine.
 type Handle struct {
-    Provider string // "localworktree", "remote"
-    Path     string // as the runtime spells it
-    Repo     string // the provider's attestation of which repository it used
-    Commit   string // the revision the workspace started from
+    Provider   string // "localworktree", "remote"
+    Path       string // as the runtime spells it
+    Repo       string // the provider's attestation of which repository it used
+    BaseCommit string // pinned at creation; every host must produce exactly this
 }
 
 type Workspace interface {
@@ -509,6 +513,98 @@ lines (`slog`), not in the webhook audit record: audit is written on the receivi
 path, which knows nothing about runtimes, and keeping it that way is what lets the
 receiver stay I/O free and transport-only.
 
+### Baseline consistency across runtimes
+
+Once there is more than one runtime host there is more than one clone, and
+"which commit does this task start from?" stops being a detail of the local
+repository. It is not a failover-only problem: with `spread`, two tasks for the
+same project can land on two hosts whose clones were fetched at different times,
+so the *normal* case produces two different baselines. The same issue would then
+produce patches that apply on one host and not the other, and tests that pass on
+one and fail on the other.
+
+**The worktree must not be synced between hosts.** A linked worktree is not a
+portable directory: its `.git` is a file containing an absolute path to a
+host-local object store, and its index, `HEAD` and untracked files are host-local
+state. Copying it either breaks or silently diverges, and it duplicates the state
+that git already knows how to share. The only thing worth moving between hosts is
+a commit, and the way to move a commit is through the origin.
+
+**So the baseline becomes an input, not something the host decides.** Today
+`git worktree add -b flowhub/<key> <path> <default_branch>` resolves the branch on
+whichever host runs it, at whatever that host's clone last fetched. Instead:
+
+```go
+type Workspace interface {
+    Name() string
+    // Resolve reports the commit that baseRef points at *as the origin sees it*,
+    // not as this host's clone sees it. Asked once per task, by whichever runtime
+    // is about to take it.
+    Resolve(ctx context.Context, repo RepoRef, baseRef string) (commit string, err error)
+    Prepare(ctx context.Context, req Request) (Handle, error)
+    Check(ctx context.Context, h Handle) error
+    Remove(ctx context.Context, h Handle) error
+}
+
+type Request struct {
+    TaskKey    string
+    Remote     string
+    BaseRef    string // "master"
+    BaseCommit string // pinned; Prepare must produce exactly this commit
+    Base       string
+}
+```
+
+`Resolve` is `git ls-remote origin <baseRef>` on the runtime side: the origin is
+the only shared truth, so the answer is the same no matter which host is asked,
+and a stale clone cannot change it. `Prepare` then creates the worktree **at that
+commit** — fetching it only when the object is missing locally
+(`git cat-file -e <commit>^{commit}`), so a stale clone heals on demand without
+network traffic on every task, and a host that cannot obtain the commit fails
+that candidate instead of quietly using an older one.
+
+The pinned values are what make the workspace reconstructible, so they are
+recorded next to the task:
+
+| `registry.Task` field | Meaning |
+| --- | --- |
+| `runtime` | the host that owns the workspace, for life |
+| `repo` | the repository identity, as attested by that host |
+| `worktree` | the provider's opaque path on that host |
+| `base_commit` | the commit the task started from, resolved once at creation and **never re-resolved** |
+
+`base_commit` is resolved once, when the task is created, and reused for every
+later turn. That is what keeps a long-running task's patches reviewable against a
+fixed base even if the origin moves, and it is also the check that makes
+"attach to an existing branch" safe: if `flowhub/<task key>` already exists on the
+host, `Prepare` verifies it is a descendant of `base_commit` before attaching,
+and refuses otherwise. Without that check a branch with the same name from an
+unrelated run would be adopted silently.
+
+Four consequences worth stating plainly:
+
+1. **Unpushed local work is invisible to the agent.** The shared baseline is what
+   the origin has, not what your working clone has. This is the price of
+   deterministic multi-host behaviour, and it is also the fix: to have the agent
+   build on your local commits, push them to a branch and point `default_branch`
+   (or a per-project `base_ref`) at it.
+2. **The guarantee covers the code, not the toolchain.** Two hosts with the same
+   `base_commit` can still differ in Go, Node or JDK versions, so a change may
+   verify on one and not the other. That drift is not something a commit pin can
+   fix: keep the hosts provisioned identically, or use `runtime_policy:
+   "first-healthy"` so a project always runs where it was verified. A provider
+   could report a toolchain fingerprint in `Check` later; out of scope here.
+3. **Tasks stay isolated from each other.** Task B's workspace never contains
+   task A's unmerged branch, on one host or across hosts. To build on another
+   task's work, merge it into the branch that `default_branch` points at — the next
+   task's resolved `base_commit` then includes it — or keep the work in one task.
+   Spreading tasks across hosts does not change this; it only makes it visible.
+4. **Review and hand-off go through the origin too.** Because the branch lives on
+   the host that made it, the reviewer needs a transport (open question 10). If a
+   task is ever re-homed by an operator command, the protocol is: push the branch
+   from the old host, fetch it on the new host, check out at the same
+   `base_commit` — and accept that the session context is still lost.
+
 ### The configuration format (v2)
 
 The routing table cannot carry a second source as it stands, for three
@@ -601,6 +697,7 @@ work (`policy`).
       "project": "BEAP_BE",
       "also": ["BEAP"],
       "repo": {
+        "_comment": "Identity only. default_branch is resolved through the origin to a commit when a task is created, and that commit is pinned for the task's life.",
         "remote": "git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git",
         "default_branch": "master"
       },
@@ -721,7 +818,7 @@ staticcheck test test-race smoke` green. Behaviour must not change before step 3
 | 2 | Add `internal/agent` and `internal/workspace`; make `opencode` the runtime and today's `worktree` package the `localworktree` provider, with its local-filesystem checks moved behind it; `dispatch` imports neither vendor; wire `FLOWHUB_OPENCODE_USER`/`PASSWORD` | `go list -deps` shows both cuts; the live path is re-verified with one real webhook turn |
 | 3 | Config format v2 as specified above: `sources`, `runtime`, `(source, project)` entries, per-level policy precedence, and the v1 translation branch | A v1 file and an equivalent v2 file produce the same routing and the same effective policy; `-print-config` names the level each value came from; a v2 file with `youtrack_key` is refused with the replacement named in the error |
 | 4 | Gitea adapter as the acceptance test for the source seam (HMAC-SHA256 `X-Hub-Signature-256`, issue and PR text) | A real Gitea webhook drives one analysis turn; the core packages show no diff beyond registration |
-| 5 | Addressed runtimes: `runtimes.<name>`, `projects[].runtime`/`runtimes` + `runtime_policy`, the sticky `registry.Task.Runtime` binding, one queue and worker per runtime, per-runtime startup probing, and the set validation | Two runtimes configured: with `spread`, two consecutive tasks land on different hosts and the log says why; with `first-healthy`, both land on the first; stopping one host makes the next task use the other and leaves the bound tasks refused with that reason |
+| 5 | Addressed runtimes **and a pinned baseline**: `runtimes.<name>`, `projects[].runtime`/`runtimes` + `runtime_policy`, `Workspace.Resolve`, `Request.BaseCommit`, `registry.Task.{Runtime,BaseCommit}`, one queue and worker per runtime, per-runtime startup probing, set validation | Two runtimes configured: with `spread`, two consecutive tasks land on different hosts and the log says why; **both report the same `base_commit`** even when one clone is deliberately stale; with `first-healthy`, both land on the first; stopping one host makes the next task use the other and leaves bound tasks refused with that reason; an existing `flowhub/<key>` branch that is not a descendant of `base_commit` is refused |
 | 6 | A `remote` workspace provider, once the deployment actually splits: the helper on the runtime host, the repository attestation handshake, and branch delivery | FlowHub runs on a host with **no** copy of the repository and still completes a full task end to end on the addressed remote runtime |
 
 Step 4 is the point of the whole exercise: if adding Gitea requires touching
