@@ -1,9 +1,11 @@
 # ADR 0001 — Pluggable event sources and agent runtimes
 
 **Status:** Proposed (awaiting review — nothing in this document is implemented)
-**Revision:** 3 — dropped the `locks` block from the config sketch (locks and key
-material stay in the environment, per source); revision 2 added the configuration
-format
+**Revision:** 4 — FlowHub is a control plane: added the `Workspace` seam and the
+topology section, split repository identity from workspace location in the config,
+and recorded the three things the split changes (repository attestation, branch
+delivery, cleanup ownership); revision 3 dropped the `locks` block; revision 2
+added the configuration format
 **Date:** 2026-09-21
 **Scope:** the shape of the seam between "an event happened somewhere" and "an
 agent works on it", including the configuration surface it needs. Nothing here is
@@ -60,8 +62,12 @@ What is *not* clean is the ownership of knowledge: source knowledge
 4. Standard library only, one binary, one process, two users (see `AGENTS.md`).
 5. Decisions that are still moving (structured output, the confirmation gate,
    reconciliation polling) must not be frozen into interfaces.
-6. Distinguish two axes. A source and a runtime are independent, and a design
-   that conflates them will be wrong for both.
+6. Distinguish the axes. A source, a workspace and a runtime are three
+   independent things, and a design that conflates them will be wrong for all
+   three.
+7. **Do not assume FlowHub and the runtime share a filesystem.** They are
+   co-located during development only; the target deployment has FlowHub on a
+   small always-on host and the agent runtime where the repositories live.
 
 ## Considered options
 
@@ -112,14 +118,31 @@ Declare event names, trigger words, state fields and the prompt text in files.
 
 Adopt **A**, with the following shape.
 
-### Two axes, two interfaces
+### Three axes, three interfaces
 
 ```
-YouTrack ─┐                                  ┌─ opencode serve  (today)
-Gitea    ─┼→ [Source] → event.Event → [dispatcher] → [agent.Runtime] → worktree
-Drone    ─┘     ↑                            ↑
-          verify/parse/policy/prompt    rules/worktree/registry/audit
+                                                        control plane
+YouTrack ─┐                                  ┌──────────────────────────────┐
+Gitea    ─┼→ [Source] → event.Event → [dispatcher] → [Workspace] ─┐        │
+Drone    ─┘     ↑                            ↑          ↑         │        │
+          verify/parse/policy/prompt    rules/registry/audit     │        │
+                                                                 │  data plane
+                                               [agent.Runtime] ←─┘        │
+                                                     │  opencode serve      │
+                                                     └→ a per-task working directory
 ```
+
+Three seams, not two:
+
+| Seam | Owns | First implementation |
+| --- | --- | --- |
+| `Source` | decoding an event, its policy, its prompt, its tool allowlist | `youtrack` |
+| `Workspace` | producing a dedicated working directory for a task, on *its* filesystem | `localworktree` (co-located) |
+| `agent.Runtime` | driving one turn inside that directory | `opencode` |
+
+Revision 1 collapsed `Workspace` into "FlowHub runs `git worktree add`", which
+silently assumed one machine. The consequences of that assumption, and the
+`Workspace` contract that replaces it, are in the next section.
 
 ### `internal/event` — the neutral IR
 
@@ -232,6 +255,99 @@ type Runtime interface {
 permissions the session starts with" is a runtime property, while "which tools a
 source needs" is the source's.
 
+### Deployment topology: FlowHub is a control plane
+
+FlowHub and the agent runtime are separate hosts in the target deployment, even
+though they run side by side during development. Four things in the current code
+assume otherwise, and all four are about the *workspace*, not about the protocol:
+
+| Assumption today | Where | Whose fact it really is |
+| --- | --- | --- |
+| `repo.path` exists, is a git work tree, and its `origin` matches `repo.remote` | `internal/projectmap/validate.go` | the runtime host |
+| the worktrees base exists and sits outside the repository | `internal/projectmap/validate.go`, `dispatch.Problems` | the runtime host |
+| `git worktree add` runs as a child process | `internal/worktree/worktree.go` | the runtime host |
+| the registry stores a *local* absolute path as the task's directory | `internal/registry` | the runtime host |
+
+Everything else is already transport-safe, which is why this is a seam and not a
+rewrite: `?directory=` is an opaque HTTP query parameter that FlowHub never reads
+(`internal/opencode/client.go`), the permission loop is pure HTTP and the commands
+it judges run on the runtime side, the attachment prefix is relative
+(`.flowhub/attachments`), and the client already speaks Basic Auth for
+`OPENCODE_SERVER_PASSWORD` — which the configuration does **not** wire up yet, a
+gap to close before the link leaves loopback.
+
+```go
+package workspace
+
+// Request describes the workspace a task needs, in terms the provider can act on
+// without knowing anything about events or prompts.
+type Request struct {
+    TaskKey string // stable, human readable: "TEST-17"
+    Remote  string // the repository identity, e.g. git@host:owner/repo.git
+    BaseRef string // the branch to start from
+    Base    string // provider specific root, from configuration
+}
+
+// Handle is what FlowHub keeps in the registry and hands to the runtime. Path is
+// opaque: FlowHub never stats, joins or globs it, because it names a directory on
+// somebody else's machine.
+type Handle struct {
+    Provider string // "localworktree", "remote"
+    Path     string // as the runtime spells it
+    Repo     string // the provider's attestation of which repository it used
+    Commit   string // the revision the workspace started from
+}
+
+type Workspace interface {
+    Name() string
+    Prepare(ctx context.Context, req Request) (Handle, error)
+    // Check reports drift: the workspace is gone, or it no longer belongs to the
+    // repository the task was created against.
+    Check(ctx context.Context, h Handle) error
+    Remove(ctx context.Context, h Handle) error
+}
+```
+
+* `localworktree` is today's `internal/worktree`, renamed and behind the
+  interface. It keeps the `git worktree` strategy, because on a host with a
+  persistent clone that is still the cheapest isolation: one object store, one
+  directory and branch per task, milliseconds to create.
+* `remote` is a later provider. It does **not** mean FlowHub holds SSH keys to the
+  runtime host: that would make FlowHub a remote executor, which this design
+  avoids. It means the runtime side runs a small helper that FlowHub calls over
+  the same kind of authenticated HTTP link it already uses for opencode, and that
+  helper owns cloning, worktrees and disk. The provider may equally be "a
+  container volume per task" — the interface deliberately says workspace, not
+  worktree.
+
+Three consequences of the split that the ADR treats as first-class, because each
+one weakens or changes something the current design gets for free:
+
+1. **Repository verification becomes a handshake.** "Never route to a guessed
+   repository" is enforced today by reading the local `.git/config` at startup.
+   Across hosts FlowHub cannot read anything, so `Handle.Repo` — the provider's
+   own statement of which repository it prepared — is what gets compared against
+   the routing entry, and recorded in the audit. If the provider cannot attest to
+   it, the task is refused. This must not degrade into "the string matched once, so
+   trust the path".
+2. **The branch has to reach the reviewer.** Co-located, the agent's commits land
+   in the same clone the human already has, so `git log flowhub/TEST-17` just
+   works and nothing is pushed. Split, the commits are on the runtime host, and
+   the workflow needs a transport: allow the agent to push its own task branch to
+   the shared origin (which means relaxing the current "never push" invariant to
+   "never push outside `flowhub/<task key>`"), or have the reviewer fetch from the
+   runtime host, or have the provider export a patch. This is a product decision,
+   not an implementation detail, and it is open question 8 below.
+3. **Cleanup belongs to the provider.** `Remove` currently has no caller, so
+   directories accumulate silently. Once the disk is somebody else's, FlowHub must
+   be able to ask for removal and report what it found (`list` with size and dirty
+   state) rather than reaching for `os.RemoveAll` on a path it cannot see.
+
+The topology also decides what "one runtime" means: with more than one runtime
+host, `runtime` is no longer a process-global block but a per-project override,
+which is why the configuration sketch below puts it at the top level *and* allows
+it per project.
+
 ### The configuration format (v2)
 
 The routing table cannot carry a second source as it stands, for three
@@ -313,23 +429,39 @@ work (`policy`).
       "project": "BEAP_BE",
       "also": ["BEAP"],
       "repo": {
-        "path": "/Users/yusiwen/git/work/pipechina/beap-be",
         "remote": "git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git",
         "default_branch": "master"
       },
-      "worktrees": "/Users/yusiwen/git/work/pipechina/beap-be-worktrees",
+      "workspace": {
+        "provider": "localworktree",
+        "clone": "/Users/yusiwen/git/work/pipechina/beap-be",
+        "base": "/Users/yusiwen/git/work/pipechina/beap-be-worktrees"
+      },
       "agent": "devops",
       "enabled": true
     },
     {
       "source": "youtrack",
       "project": "TEST",
-      "repo": { "path": "/Users/yusiwen/git/mine/test", "default_branch": "main" },
-      "worktrees": "/Users/yusiwen/git/mine/test-worktrees"
+      "repo": { "remote": "", "default_branch": "main" },
+      "workspace": {
+        "provider": "localworktree",
+        "clone": "/Users/yusiwen/git/mine/test",
+        "base": "/Users/yusiwen/git/mine/test-worktrees"
+      }
     }
   ]
 }
 ```
+
+`repo` is now the *logical identity* of a repository (its remote and the branch a
+task starts from) and `workspace` holds the *physical* facts, which belong to
+whichever provider is configured. A future remote provider reads its own keys
+(for example `{"provider": "remote", "runner": "https://builder.lan:8443", "base":
+"/srv/flowhub-worktrees"}`) and the routing table no longer has to point at a path
+this host can see. `TEST` shows the one wrinkle: a local repository with no remote
+has no identity to attest to, so `remote` is empty and the local provider is the
+only one that can serve it.
 
 Mapping from v1, which the live file uses today:
 
@@ -337,9 +469,11 @@ Mapping from v1, which the live file uses today:
 | --- | --- |
 | `projects[].youtrack_key: "TEST"` | `projects[].source: "youtrack"` + `projects[].project: "TEST"` |
 | `projects[].also_keys` | `projects[].also` |
-| `repo`, `worktrees`, `agent`, `model`, `authors`, `enabled` | unchanged |
+| `repo.path` + `worktrees` | `repo` keeps only `remote`/`default_branch` (identity); `workspace` carries `provider`, `clone`, `base` (location) |
+| `repo.remote`, `agent`, `model`, `authors`, `enabled` | unchanged |
 | `FLOWHUB_TRIGGER`, `FLOWHUB_START_STATES`, `FLOWHUB_SKIP_ANALYZE_ON_CREATE`, `FLOWHUB_MAX_TURNS` | `sources.<name>.policy.*`; the environment variables become the outermost default |
 | `FLOWHUB_OPENCODE_URL`, `FLOWHUB_DISPATCH_AGENT`, `FLOWHUB_TASK_DEADLINE` | `runtime.*`; the environment variables become the outermost default |
+| (missing) | `FLOWHUB_OPENCODE_USER` / `FLOWHUB_OPENCODE_PASSWORD` must be wired: the client supports Basic Auth but `main.go` builds it with a URL only, which is fine for loopback and not for a network link |
 | `FLOWHUB_ALLOWED_SOURCES` | stays in the environment, renamed per source (`FLOWHUB_YOUTRACK_ALLOWED_SOURCES`) |
 | `FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN` | stay in the environment, renamed per source (`FLOWHUB_YOUTRACK_HOOK_KEY`, `FLOWHUB_YOUTRACK_TOKEN`); the current names remain accepted as aliases for YouTrack |
 | `FLOWHUB_PROJECTS_FILE` | accepted, with `FLOWHUB_CONFIG_FILE` as the preferred spelling (the file is no longer only a routing table) |
@@ -420,9 +554,10 @@ staticcheck test test-race smoke` green. Behaviour must not change before step 3
 | --- | --- | --- |
 | 0 | This ADR | reviewed and accepted |
 | 1 | Add `internal/event` and `internal/source`; move `webhook.Parse`, `describe`, `AllowedMCPTools`, the reply check and `rules.Prompt` behind a `youtrack` adapter; `dispatch` consumes only the IR. The config file is **not** touched in this step | Existing tests unchanged and green; `make smoke` unchanged; `dispatch` no longer imports `webhook` |
-| 2 | Add `internal/agent`; make `opencode` implement it; move `sessionRuleset` there; `dispatch` no longer imports `opencode` | `go list -deps` shows the cut; the live path is re-verified with one real webhook turn |
+| 2 | Add `internal/agent` and `internal/workspace`; make `opencode` the runtime and today's `worktree` package the `localworktree` provider, with its local-filesystem checks moved behind it; `dispatch` imports neither vendor; wire `FLOWHUB_OPENCODE_USER`/`PASSWORD` | `go list -deps` shows both cuts; the live path is re-verified with one real webhook turn |
 | 3 | Config format v2 as specified above: `sources`, `runtime`, `(source, project)` entries, per-level policy precedence, and the v1 translation branch | A v1 file and an equivalent v2 file produce the same routing and the same effective policy; `-print-config` names the level each value came from; a v2 file with `youtrack_key` is refused with the replacement named in the error |
 | 4 | Gitea adapter as the acceptance test for the seam (HMAC-SHA256 `X-Hub-Signature-256`, issue and PR text) | A real Gitea webhook drives one analysis turn; the core packages show no diff beyond registration |
+| 5 | A `remote` workspace provider, once the deployment actually splits: the helper on the runtime host, the repository attestation handshake, and branch delivery | FlowHub runs on a host with **no** copy of the repository and still completes a full task end to end |
 
 Step 4 is the point of the whole exercise: if adding Gitea requires touching
 `dispatch`, the seam is wrong and should be revised rather than worked around.
@@ -456,7 +591,17 @@ Step 4 is the point of the whole exercise: if adding Gitea requires touching
    project entry already carries `agent`/`model`, so a per-project prompt is
    consistent. Recommendation: not yet — the prompt already receives the
    repository path and tells the agent to find the project's own tooling.
-7. **Per-source environment variable names.** The proposal renames the lock and
+8. **How does a finished branch reach the reviewer?** Co-located it is already
+   there; split it is on the runtime host. Options: relax "never push" to "never
+   push outside `flowhub/<task key>`", have the reviewer fetch from the runtime
+   host, or have the provider export a patch. Recommendation: first, because it
+   keeps the review in the tool the team already uses, with the branch name
+   enforced by the arbiter's deny list rather than promised by the prompt.
+9. **Where does the remote helper run?** A tiny sidecar next to `opencode serve`,
+   or inside the same container image / systemd unit. Recommendation: sidecar on
+   the same host, so "the workspace exists" and "the agent can reach it" cannot
+   drift apart.
+10. **Per-source environment variable names.** The proposal renames the lock and
    secret variables per source and keeps today's names as aliases. Confirm that the
    alias layer is wanted at all: dropping it is simpler and the migration is one
    shell profile, but it also breaks any script that exports the old names.
