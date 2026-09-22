@@ -1,7 +1,10 @@
 # ADR 0001 — Pluggable event sources and agent runtimes
 
 **Status:** Proposed (awaiting review — nothing in this document is implemented)
-**Revision:** 4 — FlowHub is a control plane: added the `Workspace` seam and the
+**Revision:** 5 — the target topology is a control plane plus one or more agent
+hosts, so runtimes are addressed by name, a task binds to one for life, and each
+runtime gets its own queue, worker, credentials and workspace provider; revision 4
+made FlowHub a control plane: added the `Workspace` seam and the
 topology section, split repository identity from workspace location in the config,
 and recorded the three things the split changes (repository attestation, branch
 delivery, cleanup ownership); revision 3 dropped the `locks` block; revision 2
@@ -348,6 +351,109 @@ host, `runtime` is no longer a process-global block but a per-project override,
 which is why the configuration sketch below puts it at the top level *and* allows
 it per project.
 
+### Addressing multiple runtimes
+
+Confirmed topology: FlowHub runs on the small always-on host (gateway/aliyun),
+`opencode` runs on one or more performance hosts, and there will be **more than
+one**. That turns "the runtime" from a process-global fact into an addressed
+resource, and it changes three things: who picks a runtime, where the choice is
+remembered, and how work is queued.
+
+**Identity and configuration.** A runtime is a named block. Everything that
+differs between hosts hangs off that name: endpoint, credentials, agent and model
+defaults, concurrency, and the workspace provider — because the workspace is the
+far side's filesystem.
+
+```json
+{
+  "_comment": "An excerpt: only the runtimes block of the configuration below.",
+    "runtimes": {
+      "local": {
+      "url": "http://127.0.0.1:4096",
+      "agent": "devops",
+      "workspace": {
+        "provider": "localworktree",
+        "base": "/Users/yusiwen/git/mine/test-worktrees",
+        "clones": { "youtrack:TEST": "/Users/yusiwen/git/mine/test" }
+      }
+    },
+    "builder-a": {
+      "url": "https://builder-a.lan:4096",
+      "auth": { "user": "opencode", "password_env": "FLOWHUB_RUNTIME_BUILDER_A_PASSWORD" },
+      "agent": "devops",
+      "model": "deepseek/deepseek-v4-flash",
+      "deadline": "15m",
+      "max_concurrent": 1,
+      "workspace": { "provider": "remote", "runner": "https://builder-a.lan:8443", "base": "/srv/flowhub-worktrees" }
+    }
+  }
+}
+```
+
+Physical paths appear **exactly once** in FlowHub's configuration, under the
+runtime that owns that filesystem — the same rule that removed the `locks` block.
+A `remote` provider keeps its own copy of the repo→path mapping, so FlowHub sends
+identities (`remote`, `base_ref`, `task_key`) and never a path. `workspace.clones`
+is keyed by `<source>:<project>`, the same key the routing table uses, so a project
+and its checkout cannot drift apart silently.
+
+**Selection is a routing decision, not an event decision.** A project names one
+runtime, or a list of them for capacity:
+
+```json
+{ "source": "youtrack", "project": "BEAP_BE",
+  "repo": { "remote": "git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git", "default_branch": "master" },
+  "runtimes": ["builder-a", "builder-b"] }
+```
+
+With a list, the first runtime that answers its health probe *and* can prepare a
+workspace wins. **Never from event content**: which machine runs code decides
+which network, which credentials and which repositories are reachable, so it is an
+authorization decision. An issue author who could name a runtime could ask for the
+host with the production kubeconfig on it. If a per-task hint is ever wanted (a
+YouTrack custom field, say), it may only *narrow* the project's allowed list, and
+it is refused when it names anything outside it — the same shape as the existing
+"the routing table never guesses a repository" rule.
+
+**The choice is sticky, and recorded.** A task binds to the runtime that created
+its workspace and session, for the rest of its life:
+
+* `registry.Task` gains `Runtime` (the name) next to the workspace handle.
+* A later event for a bound task goes to that runtime even if the project's
+  `runtimes` list changed. A session cannot move between hosts: a new session
+  elsewhere is a fresh context that has lost the plan and the analysis.
+* If the bound runtime is no longer configured, or does not answer, the delivery
+  is refused with that reason in the log and the task's state, rather than being
+  silently re-homed. This is the same shape as today's refusal to reuse a session
+  when the routing table now points at a different repository.
+* Binding happens once, after a workspace was prepared and a session created; if
+  every candidate fails, nothing is bound and the next delivery may try again.
+* Rows written before this change have no runtime name. They are read as the
+  configured default runtime if one is marked `"default": true`, and refused
+  loudly otherwise rather than guessed.
+
+**One queue per runtime.** Today one worker serializes everything because a prompt
+sent to a busy session is silently swallowed. That reason is per *session*, not
+per server, so the unit of serialization becomes the runtime: each runtime gets
+its own queue and its own single worker, and different runtimes run turns in
+parallel. `max_concurrent` exists in the sketch but stays at 1 until per-task
+locking is in place; the field is there so raising it later is configuration, not
+a redesign. `/healthz` reports per runtime: healthy, queued, in flight, and the
+last error, so "which host is stuck" is one HTTP call.
+
+**Credentials stay in the environment, named per runtime.** The configuration may
+say *which* variable holds a password (`password_env`), never the password
+itself — same rule as the URL key and the token. The client already speaks Basic
+Auth against `OPENCODE_SERVER_PASSWORD`; what is missing is the wiring, and it is
+needed before the link leaves loopback. Over a private WireGuard network plain
+HTTP is acceptable; anything crossing the internet needs TLS and an authenticating
+front end.
+
+**Where the runtime name is recorded.** In the registry and in the dispatch log
+lines (`slog`), not in the webhook audit record: audit is written on the receiving
+path, which knows nothing about runtimes, and keeping it that way is what lets the
+receiver stay I/O free and transport-only.
+
 ### The configuration format (v2)
 
 The routing table cannot carry a second source as it stands, for three
@@ -394,7 +500,7 @@ work (`policy`).
 {
   "version": 2,
 
-  "_comment": "Event sources, the agent runtime, and the project -> repository table.",
+  "_comment": "Event sources, agent runtimes, and the project -> repository table.",
 
   "sources": {
     "youtrack": {
@@ -408,19 +514,30 @@ work (`policy`).
       },
       "prompt_file": "prompts/youtrack.md",
       "authors": ["yusiwen"]
-    },
-    "gitea": {
-      "enabled": false,
-      "policy": { "trigger": "/opencode", "start_states": ["open"] }
     }
   },
 
-  "runtime": {
-    "name": "opencode",
-    "url": "http://127.0.0.1:4096",
-    "agent": "devops",
-    "model": "deepseek/deepseek-v4-flash",
-    "deadline": "15m"
+  "runtimes": {
+    "local": {
+      "_comment": "Development: FlowHub and opencode are the same machine.",
+      "url": "http://127.0.0.1:4096",
+      "agent": "devops",
+      "workspace": {
+        "provider": "localworktree",
+        "base": "/Users/yusiwen/git/mine/test-worktrees",
+        "clones": { "youtrack:TEST": "/Users/yusiwen/git/mine/test" }
+      }
+    },
+    "builder-a": {
+      "_comment": "Target: the agent runtime, and the filesystem it works on.",
+      "url": "https://builder-a.lan:4096",
+      "auth": { "user": "opencode", "password_env": "FLOWHUB_RUNTIME_BUILDER_A_PASSWORD" },
+      "agent": "devops",
+      "model": "deepseek/deepseek-v4-flash",
+      "deadline": "15m",
+      "max_concurrent": 1,
+      "workspace": { "provider": "remote", "runner": "https://builder-a.lan:8443", "base": "/srv/flowhub-worktrees" }
+    }
   },
 
   "projects": [
@@ -432,11 +549,7 @@ work (`policy`).
         "remote": "git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git",
         "default_branch": "master"
       },
-      "workspace": {
-        "provider": "localworktree",
-        "clone": "/Users/yusiwen/git/work/pipechina/beap-be",
-        "base": "/Users/yusiwen/git/work/pipechina/beap-be-worktrees"
-      },
+      "runtimes": ["builder-a", "builder-b"],
       "agent": "devops",
       "enabled": true
     },
@@ -444,24 +557,18 @@ work (`policy`).
       "source": "youtrack",
       "project": "TEST",
       "repo": { "remote": "", "default_branch": "main" },
-      "workspace": {
-        "provider": "localworktree",
-        "clone": "/Users/yusiwen/git/mine/test",
-        "base": "/Users/yusiwen/git/mine/test-worktrees"
-      }
+      "runtime": "local"
     }
   ]
 }
 ```
 
-`repo` is now the *logical identity* of a repository (its remote and the branch a
-task starts from) and `workspace` holds the *physical* facts, which belong to
-whichever provider is configured. A future remote provider reads its own keys
-(for example `{"provider": "remote", "runner": "https://builder.lan:8443", "base":
-"/srv/flowhub-worktrees"}`) and the routing table no longer has to point at a path
-this host can see. `TEST` shows the one wrinkle: a local repository with no remote
-has no identity to attest to, so `remote` is empty and the local provider is the
-only one that can serve it.
+`repo` is the *logical identity* of a repository (its remote and the branch a task
+starts from). The *physical* facts moved under `runtimes`, because they belong to
+whichever host owns that filesystem, and a project now names `runtime` or
+`runtimes` instead of carrying paths. `TEST` shows one wrinkle: a local repository
+with no remote has no identity to attest to, so `remote` is empty and only a local
+workspace provider can serve it.
 
 Mapping from v1, which the live file uses today:
 
@@ -469,10 +576,11 @@ Mapping from v1, which the live file uses today:
 | --- | --- |
 | `projects[].youtrack_key: "TEST"` | `projects[].source: "youtrack"` + `projects[].project: "TEST"` |
 | `projects[].also_keys` | `projects[].also` |
-| `repo.path` + `worktrees` | `repo` keeps only `remote`/`default_branch` (identity); `workspace` carries `provider`, `clone`, `base` (location) |
+| `repo.path` + `worktrees` | `repo` keeps only `remote`/`default_branch` (identity); the paths move under `runtimes.<name>.workspace` (location), which is the host that owns them |
+| (no equivalent) | `runtimes` + `projects[].runtime`/`runtimes`, so a task can be addressed to one of several agent hosts |
 | `repo.remote`, `agent`, `model`, `authors`, `enabled` | unchanged |
 | `FLOWHUB_TRIGGER`, `FLOWHUB_START_STATES`, `FLOWHUB_SKIP_ANALYZE_ON_CREATE`, `FLOWHUB_MAX_TURNS` | `sources.<name>.policy.*`; the environment variables become the outermost default |
-| `FLOWHUB_OPENCODE_URL`, `FLOWHUB_DISPATCH_AGENT`, `FLOWHUB_TASK_DEADLINE` | `runtime.*`; the environment variables become the outermost default |
+| `FLOWHUB_OPENCODE_URL`, `FLOWHUB_DISPATCH_AGENT`, `FLOWHUB_TASK_DEADLINE` | the `runtimes.<name>` block (the environment variables become the default for a runtime named `default`) |
 | (missing) | `FLOWHUB_OPENCODE_USER` / `FLOWHUB_OPENCODE_PASSWORD` must be wired: the client supports Basic Auth but `main.go` builds it with a URL only, which is fine for loopback and not for a network link |
 | `FLOWHUB_ALLOWED_SOURCES` | stays in the environment, renamed per source (`FLOWHUB_YOUTRACK_ALLOWED_SOURCES`) |
 | `FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN` | stay in the environment, renamed per source (`FLOWHUB_YOUTRACK_HOOK_KEY`, `FLOWHUB_YOUTRACK_TOKEN`); the current names remain accepted as aliases for YouTrack |
@@ -556,8 +664,9 @@ staticcheck test test-race smoke` green. Behaviour must not change before step 3
 | 1 | Add `internal/event` and `internal/source`; move `webhook.Parse`, `describe`, `AllowedMCPTools`, the reply check and `rules.Prompt` behind a `youtrack` adapter; `dispatch` consumes only the IR. The config file is **not** touched in this step | Existing tests unchanged and green; `make smoke` unchanged; `dispatch` no longer imports `webhook` |
 | 2 | Add `internal/agent` and `internal/workspace`; make `opencode` the runtime and today's `worktree` package the `localworktree` provider, with its local-filesystem checks moved behind it; `dispatch` imports neither vendor; wire `FLOWHUB_OPENCODE_USER`/`PASSWORD` | `go list -deps` shows both cuts; the live path is re-verified with one real webhook turn |
 | 3 | Config format v2 as specified above: `sources`, `runtime`, `(source, project)` entries, per-level policy precedence, and the v1 translation branch | A v1 file and an equivalent v2 file produce the same routing and the same effective policy; `-print-config` names the level each value came from; a v2 file with `youtrack_key` is refused with the replacement named in the error |
-| 4 | Gitea adapter as the acceptance test for the seam (HMAC-SHA256 `X-Hub-Signature-256`, issue and PR text) | A real Gitea webhook drives one analysis turn; the core packages show no diff beyond registration |
-| 5 | A `remote` workspace provider, once the deployment actually splits: the helper on the runtime host, the repository attestation handshake, and branch delivery | FlowHub runs on a host with **no** copy of the repository and still completes a full task end to end |
+| 4 | Gitea adapter as the acceptance test for the source seam (HMAC-SHA256 `X-Hub-Signature-256`, issue and PR text) | A real Gitea webhook drives one analysis turn; the core packages show no diff beyond registration |
+| 5 | Addressed runtimes: `runtimes.<name>`, `projects[].runtime`/`runtimes`, the sticky `registry.Task.Runtime` binding, and one queue and worker per runtime | Two runtimes configured, one task on each, both complete; a task bound to a runtime that is then removed from the configuration is refused with that reason rather than re-homed |
+| 6 | A `remote` workspace provider, once the deployment actually splits: the helper on the runtime host, the repository attestation handshake, and branch delivery | FlowHub runs on a host with **no** copy of the repository and still completes a full task end to end on the addressed remote runtime |
 
 Step 4 is the point of the whole exercise: if adding Gitea requires touching
 `dispatch`, the seam is wrong and should be revised rather than worked around.
@@ -591,7 +700,18 @@ Step 4 is the point of the whole exercise: if adding Gitea requires touching
    project entry already carries `agent`/`model`, so a per-project prompt is
    consistent. Recommendation: not yet — the prompt already receives the
    repository path and tells the agent to find the project's own tooling.
-8. **How does a finished branch reach the reviewer?** Co-located it is already
+8. **Runtime selection: explicit names, or labels?** Names are deterministic and
+   auditable but adding a machine means editing every project that should use it.
+   Labels (`runtimes.builder-a.labels: ["java","maven"]`, `projects[].needs:
+   ["java"]`) invert that at the cost of an indirection and a new failure mode
+   ("no runtime satisfies this project"). Recommendation: names now, labels only
+   if the third runtime appears.
+9. **What should a bound-but-unreachable runtime do to the task?** The
+   recommendation above is "refuse and say so". The alternative is an operator
+   command to re-home a task explicitly (`flowhub task move TEST-17 builder-b`),
+   which is honest because a human decides that losing the session context is
+   acceptable. Not needed until a host actually dies.
+10. **How does a finished branch reach the reviewer?** Co-located it is already
    there; split it is on the runtime host. Options: relax "never push" to "never
    push outside `flowhub/<task key>`", have the reviewer fetch from the runtime
    host, or have the provider export a patch. Recommendation: first, because it
@@ -601,7 +721,7 @@ Step 4 is the point of the whole exercise: if adding Gitea requires touching
    or inside the same container image / systemd unit. Recommendation: sidecar on
    the same host, so "the workspace exists" and "the agent can reach it" cannot
    drift apart.
-10. **Per-source environment variable names.** The proposal renames the lock and
+11. **Per-source environment variable names.** The proposal renames the lock and
    secret variables per source and keeps today's names as aliases. Confirm that the
    alias layer is wanted at all: dropping it is simpler and the migration is one
    shell profile, but it also breaks any script that exports the old names.
