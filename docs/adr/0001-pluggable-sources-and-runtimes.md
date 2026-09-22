@@ -1,7 +1,9 @@
 # ADR 0001 — Pluggable event sources and agent runtimes
 
 **Status:** Proposed (awaiting review — nothing in this document is implemented)
-**Revision:** 2 — added "The configuration format (v2)" and the questions it raises
+**Revision:** 3 — dropped the `locks` block from the config sketch (locks and key
+material stay in the environment, per source); revision 2 added the configuration
+format
 **Date:** 2026-09-21
 **Scope:** the shape of the seam between "an event happened somewhere" and "an
 agent works on it", including the configuration surface it needs. Nothing here is
@@ -248,9 +250,29 @@ mechanical reasons:
 
 The file also has to absorb the runtime, because `FLOWHUB_OPENCODE_URL` and
 `FLOWHUB_DISPATCH_AGENT` are runtime facts sitting in the same flat environment as
-the source facts. **Secrets stay in the environment.** The file describes which
-locks are active and which policy applies; it never holds key material, so it
-stays safe to copy, diff, back up and review.
+the source facts.
+
+**Locks and key material stay in the environment**; the file holds non-secret
+policy and routing only, so it stays safe to copy, diff, back up and review. Both
+sides become per-source: `FLOWHUB_YOUTRACK_HOOK_KEY`,
+`FLOWHUB_YOUTRACK_TOKEN`, `FLOWHUB_YOUTRACK_ALLOWED_SOURCES`,
+`FLOWHUB_GITEA_SECRET`, with today's unsuffixed names kept as aliases for YouTrack.
+
+Revision 2 sketched a per-source `locks` block in this file (`url_key`,
+`token_header`, `source_ip`). It was removed for two reasons. First, it splits a
+lock's *enablement* from its *secret*, which creates a contradiction the format
+then has to resolve by rule: `"url_key": true` with no
+`FLOWHUB_YOUTRACK_HOOK_KEY` in the environment can only be "refuse to start",
+because the project's invariant is that a silently disabled lock is the worst
+outcome — today's `unset` means "disabled, loudly" only because it cannot tell
+"I meant to turn this off" from "I forgot to configure it", and an explicit
+declaration in a file removes that excuse rather than needing it. Second, a lock
+is a *deployment* fact (which address the gateway forwards from, which URL is
+published, what the shared secret is), not a repository fact, and this file's
+subject is repositories. Keeping both the switch and the value in the environment
+leaves exactly one place to be wrong. What the file does keep is the per-source
+statement that the source exists at all (`enabled`) and what it means to start
+work (`policy`).
 
 ```json
 {
@@ -261,7 +283,6 @@ stays safe to copy, diff, back up and review.
   "sources": {
     "youtrack": {
       "enabled": true,
-      "locks": { "url_key": true, "token_header": true, "source_ip": ["10.1.0.0/24"] },
       "policy": {
         "trigger": "/opencode start",
         "start_states": ["In Progress"],
@@ -274,7 +295,6 @@ stays safe to copy, diff, back up and review.
     },
     "gitea": {
       "enabled": false,
-      "locks": { "signature": true },
       "policy": { "trigger": "/opencode", "start_states": ["open"] }
     }
   },
@@ -320,7 +340,7 @@ Mapping from v1, which the live file uses today:
 | `repo`, `worktrees`, `agent`, `model`, `authors`, `enabled` | unchanged |
 | `FLOWHUB_TRIGGER`, `FLOWHUB_START_STATES`, `FLOWHUB_SKIP_ANALYZE_ON_CREATE`, `FLOWHUB_MAX_TURNS` | `sources.<name>.policy.*`; the environment variables become the outermost default |
 | `FLOWHUB_OPENCODE_URL`, `FLOWHUB_DISPATCH_AGENT`, `FLOWHUB_TASK_DEADLINE` | `runtime.*`; the environment variables become the outermost default |
-| `FLOWHUB_ALLOWED_SOURCES` | `sources.<name>.locks.source_ip` |
+| `FLOWHUB_ALLOWED_SOURCES` | stays in the environment, renamed per source (`FLOWHUB_YOUTRACK_ALLOWED_SOURCES`) |
 | `FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN` | stay in the environment, renamed per source (`FLOWHUB_YOUTRACK_HOOK_KEY`, `FLOWHUB_YOUTRACK_TOKEN`); the current names remain accepted as aliases for YouTrack |
 | `FLOWHUB_PROJECTS_FILE` | accepted, with `FLOWHUB_CONFIG_FILE` as the preferred spelling (the file is no longer only a routing table) |
 | (absent) | `version`; absent means 1 |
@@ -436,7 +456,7 @@ Step 4 is the point of the whole exercise: if adding Gitea requires touching
    project entry already carries `agent`/`model`, so a per-project prompt is
    consistent. Recommendation: not yet — the prompt already receives the
    repository path and tells the agent to find the project's own tooling.
-7. **Does `locks.source_ip` belong in the file?** It is a deployment fact (which
-   address the gateway forwards from), not a repository fact. Recommendation: yes,
-   per source, because two sources can arrive from different addresses; the values
-   are not secrets, so the file stays safe to commit.
+7. **Per-source environment variable names.** The proposal renames the lock and
+   secret variables per source and keeps today's names as aliases. Confirm that the
+   alias layer is wanted at all: dropping it is simpler and the migration is one
+   shell profile, but it also breaks any script that exports the old names.
