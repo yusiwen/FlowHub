@@ -1,7 +1,8 @@
 # ADR 0002 — Data-plane runtime installation and enrollment
 
-**Status:** Proposed (nothing implemented; the five decisions below were approved
-in review on 2026-09-22)
+**Status:** Proposed, partially implemented. The five decisions below were approved
+in review on 2026-09-22, and **migration step 1 — `flowhub runtime init --check` —
+is implemented**; steps 2–5 are not started.
 **Revision:** 1
 **Date:** 2026-09-22
 **Depends on:** [ADR 0001](./0001-pluggable-sources-and-runtimes.md) — it settles

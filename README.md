@@ -86,6 +86,37 @@ curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' \
 # => 202 0.0004s
 ```
 
+## Commands
+
+The service and the data-plane host are the same binary, and a subcommand is
+dispatched before the receiver configuration is loaded — a host that will run
+turns has none of the receiver's environment variables and must not fail because
+they are absent.
+
+```bash
+flowhub                      # run the receiver (and the dispatcher)
+flowhub -version             # print the version
+flowhub -print-config        # print the effective configuration, secrets masked
+flowhub runtime init --check # report what this host can and cannot do; writes nothing
+```
+
+`runtime init --check` is the first half of
+[`docs/adr/0002`](./docs/adr/0002-data-plane-runtime-installation.md): it checks
+the agent runtime, `git`, the forge command-line tools the declared repositories
+need, each clone's `origin`, read access (`git ls-remote`) and **write** access
+(`git push --dry-run`, which contacts the remote and updates nothing), plus the
+presence of required environment variables. It reports the identity it ran as,
+because a check that runs as the wrong user passes and then the first push fails.
+Exit status is 0 for ready, 2 for not ready, 1 for a usage mistake.
+
+```bash
+flowhub runtime init --check --forge git.yusiwen.cn=gitea \
+  --repo git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git=/Users/me/git/beap-be
+```
+
+Installation, enrollment and the runtime inventory (ADR 0002 steps 2 and 3) are
+not implemented; `flowhub runtime init` without `--check` says so and exits.
+
 ## Configuration
 
 Flags: `-version`, `-print-config`.

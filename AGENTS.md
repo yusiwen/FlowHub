@@ -92,6 +92,7 @@ internal/projectmap/ YouTrack project -> repository routing table (~/.config/flo
 internal/opencode/  opencode client, permission arbiter, one-turn runner (make test-live)
 internal/rules/     trigger policy (ignore/analyze/plan/execute) and the per-turn prompt
 internal/dispatch/  the worker: queue, routing, worktree, session, arbiter, registry
+internal/provision/ data-plane host prep: `flowhub runtime init --check` (capability report, writes nothing)
 internal/dedupe/    TTL idempotency cache
 internal/store/     Audit record, non-blocking queue, JSONL audit, payload log
 internal/metrics/   Counters behind /healthz
@@ -189,7 +190,15 @@ documents. The rules below are load-bearing; do not relax them casually.
     `Policy.Basis(decision, delivery)` — never from the model, which will invent a
     plausible reason when asked to explain itself. The marker stays the last line,
     inside the blockquote.
-11. **Dispatch must be stoppable without a restart.** `FLOWHUB_PAUSE_FILE`
+11. **A subcommand runs before the receiver configuration is loaded.**
+    `flowhub runtime init` executes on a machine that has none of the receiver's
+    environment variables, so `main` dispatches a subcommand before `config.Load`
+    and does not print the receiver's banner or load the routing table. Its exit
+    status is a gate: 0 ready, 2 not ready, 1 usage. A capability report never
+    carries a secret value — only whether a variable is present — because it is a
+    document that gets copied into tickets; and a check that could not run (a
+    permission failure) must never be reported as a negative finding.
+12. **Dispatch must be stoppable without a restart.** `FLOWHUB_PAUSE_FILE`
     (default `<DataDir>/DISPATCH_OFF`) is checked before every delivery: while it
     exists, deliveries are audited and ignored. A kill switch that needs an API, a
     credential or a restart is not a kill switch.

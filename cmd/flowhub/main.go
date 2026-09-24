@@ -35,6 +35,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/metrics"
 	"github.com/yusiwen/flowhub/internal/opencode"
 	"github.com/yusiwen/flowhub/internal/projectmap"
+	"github.com/yusiwen/flowhub/internal/provision"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
 	"github.com/yusiwen/flowhub/internal/store"
@@ -54,6 +55,15 @@ var (
 )
 
 func main() {
+	// A subcommand is dispatched before anything else, and in particular before
+	// the receiver configuration is loaded. `flowhub runtime init` runs on a
+	// machine that has none of the receiver's environment variables, and it must
+	// not fail because they are absent. The exit status is the subcommand's: a
+	// capability check is a gate, so "not ready" has to be distinguishable from
+	// "you typed it wrong".
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		os.Exit(provision.Main(os.Args[1], os.Args[2:], os.Stdout, os.Stderr))
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "flowhub: %v\n", err)
 		os.Exit(1)
