@@ -513,14 +513,17 @@ func TestCommandExitStatuses(t *testing.T) {
 	if code := Main("nonsense", nil, &stdout, &stderr); code != ExitUsage {
 		t.Fatalf("unknown command exit = %d", code)
 	}
+	// No unit test runs `runtime init` without --config-root: on a machine that
+	// has an agent runtime installed it would write into the operator's real
+	// configuration directory. The install path is covered by the tests that pass
+	// a throwaway root.
 	stdout.Reset()
-	stderr.Reset()
-	if code := runtimeCommand([]string{"init"}, &stdout, &stderr); code != ExitUsage {
-		t.Fatalf("init without --check exit = %d, want usage: %s", code, stderr.String())
-	}
 	stderr.Reset()
 	if code := runtimeCommand([]string{"doctor"}, &stdout, &stderr); code != ExitUsage {
 		t.Fatalf("unimplemented subcommand exit = %d", code)
+	}
+	if code := runtimeCommand(nil, &stdout, &stderr); code != ExitUsage {
+		t.Fatalf("no subcommand exit = %d", code)
 	}
 	if !strings.Contains(stderr.String(), "not implemented in this build") {
 		t.Fatalf("stderr = %q", stderr.String())
@@ -541,9 +544,17 @@ func TestTextReportIsStableAndReadable(t *testing.T) {
 	if first.String() != second.String() {
 		t.Fatal("the text report is not deterministic")
 	}
-	for _, want := range []string{"builder-a", "yusiwen", "opencode", "tea", "git.yusiwen.cn", "push", "result: OK", "nothing was written"} {
+	// The report describes the host only. Whether a run wrote anything is the
+	// caller's statement, so it must not appear here (it once did, and told an
+	// installing run that it had written nothing).
+	for _, want := range []string{"builder-a", "yusiwen", "opencode", "tea", "git.yusiwen.cn", "push", "result: OK"} {
 		if !strings.Contains(first.String(), want) {
 			t.Errorf("report is missing %q:\n%s", want, first.String())
+		}
+	}
+	for _, unwanted := range []string{"nothing was written", "not implemented"} {
+		if strings.Contains(first.String(), unwanted) {
+			t.Errorf("the report claims something about the caller's run: %q", unwanted)
 		}
 	}
 }

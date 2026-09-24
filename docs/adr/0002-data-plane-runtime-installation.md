@@ -1,8 +1,20 @@
 # ADR 0002 — Data-plane runtime installation and enrollment
 
 **Status:** Proposed, partially implemented. The five decisions below were approved
-in review on 2026-09-22, and **migration step 1 — `flowhub runtime init --check` —
-is implemented**; steps 2–5 are not started.
+in review on 2026-09-22. **Migration steps 1 and 2 are implemented** — the
+capability report, the embedded artifacts, the manifest with drift refusal, and
+`uninstall`; steps 3–5 are not started, so `init` installs and reports but does not
+enroll. Two small refinements were made while implementing them, recorded here
+because the body above still reads as the original sketch:
+
+* The manifest lives in FlowHub's own configuration directory
+  (`<config-root>/../flowhub/manifest.json`) rather than beside the artifacts: the
+  agent's directory should hold the agent's files, and a manifest that follows the
+  agent's layout would move with it.
+* `init` runs the capability check first and refuses to install when the *agent* is
+  missing, but a missing forge tool or an unreadable clone only sets the exit
+  status to "not ready" — the operator fixes that while the files are already in
+  place, and a re-run of the install is a no-op.
 **Revision:** 1
 **Date:** 2026-09-22
 **Depends on:** [ADR 0001](./0001-pluggable-sources-and-runtimes.md) — it settles

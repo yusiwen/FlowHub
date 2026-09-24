@@ -98,6 +98,8 @@ flowhub                      # run the receiver (and the dispatcher)
 flowhub -version             # print the version
 flowhub -print-config        # print the effective configuration, secrets masked
 flowhub runtime init --check # report what this host can and cannot do; writes nothing
+flowhub runtime init         # report, then install the files FlowHub manages
+flowhub runtime uninstall    # remove exactly what the manifest records
 ```
 
 `runtime init --check` is the first half of
@@ -114,8 +116,39 @@ flowhub runtime init --check --forge git.yusiwen.cn=gitea \
   --repo git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git=/Users/me/git/beap-be
 ```
 
-Installation, enrollment and the runtime inventory (ADR 0002 steps 2 and 3) are
-not implemented; `flowhub runtime init` without `--check` says so and exits.
+### Installing the agent files
+
+`flowhub runtime init` writes the agent definition FlowHub manages, then records
+every file it wrote — path, SHA-256 and the FlowHub version — in a manifest at
+`~/.config/flowhub/manifest.json`. What it installs is **embedded in the binary**,
+never fetched from the control plane: the agent file *is* the agent's system
+prompt, so a compromised service must not be able to push prompts to every worker.
+
+The manifest is what makes the installer safe to re-run:
+
+| On disk | What happens |
+| --- | --- |
+| matches this build | nothing (a no-op) |
+| matches what FlowHub wrote, but this build embeds something newer | updated |
+| missing | restored |
+| there, identical, but not in the manifest (the hand-written case) | adopted, no write |
+| **changed by a human** | **refused, with a diff**; `--force` overwrites |
+| unreadable | refused, and reported as unreadable rather than missing |
+
+`uninstall` deletes exactly the manifest's files — a file that was edited
+afterwards is kept unless `--force` is given — and then removes the directories it
+created, so the tree goes back to what it was.
+
+The agent's **MCP configuration is never rewritten**: v1 prints the block to merge
+when the file already exists, and only creates it when there is nothing to
+destroy. That file may hold comments and other servers, and a JSON round-trip would
+delete both.
+
+`--config-root <dir>` installs into a throwaway tree instead of the real one, which
+is how the round trip is tested without touching an operator's configuration.
+
+Enrollment and the runtime inventory (ADR 0002 step 3) are not implemented:
+`init` installs and reports, and says so.
 
 ## Configuration
 

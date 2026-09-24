@@ -1,0 +1,12 @@
+{
+  "_comment": "The MCP server the devops agent needs in order to read issues and post its reply. Merge this into the agent's own configuration; the token comes from the environment and never from a file FlowHub writes.",
+  "mcp": {
+    "youtrack": {
+      "type": "remote",
+      "url": "https://pm.yusiwen.cn/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:YOUTRACK_TOKEN}"
+      }
+    }
+  }
+}

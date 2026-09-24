@@ -137,12 +137,10 @@ func (r *Report) Text(w io.Writer) {
 	} else {
 		fmt.Fprintf(w, "result: FAILED (%d failure(s), %d warning(s))\n", len(r.Failures), len(r.Warnings))
 	}
-	// Nothing was installed and nothing was registered: this command only reports.
-	// Saying so here is what stops a reader assuming --check did more than it did.
-	fmt.Fprintln(w, "note: nothing was written or registered by this check")
-	if len(r.Artifacts) == 0 {
-		fmt.Fprintln(w, "note: artifact installation and the manifest are not implemented yet")
-	}
+	// Deliberately no "nothing was written" note here: this document describes the
+	// host, and whether the run changed anything is the caller's business. A note
+	// baked in here told an installing run that it had written nothing, which is
+	// exactly the kind of reassurance a report must never invent.
 }
 
 func sortedKeys[V any](m map[string]V) []string {

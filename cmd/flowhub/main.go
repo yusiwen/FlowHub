@@ -62,6 +62,9 @@ func main() {
 	// capability check is a gate, so "not ready" has to be distinguishable from
 	// "you typed it wrong".
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		// The build identity travels into the manifest, so a host can tell which
+		// binary wrote the files it is running.
+		provision.Version = versionLine()
 		os.Exit(provision.Main(os.Args[1], os.Args[2:], os.Stdout, os.Stderr))
 	}
 	if err := run(); err != nil {

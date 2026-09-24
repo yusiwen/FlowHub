@@ -92,7 +92,7 @@ internal/projectmap/ YouTrack project -> repository routing table (~/.config/flo
 internal/opencode/  opencode client, permission arbiter, one-turn runner (make test-live)
 internal/rules/     trigger policy (ignore/analyze/plan/execute) and the per-turn prompt
 internal/dispatch/  the worker: queue, routing, worktree, session, arbiter, registry
-internal/provision/ data-plane host prep: `flowhub runtime init --check` (capability report, writes nothing)
+internal/provision/ data-plane host prep: `flowhub runtime init [--check]`, `uninstall` (capability report, embedded artifacts, manifest)
 internal/dedupe/    TTL idempotency cache
 internal/store/     Audit record, non-blocking queue, JSONL audit, payload log
 internal/metrics/   Counters behind /healthz
@@ -198,7 +198,17 @@ documents. The rules below are load-bearing; do not relax them casually.
     carries a secret value — only whether a variable is present — because it is a
     document that gets copied into tickets; and a check that could not run (a
     permission failure) must never be reported as a negative finding.
-12. **Dispatch must be stoppable without a restart.** `FLOWHUB_PAUSE_FILE`
+12. **Installed files come from the binary, and the manifest is the contract.**
+    `internal/provision` embeds the agent definition and the MCP snippet; nothing
+    is fetched from the control plane, because the agent file is a system prompt
+    and a compromised service must not be able to push prompts to every worker.
+    Every write is recorded in `manifest.json` with its SHA-256, and a file a human
+    changed is refused with a diff rather than overwritten — never silently
+    replaced, and never deleted by `uninstall` unless `--force` says so. An
+    artifact the manifest does not know is never touched. The agent's own
+    configuration file is printed, not merged: it may hold comments, and a JSON
+    round-trip would delete them.
+13. **Dispatch must be stoppable without a restart.** `FLOWHUB_PAUSE_FILE`
     (default `<DataDir>/DISPATCH_OFF`) is checked before every delivery: while it
     exists, deliveries are audited and ignored. A kill switch that needs an API, a
     credential or a restart is not a kill switch.
