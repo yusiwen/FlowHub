@@ -37,7 +37,7 @@ turn inside a per-task git worktree.
 | `internal/rules/` | Trigger policy (`rules.go`: ignore/analyze/plan/execute, trigger origin, `Basis`, self-comment detection, turn budget) and the per-turn prompt (`prompt.go`: ground rules, phase instructions, the reply sign-off contract) |
 | `internal/dispatch/` | The worker: queue, routing, worktree cache, phase arbiter, session reuse, registry update, audit log |
 | `internal/metrics/metrics.go` | Counters behind `/healthz` |
-| `docs/adr/` | Architecture decision records. `0001` proposes the seam that would make event sources and agent runtimes pluggable, including a v2 configuration format; it is **proposed, not implemented** |
+| `docs/adr/` | Architecture decision records, both **proposed and not implemented**: `0001` the seam that would make event sources and agent runtimes pluggable (including a v2 configuration format, addressed runtimes and a pinned base commit), `0002` how a data-plane host is installed and enrolled as a runtime (`flowhub runtime init`, the admin API, the artifact manifest) |
 | `README.md` | Operator-facing documentation: config table, log formats, pipeline, jq recipes, verification checklist |
 
 Tests live next to the code (`*_test.go`). `go test ./...` and `go vet ./...` are
