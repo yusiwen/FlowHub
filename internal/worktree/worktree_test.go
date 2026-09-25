@@ -300,3 +300,196 @@ func TestPrepareClearsALeftoverDirectoryWithoutLosingFiles(t *testing.T) {
 		t.Fatalf("the file that was in the way did not survive: %v %q", err, content)
 	}
 }
+
+// gitIn runs one git command in dir with the same hermetic environment the rest of
+// these tests use.
+func gitIn(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = dir
+	command.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL="+filepath.Join(t.TempDir(), "gitconfig"),
+		"GIT_CONFIG_NOSYSTEM=1",
+	)
+	out, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v: %s", args, dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// commitIn writes a file and commits it, returning the new commit id.
+func commitIn(t *testing.T, repo, name, content string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repo, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q", "-m", "change "+name)
+	return gitIn(t, repo, "rev-parse", "HEAD")
+}
+
+// originWithTwoClones builds the multi-host situation on one machine: a bare origin,
+// a clone that is up to date, and a clone that is deliberately left behind.
+func originWithTwoClones(t *testing.T) (origin, fresh, stale string) {
+	t.Helper()
+	root := t.TempDir()
+	origin = filepath.Join(root, "origin.git")
+	if err := os.MkdirAll(origin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, origin, "init", "-q", "--bare", "-b", "main")
+
+	seed := filepath.Join(root, "seed")
+	if err := os.MkdirAll(seed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, seed, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, seed, "add", "-A")
+	gitIn(t, seed, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q", "-m", "base")
+	gitIn(t, seed, "remote", "add", "origin", origin)
+	gitIn(t, seed, "push", "-q", "-u", "origin", "main")
+
+	clone := func(name string) string {
+		dir := filepath.Join(root, name)
+		gitIn(t, root, "clone", "-q", origin, dir)
+		return dir
+	}
+	fresh = clone("fresh")
+	stale = clone("stale")
+
+	// The origin moves on, and only one clone hears about it.
+	commitIn(t, seed, "CHANGELOG.md", "moved on\n")
+	gitIn(t, seed, "push", "-q", "origin", "main")
+	gitIn(t, fresh, "fetch", "-q", "origin")
+	return origin, fresh, stale
+}
+
+// TestResolveAnswersFromTheOriginNotFromTheClone is the property the pinned baseline
+// exists for: two hosts whose clones were fetched at different times must resolve the
+// same commit, and the stale one must not answer with its own older view.
+func TestResolveAnswersFromTheOriginNotFromTheClone(t *testing.T) {
+	origin, fresh, stale := originWithTwoClones(t)
+	want := gitIn(t, origin, "rev-parse", "refs/heads/main")
+
+	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
+	for _, clone := range []struct{ name, dir string }{{"fresh", fresh}, {"stale", stale}} {
+		t.Run(clone.name, func(t *testing.T) {
+			base, err := manager.Resolve(context.Background(), clone.dir, "main")
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if base.Commit != want {
+				t.Fatalf("commit = %s, want the origin's %s", base.Commit, want)
+			}
+			if base.Source != "origin" || base.Ref != "refs/heads/main" {
+				t.Fatalf("base = %+v, want the origin answer for refs/heads/main", base)
+			}
+		})
+	}
+
+	// The stale clone's own view really is behind, which is what makes the test
+	// meaningful rather than a coincidence.
+	if local := gitIn(t, stale, "rev-parse", "refs/remotes/origin/main"); local == want {
+		t.Fatalf("the stale clone is not stale: %s", local)
+	}
+}
+
+// TestResolveIsHonestAboutARepositoryWithNoOrigin: without an origin there is no
+// shared truth, and Source says so instead of pretending the answer is pinned.
+func TestResolveIsHonestAboutARepositoryWithNoOrigin(t *testing.T) {
+	repo := testRepo(t)
+	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
+
+	base, err := manager.Resolve(context.Background(), repo, "main")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if base.Source != "local" || base.Commit != gitIn(t, repo, "rev-parse", "HEAD") {
+		t.Fatalf("base = %+v, want the local HEAD with source=local", base)
+	}
+	if _, err := manager.Resolve(context.Background(), repo, "no-such-branch"); err == nil {
+		t.Fatal("a branch that does not exist was resolved")
+	}
+}
+
+// TestPrepareProducesThePinnedCommitEvenFromAStaleClone is the other half: the point
+// of resolving through the origin is worth nothing if the worktree is created from
+// whatever the clone has. The stale clone has never seen the pinned commit, so
+// Prepare has to fetch it — and it must not fall back to the older one.
+func TestPrepareProducesThePinnedCommitEvenFromAStaleClone(t *testing.T) {
+	origin, _, stale := originWithTwoClones(t)
+	want := gitIn(t, origin, "rev-parse", "refs/heads/main")
+	if _, err := exec.Command("git", "-C", stale, "cat-file", "-e", want+"^{commit}").CombinedOutput(); err == nil {
+		t.Fatal("precondition: the stale clone should not have the pinned commit yet")
+	}
+
+	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
+	base, err := manager.Resolve(context.Background(), stale, "main")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	wt, err := manager.Prepare(context.Background(), Request{
+		Repo: stale, TaskKey: "TEST-1", DefaultBranch: "main", BaseCommit: base.Commit,
+	})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if head := gitIn(t, wt.Path, "rev-parse", "HEAD"); head != want {
+		t.Fatalf("worktree HEAD = %s, want the pinned %s", head, want)
+	}
+}
+
+// TestPrepareRefusesToAttachToABranchThatIsNotADescendant closes the silent-adoption
+// hole: a `flowhub/<key>` branch left over from an unrelated run must not be built
+// on top of, because the agent's work would land on code the task never chose.
+func TestPrepareRefusesToAttachToABranchThatIsNotADescendant(t *testing.T) {
+	_, _, stale := originWithTwoClones(t)
+	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
+	base, err := manager.Resolve(context.Background(), stale, "main")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	// A branch with the task's name, started from an older commit: a leftover.
+	older := gitIn(t, stale, "rev-parse", "refs/remotes/origin/main~0")
+	gitIn(t, stale, "branch", DefaultBranchPrefix+"TEST-2", older)
+	// Rewind the pin to a commit the branch does not descend from by rewriting the
+	// branch onto an unrelated root, which is what a stray branch looks like.
+	gitIn(t, stale, "checkout", "-q", "--orphan", "stray")
+	gitIn(t, stale, "rm", "-q", "-rf", ".")
+	if err := os.WriteFile(filepath.Join(stale, "OTHER.md"), []byte("unrelated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, stale, "add", "-A")
+	gitIn(t, stale, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q", "-m", "unrelated root")
+	stray := gitIn(t, stale, "rev-parse", "HEAD")
+	gitIn(t, stale, "branch", "-f", DefaultBranchPrefix+"TEST-2", stray)
+	gitIn(t, stale, "checkout", "-q", "main")
+
+	_, err = manager.Prepare(context.Background(), Request{
+		Repo: stale, TaskKey: "TEST-2", DefaultBranch: "main", BaseCommit: base.Commit,
+	})
+	if err == nil {
+		t.Fatal("Prepare attached to a branch that is not a descendant of the pinned base")
+	}
+	if !strings.Contains(err.Error(), "not a descendant") || !strings.Contains(err.Error(), base.Commit) {
+		t.Fatalf("the refusal does not explain itself: %v", err)
+	}
+
+	// The same branch, descended from the pin, is attached to rather than refused.
+	gitIn(t, stale, "checkout", "-q", "-B", DefaultBranchPrefix+"TEST-3", base.Commit)
+	gitIn(t, stale, "checkout", "-q", "main")
+	wt, err := manager.Prepare(context.Background(), Request{
+		Repo: stale, TaskKey: "TEST-3", DefaultBranch: "main", BaseCommit: base.Commit,
+	})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if head := gitIn(t, wt.Path, "rev-parse", "HEAD"); head != base.Commit {
+		t.Fatalf("attached worktree HEAD = %s, want %s", head, base.Commit)
+	}
+}

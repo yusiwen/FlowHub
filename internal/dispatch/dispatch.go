@@ -380,10 +380,34 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 	if err != nil {
 		return registry.Task{}, err
 	}
+
+	// The baseline is resolved once, when the task is created, and never again: a
+	// long-running task's patches stay reviewable against a fixed commit even if the
+	// origin moves. Resolving it through the origin is what makes two hosts with
+	// clones fetched at different times agree on where the task starts.
+	baseCommit := strings.TrimSpace(task.BaseCommit)
+	if baseCommit == "" {
+		resolved, err := manager.Resolve(ctx, entry.Repo.Path, entry.Repo.DefaultBranch)
+		if err != nil {
+			return registry.Task{}, err
+		}
+		baseCommit = resolved.Commit
+		d.log.Info("task baseline resolved",
+			"issue", rec.IssueID, "commit", shortCommit(resolved.Commit), "ref", resolved.Ref,
+			"source", resolved.Source, "repo", entry.Repo.Path)
+		if resolved.Source == "local" {
+			// Said out loud, because "local" is not a shared truth: it is the answer
+			// on this host only, and a second host would resolve its own.
+			d.log.Warn("the repository has no origin remote, so the baseline is this clone's local ref; two hosts would not agree on it",
+				"issue", rec.IssueID, "repo", entry.Repo.Path)
+		}
+	}
+
 	prepared, err := manager.Prepare(ctx, worktree.Request{
 		Repo:          entry.Repo.Path,
 		TaskKey:       rec.IssueID,
 		DefaultBranch: entry.Repo.DefaultBranch,
+		BaseCommit:    baseCommit,
 	})
 	if err != nil {
 		return registry.Task{}, err
@@ -391,6 +415,9 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 	return d.opts.Registry.Update(rec.IssueID, func(t *registry.Task) {
 		t.Worktree = prepared.Path
 		t.Repo = prepared.Repo
+		if t.BaseCommit == "" {
+			t.BaseCommit = baseCommit
+		}
 	})
 }
 
@@ -590,7 +617,13 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 		t.Plan = plan
 		t.Turns++
 		t.Cost += result.Cost
-		t.LastReply = result.Text
+		// Only a turn that produced text replaces the recorded reply. A turn that
+		// ends without a final message — a tool-only loop, a crash — must not erase
+		// the last thing the agent said: that text is what recognises our own comment
+		// coming back as a webhook when the marker is lost.
+		if strings.TrimSpace(result.Text) != "" {
+			t.LastReply = result.Text
+		}
 	}); err != nil {
 		d.log.Error("cannot record the turn in the registry", "issue", rec.IssueID, "error", err)
 	}
@@ -653,4 +686,14 @@ func describe(rec *store.Record, payload *webhook.Payload) rules.Delivery {
 		}
 	}
 	return delivery
+}
+
+// shortCommit renders a commit id for a log line: long enough to be unambiguous in
+// a small repository, short enough that the interesting fields stay visible.
+func shortCommit(commit string) string {
+	commit = strings.TrimSpace(commit)
+	if len(commit) <= 12 {
+		return commit
+	}
+	return commit[:12]
 }

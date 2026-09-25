@@ -349,6 +349,27 @@ runtime is gone is refused with that reason rather than silently re-homed, becau
 a session on another host is a fresh context that has lost the analysis and the
 plan.
 
+### The baseline every task starts from
+
+Two hosts mean two clones, and a clone is only as new as its last fetch — so with
+`spread` the *normal* case would give two tasks for one project two different
+starting points, and a patch that applies on one host would not apply on the other.
+The base commit is therefore resolved **through the origin** and pinned:
+
+* `git ls-remote origin refs/heads/<default_branch>` answers the question once, when
+  the task is created, and that commit is recorded in the registry
+  (`base_commit`) and never re-resolved — a long-running task's patches stay
+  reviewable against a fixed base even if the origin moves;
+* the worktree is created **at that commit**; a clone that has never seen it fetches
+  it on demand (`git cat-file -e` first, so the fetch happens once, not per task),
+  and a host that cannot obtain it fails instead of quietly using an older commit;
+* if a `flowhub/<task key>` branch already exists, it is attached to **only when it
+  descends from the pinned base** — a stray branch from an unrelated run must not be
+  built on silently.
+
+A repository with no `origin` remote has no shared truth to pin: the local ref is
+used and the task log says so, because "pinned" and "assumed" are different claims.
+
 Startup checks the names against the inventory: a name that was **revoked** is a
 configuration error and stops the start (with the fix in the message), while a name
 that is merely not enrolled yet is a warning naming the invite/init commands — the

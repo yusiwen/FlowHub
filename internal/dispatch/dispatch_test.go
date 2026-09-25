@@ -49,6 +49,9 @@ type fakeOpencode struct {
 	// model override can be asserted.
 	sessionBody opencode.CreateSessionRequest
 	promptBody  opencode.PromptRequest
+	// silentFinish completes the message with tools only and no text, which is what a
+	// turn that ends without a final message looks like.
+	silentFinish bool
 }
 
 func newFakeOpencode(t *testing.T) *fakeOpencode {
@@ -96,7 +99,9 @@ func (f *fakeOpencode) start() *httptest.Server {
 			})
 			f.toolCalls = append(f.toolCalls, "youtrack_add_issue_comment")
 		}
-		parts = append(parts, opencode.Part{Type: "text", Text: "analysis done"})
+		if !f.silentFinish {
+			parts = append(parts, opencode.Part{Type: "text", Text: "analysis done"})
+		}
 		id := len(f.messages)
 		f.messages = append(f.messages,
 			opencode.Message{Info: opencode.MessageInfo{ID: "u", Role: "user", Time: opencode.MessageTime{Created: int64(id)}}},
@@ -571,5 +576,85 @@ func TestProblemsReportsEntriesThatCannotBeDispatched(t *testing.T) {
 	}
 	if got := Problems(nil, ""); got != nil {
 		t.Fatalf("Problems(nil) = %v, want nil", got)
+	}
+}
+
+// TestTaskRecordsThePinnedBaseline covers ADR 0001 step 5's registry contract: the
+// commit a task starts from is resolved once, at creation, and recorded next to the
+// task so a later turn — and a human reading the registry — can see where it began.
+func TestTaskRecordsThePinnedBaseline(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, repo := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-41", "issueCreated", issueCreatedBody("TEST-41")))
+
+	head := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	task, ok := reg.Get("TEST-41")
+	if !ok {
+		t.Fatal("no registry row for the task")
+	}
+	if task.BaseCommit != head {
+		t.Fatalf("base_commit = %q, want the repository HEAD %q", task.BaseCommit, head)
+	}
+	if task.Worktree == "" || task.Runtime == "" {
+		t.Fatalf("task = %+v, want a worktree and a runtime as well", task)
+	}
+
+	// A second delivery for the same task must not re-resolve the baseline, even
+	// when the branch has moved on: a long-running task's patches stay reviewable
+	// against a fixed base.
+	if commit := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD")); commit != head {
+		t.Fatalf("the test moved HEAD unexpectedly: %s != %s", commit, head)
+	}
+	dispatcher.handle(context.Background(), delivery("TEST-41", "issueCreated", issueCreatedBody("TEST-41")))
+	after, _ := reg.Get("TEST-41")
+	if after.BaseCommit != head {
+		t.Fatalf("base_commit changed to %q on a later turn", after.BaseCommit)
+	}
+}
+
+// runGit runs one git command in dir and returns its stdout.
+func runGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = dir
+	command.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL="+filepath.Join(t.TempDir(), "gitconfig"),
+		"GIT_CONFIG_NOSYSTEM=1")
+	out, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v: %s", args, dir, err, out)
+	}
+	return string(out)
+}
+
+// TestATextlessTurnKeepsTheRecordedReply: the last reply is what recognises our own
+// comment coming back as a webhook when the marker is lost. A turn that ends without
+// a final message — a tool-only loop, a crash — must not erase it.
+func TestATextlessTurnKeepsTheRecordedReply(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-42", "issueCreated", issueCreatedBody("TEST-42")))
+	first, _ := reg.Get("TEST-42")
+	if first.LastReply == "" {
+		t.Fatal("the first turn recorded no reply")
+	}
+
+	fake.mu.Lock()
+	fake.silentFinish = true
+	fake.mu.Unlock()
+	dispatcher.handle(context.Background(), delivery("TEST-42", "issueCreated", issueCreatedBody("TEST-42")))
+
+	second, _ := reg.Get("TEST-42")
+	if second.LastReply != first.LastReply {
+		t.Fatalf("last reply = %q, want the previous %q", second.LastReply, first.LastReply)
+	}
+	if second.Turns != 2 {
+		t.Fatalf("turns = %d, want the turn to have been counted", second.Turns)
 	}
 }

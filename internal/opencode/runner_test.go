@@ -34,6 +34,10 @@ type fakeServer struct {
 	// recorded, no assistant message is written and the session stays idle. That is
 	// what a rejected prompt looks like from the outside.
 	silentPrompt bool
+	// goneOnReply makes every permission reply 404 and leaves the request in the
+	// pending list, which is what a request the server resolved on its own looks like
+	// when its bookkeeping has not caught up.
+	goneOnReply bool
 
 	sawDirectory []string
 	sawAuth      []string
@@ -118,6 +122,21 @@ func (f *fakeServer) start() *httptest.Server {
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/permission/"), "/reply")
 		var body ReplyRequest
 		decodeBody(f.t, r, &body)
+
+		if f.goneOnReply {
+			// The request is already resolved server-side: the reply 404s, the request
+			// stays listed, and the turn still finishes (the completion signal is
+			// produced by afterReply, as it is after a normal reply).
+			f.mu.Lock()
+			after := f.afterReply
+			f.mu.Unlock()
+			if after != nil {
+				after(f)
+			}
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"_tag":"PermissionNotFoundError","message":"Permission request not found"}`))
+			return
+		}
 
 		// Mutate under the lock, then release it before running the callback: the
 		// callback locks again (finishWith), and sync.Mutex is not reentrant.
@@ -477,5 +496,36 @@ func TestHTTPErrorAndUnauthorized(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "401") {
 		t.Fatalf("error does not name the status: %v", err)
+	}
+}
+
+// TestRunnerSurvivesAPermissionThatVanishedBeforeTheReply is a regression test for a
+// live turn that died at 0s after answering three permissions: the fourth's reply
+// came back 404 (PermissionNotFoundError), because the server had already resolved a
+// request our list still contained. Two things have to hold: the turn must not fail,
+// and a request the server keeps listing must not stop it completing either.
+func TestRunnerSurvivesAPermissionThatVanishedBeforeTheReply(t *testing.T) {
+	fake := newFakeServer(t)
+	fake.directory = "/private/tmp/work"
+	fake.addPending(PermissionRequest{
+		ID: "per_gone", SessionID: "ses_fake1", Permission: "bash",
+		Metadata: PermissionMetadata{Command: "pwd"},
+	})
+	fake.goneOnReply = true
+	fake.afterReply = func(f *fakeServer) { f.finishWith("done") }
+	server := fake.start()
+	defer server.Close()
+
+	result, err := testRunner(t, server.URL).Run(context.Background(), Task{
+		Directory: "/private/tmp/work", Prompt: "look around", Deadline: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("a permission that was already resolved failed the turn: %v", err)
+	}
+	if !result.Finished {
+		t.Fatalf("result = %+v, want a finished turn: a request the server already resolved must not count as pending", result)
+	}
+	if len(result.Permissions) != 0 {
+		t.Fatalf("permissions = %+v, want none: the reply never took effect", result.Permissions)
 	}
 }

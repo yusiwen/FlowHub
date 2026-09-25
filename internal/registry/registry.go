@@ -62,6 +62,11 @@ type Task struct {
 	// gone is refused rather than re-homed. Empty means "not yet chosen".
 	Runtime  string `json:"runtime,omitempty"`
 	Worktree string `json:"worktree,omitempty"`
+	// BaseCommit is the commit the task started from, resolved once through the
+	// origin when the task was created and never re-resolved. That is what keeps a
+	// long-running task's patches reviewable against a fixed base even if the origin
+	// moves, and what makes two hosts agree on where the task began.
+	BaseCommit string `json:"base_commit,omitempty"`
 	// SessionID is the opencode session this task runs in. Empty until the first
 	// turn has created one.
 	SessionID string    `json:"session_id,omitempty"`

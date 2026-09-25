@@ -1,18 +1,24 @@
 # ADR 0001 — Pluggable event sources and agent runtimes
 
-**Status:** Proposed, **partly implemented ahead of the plan** (2026-09-25). The
-*selection* half of migration step 5 landed first, because it does not depend on
-steps 1–4: the projects file accepts `runtime`, `runtimes` and `runtime_policy`
-(per project, with a table-wide default of `spread`), the dispatcher ranks the
-eligible runtimes by the rules below and logs the numbers it chose by, startup
-validates the declared names against the inventory, and `/healthz` reports the
-in-flight counters. Two pieces of step 5 are still open — **one queue and worker
-per runtime** (one worker still serializes every runtime, which is safe but not
-parallel) and the **pinned baseline** (`Workspace.Resolve`, `Request.BaseCommit`,
-`registry.Task.BaseCommit`) — as are steps 1–4, so the v2 configuration format,
-the `source`/`agent`/`workspace` seams and the `remote` provider do not exist yet.
-The addressing above was added to the *current* projects file and moves into the
-v2 format when step 3 lands.
+**Status:** Proposed, **partly implemented ahead of the plan** (2026-09-25). Most
+of migration step 5 landed first, because it does not depend on steps 1–4: the
+projects file accepts `runtime`, `runtimes` and `runtime_policy` (per project, with
+a table-wide default of `spread`), the dispatcher ranks the eligible runtimes by the
+rules below and logs the numbers it chose by, startup validates the declared names
+against the inventory, `/healthz` reports the in-flight counters, and the baseline
+is pinned — `worktree.Manager.Resolve` asks the **origin** for the commit, `Prepare`
+produces exactly it (fetching it when a stale clone has never seen it, and refusing
+to attach to a same-named branch that is not its descendant), and
+`registry.Task.BaseCommit` records it once and never re-resolves it. What is still
+open from step 5 is **one queue and worker per runtime**: one worker still
+serializes every runtime, which is safe but not parallel. Steps 1–4 are open too, so
+the v2 configuration format, the `source`/`agent`/`workspace` seams and the `remote`
+provider do not exist yet — the addressing and the baseline were added to the
+*current* worktree manager and projects file, and move behind the `Workspace` seam
+when step 2 lands. One measured consequence of the local provider: a repository with
+no `origin` remote has no shared truth to pin, so `Resolve` answers from the local
+ref and **says so** (a warning on every task that creates its worktree), because the
+guarantee this section describes only exists once there is an origin.
 **Revision:** 7 — made the baseline an input: resolve the base ref to a commit
 through the origin once per task, pin it, require every host to produce exactly
 that commit, and refuse to attach to a same-named branch that is not its
@@ -830,7 +836,7 @@ staticcheck test test-race smoke` green. Behaviour must not change before step 3
 | 2 | Add `internal/agent` and `internal/workspace`; make `opencode` the runtime and today's `worktree` package the `localworktree` provider, with its local-filesystem checks moved behind it; `dispatch` imports neither vendor; wire `FLOWHUB_OPENCODE_USER`/`PASSWORD` | `go list -deps` shows both cuts; the live path is re-verified with one real webhook turn |
 | 3 | Config format v2 as specified above: `sources`, `runtime`, `(source, project)` entries, per-level policy precedence, and the v1 translation branch | A v1 file and an equivalent v2 file produce the same routing and the same effective policy; `-print-config` names the level each value came from; a v2 file with `youtrack_key` is refused with the replacement named in the error |
 | 4 | Gitea adapter as the acceptance test for the source seam (HMAC-SHA256 `X-Hub-Signature-256`, issue and PR text) | A real Gitea webhook drives one analysis turn; the core packages show no diff beyond registration |
-| 5 | Addressed runtimes **and a pinned baseline**: `runtimes.<name>`, `projects[].runtime`/`runtimes` + `runtime_policy`, `Workspace.Resolve`, `Request.BaseCommit`, `registry.Task.{Runtime,BaseCommit}`, one queue and worker per runtime, per-runtime startup probing, set validation. **Landed so far: `projects[].runtime`/`runtimes` + `runtime_policy`, the deterministic ranking and its log line, set validation, in-flight counters. Open: one queue/worker per runtime, the pinned baseline** | Two runtimes configured: with `spread`, two consecutive tasks land on different hosts and the log says why; **both report the same `base_commit`** even when one clone is deliberately stale; with `first-healthy`, both land on the first; stopping one host makes the next task use the other and leaves bound tasks refused with that reason; an existing `flowhub/<key>` branch that is not a descendant of `base_commit` is refused |
+| 5 | Addressed runtimes **and a pinned baseline**: `runtimes.<name>`, `projects[].runtime`/`runtimes` + `runtime_policy`, `Workspace.Resolve`, `Request.BaseCommit`, `registry.Task.{Runtime,BaseCommit}`, one queue and worker per runtime, per-runtime startup probing, set validation. **Landed: the addressing and its policy, the deterministic ranking and its log line, set validation, in-flight counters, and the pinned baseline (resolved through the origin, fetched on demand, descendant-checked, recorded). Open: one queue and worker per runtime** | Two runtimes configured: with `spread`, two consecutive tasks land on different hosts and the log says why; **both report the same `base_commit`** even when one clone is deliberately stale; with `first-healthy`, both land on the first; stopping one host makes the next task use the other and leaves bound tasks refused with that reason; an existing `flowhub/<key>` branch that is not a descendant of `base_commit` is refused |
 | 6 | A `remote` workspace provider, once the deployment actually splits: the helper on the runtime host, the repository attestation handshake, and branch delivery | FlowHub runs on a host with **no** copy of the repository and still completes a full task end to end on the addressed remote runtime |
 
 Step 4 is the point of the whole exercise: if adding Gitea requires touching

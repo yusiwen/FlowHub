@@ -229,6 +229,14 @@ func IsUnauthorized(err error) bool {
 	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusUnauthorized
 }
 
+// IsNotFound reports whether err is a 404. For a permission reply that means the
+// request no longer exists — an answer, not a failure: the server resolves a
+// permission itself when its turn ends, and a request can also be answered twice.
+func IsNotFound(err error) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
+}
+
 func truncate(value string, limit int) string {
 	if len(value) <= limit {
 		return value

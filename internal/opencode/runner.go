@@ -180,8 +180,15 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 	firstResponse := r.firstResponseBound(task.Deadline)
 	firstResponseAt := time.Now().Add(firstResponse)
 
+	// Permission requests this turn has already dealt with. The server can keep
+	// listing a request for a moment after the reply, and a second reply to the same
+	// id is a 404 (PermissionNotFoundError) — which used to end the turn. So a request
+	// is answered once and then skipped, both when deciding what to answer and when
+	// deciding whether the turn can be called complete.
+	handled := map[string]bool{}
+
 	for {
-		if err := r.answerPending(ctx, task.Directory, sessionID, &result); err != nil {
+		if err := r.answerPending(ctx, task.Directory, sessionID, &result, handled); err != nil {
 			return result, err
 		}
 
@@ -199,6 +206,7 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 		if err != nil {
 			return result, err
 		}
+		pending = withoutHandled(pending, handled)
 
 		// A turn is finished when a *new* assistant message has completed, the
 		// session is not busy and nothing is waiting for a decision. Checking all
@@ -252,12 +260,22 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 }
 
 // answerPending replies to every pending permission of this session.
-func (r *Runner) answerPending(ctx context.Context, directory, sessionID string, result *Result) error {
-	pending, err := r.pendingFor(ctx, directory, sessionID)
-	if err != nil {
-		return err
-	}
-	for _, request := range pending {
+func (r *Runner) answerPending(ctx context.Context, directory, sessionID string, result *Result, handled map[string]bool) error {
+	// One request per round trip, re-listing in between. Answering a whole stale list
+	// at once looked harmless and was not: opencode can hold two pending requests for
+	// one session and cancel one when the other is answered, so the second reply came
+	// back 404 (PermissionNotFoundError) and — before this — ended the turn. Asking
+	// again after each reply is how the cancellation is noticed instead of raced.
+	for round := 0; round < maxPermissionsPerPass; round++ {
+		pending, err := r.pendingFor(ctx, directory, sessionID)
+		if err != nil {
+			return err
+		}
+		pending = withoutHandled(pending, handled)
+		if len(pending) == 0 {
+			return nil
+		}
+		request := pending[0]
 		decision := r.arbiter.Decide(request)
 		message := ""
 		if !decision.Allowed() {
@@ -266,22 +284,40 @@ func (r *Runner) answerPending(ctx context.Context, directory, sessionID string,
 			message = decision.Reason
 		}
 		if err := r.client.ReplyPermission(ctx, directory, request.ID, decision.Reply, message); err != nil {
+			if IsNotFound(err) {
+				// The request was resolved between the list and the reply: the server
+				// answers a permission itself when the turn or the sibling tool call it
+				// belongs to ends. That is an answer, not a failure — measured
+				// 2026-09-25 on a live turn that had answered three permissions and died
+				// on the fourth's reply, losing the whole turn at 0s.
+				handled[request.ID] = true
+				r.log.Warn("permission was already resolved; continuing without it",
+					"session", sessionID, "request", request.ID,
+					"permission", request.Permission, "command", request.Metadata.Command)
+				continue
+			}
 			return fmt.Errorf("opencode: reply to permission %s: %w", request.ID, err)
 		}
-		answered := Answered{
+		handled[request.ID] = true
+		result.Permissions = append(result.Permissions, Answered{
 			RequestID:  request.ID,
 			Permission: request.Permission,
 			Command:    request.Metadata.Command,
 			Reply:      decision.Reply,
 			Reason:     decision.Reason,
-		}
-		result.Permissions = append(result.Permissions, answered)
+		})
 		r.log.Info("permission answered",
 			"session", sessionID, "permission", request.Permission,
 			"command", request.Metadata.Command, "reply", decision.Reply, "reason", decision.Reason)
 	}
+	// The budget is a runaway guard, not a policy: more requests than this in one pass
+	// means the model is looping, and the outer poll loop will pick the rest up.
 	return nil
 }
+
+// maxPermissionsPerPass bounds the replies one poll pass makes, so a model that asks
+// for permission in a loop cannot make the worker spin inside a single pass.
+const maxPermissionsPerPass = 32
 
 func (r *Runner) pendingFor(ctx context.Context, directory, sessionID string) ([]PermissionRequest, error) {
 	all, err := r.client.Permissions(ctx, directory)
@@ -295,6 +331,20 @@ func (r *Runner) pendingFor(ctx context.Context, directory, sessionID string) ([
 		}
 	}
 	return mine, nil
+}
+
+// withoutHandled drops the permission requests this turn has already dealt with.
+func withoutHandled(requests []PermissionRequest, handled map[string]bool) []PermissionRequest {
+	if len(handled) == 0 {
+		return requests
+	}
+	kept := make([]PermissionRequest, 0, len(requests))
+	for _, request := range requests {
+		if !handled[request.ID] {
+			kept = append(kept, request)
+		}
+	}
+	return kept
 }
 
 // firstResponseBound is how long a turn may take to produce its first assistant

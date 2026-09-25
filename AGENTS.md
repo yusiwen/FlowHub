@@ -178,10 +178,23 @@ documents. The rules below are load-bearing; do not relax them casually.
    A turn that produces no assistant message at all while the session is idle is
    failed at `FLOWHUB_FIRST_RESPONSE` rather than held until the deadline — that is
    the signature of a prompt the agent server rejected, and a busy session with no
-   message yet is not it.
+   message yet is not it. Permission replies are **one per round trip, re-listing in
+   between**: opencode can hold two pending requests for one session and resolve one
+   when the other is answered, so replying to a whole stale list got a 404
+   (`PermissionNotFoundError`) and used to kill a turn that had already done the
+   work. A 404 is treated as "already resolved" (skipped, never recorded as
+   answered), and a request that is handled is never listed as pending again — a
+   request the server keeps listing must not stop a finished turn from completing.
 9. **One task, one worktree, one session.** `internal/registry` is the
    append-only record of that binding (`<DataDir>/registry.jsonl`) and
-   `internal/worktree` creates the checkout. The dispatcher refuses to reuse a
+   `internal/worktree` creates the checkout. The base commit is **pinned through
+   the origin** once per task and recorded (`base_commit`), never re-resolved: two
+   hosts whose clones were fetched at different times must start a project's tasks
+   from the same commit. `Prepare` produces exactly that commit (fetching it only
+   when the clone has never seen it) and attaches to an existing
+   `flowhub/<task key>` branch only when it descends from the pin. A repository
+   with no `origin` has no shared truth to pin: the local ref is used and the log
+   says so. The dispatcher refuses to reuse a
    session when the routing table now points at a different repository than the
    task was created against, and it never falls back to the shared checkout.
    Only one worker runs turns: a prompt sent to a busy session is silently
@@ -190,7 +203,8 @@ documents. The rules below are load-bearing; do not relax them casually.
     recognised by content, because the agent posts as the same YouTrack user as
     the human. Three independent layers: the `<!-- flowhub-auto -->` marker in the
     reply, a probe against the task's recorded last reply (for when the marker is
-    lost), and an anchored trigger (`^\s*/opencode start\b`) so a reply that
+    lost) — which is why only a turn that produced text replaces it — and an
+    anchored trigger (`^\s*/opencode start\b`) so a reply that
     merely *mentions* the trigger cannot fire one. Do not loosen the anchoring,
     and do not add a natural-language trigger. The reply must also end with a
     blockquote that says opencode generated it and **what triggered the turn**,

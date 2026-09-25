@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -22,6 +23,11 @@ import (
 // DefaultBranchPrefix namespaces the branches FlowHub creates, so they are easy
 // to list and delete without touching a human's branches.
 const DefaultBranchPrefix = "flowhub/"
+
+// commitPattern accepts a full or abbreviated commit id. Git itself decides whether
+// the object exists; this only rejects a caller that passed a branch name, a path or
+// an empty string where a pinned commit belongs.
+var commitPattern = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
 
 // ignoreEntry is added to the worktree's own exclude file (not the repository's
 // .gitignore) so downloaded attachments and other task scratch never show up as
@@ -65,6 +71,25 @@ type Request struct {
 	// already exist in the clone: guessing one would silently base the task on
 	// the wrong code.
 	DefaultBranch string
+	// BaseCommit pins the commit the task starts from, as resolved from the origin
+	// by Resolve. When it is set, Prepare produces exactly this commit — fetching
+	// it if this clone has never seen it — and refuses to attach to an existing
+	// branch that is not its descendant. Empty keeps the older behaviour of
+	// branching from DefaultBranch as this clone happens to have it, which is only
+	// correct for a single host.
+	BaseCommit string
+}
+
+// Base is a resolved baseline.
+type Base struct {
+	// Commit is the full commit id the base ref points at.
+	Commit string
+	// Ref is the fully qualified ref it was resolved from, e.g. refs/heads/main.
+	Ref string
+	// Source is "origin" when `git ls-remote origin` answered, and "local" when the
+	// repository has no origin remote to ask. The difference matters: only the
+	// first is the same answer on every host.
+	Source string
 }
 
 // Worktree is a prepared checkout.
@@ -97,6 +122,126 @@ func New(opts Options) (*Manager, error) {
 
 // Base returns the directory that holds the task worktrees.
 func (m *Manager) Base() string { return m.opts.Base }
+
+// Resolve reports the commit baseRef points at *as the origin sees it*, not as this
+// clone happens to have it.
+//
+// This is the whole point of pinning a baseline: with more than one host there is
+// more than one clone, and a clone's `origin/<branch>` records whatever it last
+// fetched. Asking the origin makes the answer the same on every host, so two tasks
+// for one project spread across two machines start from the same commit. A stale
+// clone is healed by Prepare, which fetches the pinned commit only when the object
+// is missing locally.
+//
+// A repository with **no** origin remote has no shared truth to ask: the local ref
+// is the honest answer there, and Source says so, because a caller that logs which
+// one happened is the difference between "pinned" and "assumed".
+func (m *Manager) Resolve(ctx context.Context, repo, baseRef string) (Base, error) {
+	repo = canonical(repo)
+	ref := strings.TrimSpace(baseRef)
+	if ref == "" {
+		return Base{}, errors.New("worktree: a base ref is required to pin a baseline")
+	}
+	if !strings.HasPrefix(ref, "refs/") {
+		ref = "refs/heads/" + ref
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+		return Base{}, fmt.Errorf("worktree: %s is not a git work tree", repo)
+	}
+
+	hasOrigin, err := m.hasOrigin(ctx, repo)
+	if err != nil {
+		return Base{}, err
+	}
+	if !hasOrigin {
+		out, err := m.run(ctx, repo, "rev-parse", "--verify", ref+"^{commit}")
+		if err != nil {
+			return Base{}, fmt.Errorf("worktree: %s has no origin remote and no local %s to pin", repo, ref)
+		}
+		return Base{Commit: strings.TrimSpace(out), Ref: ref, Source: "local"}, nil
+	}
+
+	out, err := m.run(ctx, repo, "ls-remote", "origin", ref)
+	if err != nil {
+		return Base{}, fmt.Errorf("worktree: resolve %s on origin: %w", ref, err)
+	}
+	commit, err := parseLsRemote(out, ref)
+	if err != nil {
+		return Base{}, fmt.Errorf("worktree: %s in %s: %w", ref, repo, err)
+	}
+	return Base{Commit: commit, Ref: ref, Source: "origin"}, nil
+}
+
+// parseLsRemote reads one ref out of `git ls-remote` output, which is
+// "<sha>\t<ref>" per line, oldest format included.
+func parseLsRemote(output, ref string) (string, error) {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		if fields[1] == ref || strings.HasSuffix(fields[1], "/"+strings.TrimPrefix(ref, "refs/heads/")) {
+			if !commitPattern.MatchString(fields[0]) {
+				return "", fmt.Errorf("origin answered %q for %s", fields[0], ref)
+			}
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("origin has no %s", ref)
+}
+
+// hasOrigin reports whether the clone has an origin remote to ask.
+func (m *Manager) hasOrigin(ctx context.Context, repo string) (bool, error) {
+	out, err := m.run(ctx, repo, "remote")
+	if err != nil {
+		return false, err
+	}
+	for _, name := range strings.Fields(out) {
+		if name == "origin" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ensureCommit makes sure a pinned commit is present locally, fetching it only when
+// it is not.
+//
+// A stale clone heals on demand rather than on every task: the object store is
+// shared by every worktree of the clone, so the fetch happens once. A host that
+// cannot obtain the commit fails here instead of quietly basing the task on
+// whatever it already had — which is the failure the pin exists to prevent.
+func (m *Manager) ensureCommit(ctx context.Context, req Request, commit string) error {
+	if _, err := m.run(ctx, req.Repo, "cat-file", "-e", commit+"^{commit}"); err == nil {
+		return nil
+	}
+	// Asking for the commit by id works on a server that allows it; fetching the
+	// branch is the fallback, and it brings the commit when the commit is an
+	// ancestor of that branch — which it is, unless the branch was rewritten.
+	if _, err := m.run(ctx, req.Repo, "fetch", "origin", commit); err != nil {
+		if _, branchErr := m.run(ctx, req.Repo, "fetch", "origin", req.DefaultBranch); branchErr != nil {
+			return fmt.Errorf("worktree: the pinned commit %s is not in %s and could not be fetched: %w", commit, req.Repo, branchErr)
+		}
+	}
+	if _, err := m.run(ctx, req.Repo, "cat-file", "-e", commit+"^{commit}"); err != nil {
+		return fmt.Errorf("worktree: the pinned commit %s is not reachable from origin in %s", commit, req.Repo)
+	}
+	return nil
+}
+
+// isAncestor reports whether ancestor is reachable from descendant. It is how the
+// attach path decides that a branch which already exists belongs to this task.
+func (m *Manager) isAncestor(ctx context.Context, repo, ancestor, descendant string) (bool, error) {
+	if _, err := m.run(ctx, repo, "merge-base", "--is-ancestor", ancestor, descendant); err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			// Exit code 1 is git's "no": not an error, an answer.
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
 
 // Prepare creates (or reuses) the worktree for one task.
 //
@@ -139,6 +284,12 @@ func (m *Manager) Prepare(ctx context.Context, req Request) (Worktree, error) {
 		}
 	}
 
+	if base := strings.TrimSpace(req.BaseCommit); base != "" {
+		if err := m.ensureCommit(ctx, req, base); err != nil {
+			return Worktree{}, err
+		}
+	}
+
 	if err := os.MkdirAll(m.opts.Base, 0o700); err != nil {
 		return Worktree{}, fmt.Errorf("worktree: create base %s: %w", m.opts.Base, err)
 	}
@@ -162,12 +313,31 @@ func (m *Manager) Prepare(ctx context.Context, req Request) (Worktree, error) {
 	if exists, err := m.branchExists(ctx, req.Repo, branch); err != nil {
 		return Worktree{}, err
 	} else if exists {
-		// The branch survived a previous task; attach to it rather than failing.
+		// The branch survived a previous task; attach to it rather than failing —
+		// but only when it descends from the pinned baseline. A branch with this
+		// name from an unrelated run would otherwise be adopted silently, and the
+		// agent's work would land on top of code the task never chose.
+		if base := strings.TrimSpace(req.BaseCommit); base != "" {
+			descends, err := m.isAncestor(ctx, req.Repo, base, branch)
+			if err != nil {
+				return Worktree{}, err
+			}
+			if !descends {
+				return Worktree{}, fmt.Errorf("worktree: branch %s already exists in %s but is not a descendant of the pinned base %s; remove it or start a new task",
+					branch, req.Repo, base)
+			}
+		}
 		if _, err := m.run(ctx, req.Repo, "worktree", "add", path, branch); err != nil {
 			return Worktree{}, err
 		}
 	} else {
-		if _, err := m.run(ctx, req.Repo, "worktree", "add", "-b", branch, path, req.DefaultBranch); err != nil {
+		// The pinned commit wins over the branch name: the branch may have moved on
+		// since the task was created, and the task's base must not.
+		start := req.DefaultBranch
+		if base := strings.TrimSpace(req.BaseCommit); base != "" {
+			start = base
+		}
+		if _, err := m.run(ctx, req.Repo, "worktree", "add", "-b", branch, path, start); err != nil {
 			return Worktree{}, err
 		}
 	}
@@ -221,6 +391,9 @@ func (m *Manager) validate(req Request) error {
 	}
 	if strings.TrimSpace(req.DefaultBranch) == "" {
 		return errors.New("worktree: Request.DefaultBranch is required (guessing one would base the task on the wrong code)")
+	}
+	if base := strings.TrimSpace(req.BaseCommit); base != "" && !commitPattern.MatchString(base) {
+		return fmt.Errorf("worktree: Request.BaseCommit %q is not a commit id", req.BaseCommit)
 	}
 	if !filepath.IsAbs(req.Repo) {
 		return fmt.Errorf("worktree: Repo %q must be absolute", req.Repo)
