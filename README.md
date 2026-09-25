@@ -543,9 +543,14 @@ therefore cannot walk into another task's checkout, and the dispatcher refuses t
 reuse a session when the routing table now points at a different repository than
 the task was created against.
 
-One worker runs turns, on purpose: the session model is one turn at a time, and a
-prompt delivered to a busy session is silently swallowed. More workers would need
-per-task locking first.
+Turns are serialized **per runtime**, not per process. The reason a session cannot
+be prompted twice at once is that a busy session silently swallows the second
+prompt — and a session belongs to one runtime for life, so the runtime is the right
+unit: an intake loop decides which runtime takes a delivery and hands it to that
+runtime's own queue, and each runtime runs its turns with a single worker. Two
+runtimes therefore work in parallel, one runtime still works one task at a time,
+and `FLOWHUB_DISPATCH_QUEUE` bounds each queue (a full queue drops, it never
+blocks the publisher).
 
 ### The agent definition
 
@@ -611,8 +616,9 @@ store the secret. `TestRedactionNeverEchoesAnUnrecognisedKey` pins it.
   is still audited, nothing runs. Remove the file to resume: no API, no restart,
   no credential.
 * `FLOWHUB_DISPATCH=0` and a restart.
-* `GET /healthz` shows `dispatch.{queued,handled,ignored,dropped,paused,agent}`,
-  and `-print-config` prints the effective policy.
+* `GET /healthz` shows `dispatch.{queued,handled,ignored,dropped,paused,agent}`
+  plus a per-runtime view (`runtimes.<name>.{queued,in_flight,depth,last_error}`),
+  so "which host is stuck" is one call; `-print-config` prints the effective policy.
 
 ## Endpoints
 

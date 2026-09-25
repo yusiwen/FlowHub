@@ -84,19 +84,34 @@ type Dispatcher struct {
 	opts Options
 	log  *slog.Logger
 
-	// managers caches one worktree manager per base directory. Only the worker
-	// goroutine touches it, which is why it needs no lock.
+	// managers caches one worktree manager per base directory, and clients one
+	// opencode client per runtime. One worker per runtime touches them, so they are
+	// guarded rather than worker-local.
+	cacheMu  sync.Mutex
 	managers map[string]*worktree.Manager
+	clients  map[string]*opencode.Client
 
-	// clients caches one opencode client per runtime. Only the worker goroutine
-	// touches it.
-	clients map[string]*opencode.Client
+	// prepMu guards prepLocks, which serializes workspace preparation per repository:
+	// `git worktree add` is not safe to run twice at once in one clone, and two
+	// runtimes may well share one (a second name for the same host, or a
+	// misconfiguration that must not corrupt the clone).
+	prepMu    sync.Mutex
+	prepLocks map[string]*sync.Mutex
 
 	queue   chan *store.Record
 	queued  atomic.Int64
 	handled atomic.Int64
 	dropped atomic.Int64
 	ignored atomic.Int64
+
+	// queueMu guards the per-runtime queues and their counters. The intake loop
+	// creates a queue (and starts its worker) the first time a runtime is used, and
+	// /healthz reads the counters from an HTTP handler.
+	queueMu   sync.Mutex
+	queues    map[string]chan routed
+	workers   map[string]bool
+	busyPerRT map[string]int
+	lastError map[string]string
 
 	// loadMu guards inFlight, which the selection policy reads from the worker
 	// goroutine and /healthz reads from an HTTP handler.
@@ -131,12 +146,17 @@ func New(opts Options) (*Dispatcher, error) {
 	opts.Rules = opts.Rules.Defaults()
 
 	return &Dispatcher{
-		opts:     opts,
-		log:      opts.Log,
-		managers: map[string]*worktree.Manager{},
-		clients:  map[string]*opencode.Client{},
-		inFlight: map[string]int{},
-		queue:    make(chan *store.Record, opts.QueueSize),
+		opts:      opts,
+		log:       opts.Log,
+		prepLocks: map[string]*sync.Mutex{},
+		managers:  map[string]*worktree.Manager{},
+		clients:   map[string]*opencode.Client{},
+		inFlight:  map[string]int{},
+		queue:     make(chan *store.Record, opts.QueueSize),
+		queues:    map[string]chan routed{},
+		workers:   map[string]bool{},
+		busyPerRT: map[string]int{},
+		lastError: map[string]string{},
 	}, nil
 }
 
@@ -161,16 +181,31 @@ func (d *Dispatcher) Dispatch(rec *store.Record) {
 	}
 }
 
-// Run processes deliveries until the context is cancelled.
+// routed is one delivery on its way to a runtime: the intake loop decided *which*
+// runtime, and that runtime's worker runs the turn.
+type routed struct {
+	record  *store.Record
+	binding runtimeBinding
+}
+
+// Run routes deliveries to their runtime's worker until the context is cancelled.
 //
-// One worker is deliberate: the task model is "one turn at a time", and a busy
-// session silently swallows a prompt (opencode issue #46842), so more workers
-// would need per-task locking before they could be safe.
+// The unit of serialization is the runtime, not the process. The reason one worker
+// was needed at all — a prompt sent to a busy session is silently swallowed
+// (opencode issue #46842) — is a property of a *session*, and a session belongs to
+// one runtime for life. So each runtime gets its own queue and its own single
+// worker, and different runtimes run turns in parallel. `max_concurrent` stays 1
+// until per-task locking exists; the queue is where raising it would go.
+//
+// The intake loop itself only decides the runtime (and probes it, so it is off the
+// webhook path but still serialized); it never runs a turn.
 func (d *Dispatcher) Run(ctx context.Context) {
 	d.log.Info("dispatcher started",
 		"queue_size", d.opts.QueueSize, "deadline", d.opts.Deadline,
 		"agent", d.opts.Agent, "analyze_on_create", !d.opts.Rules.SkipAnalyzeOnCreate,
 		"trigger", d.opts.Rules.Trigger)
+	var workers sync.WaitGroup
+	defer workers.Wait()
 	for {
 		select {
 		case <-ctx.Done():
@@ -178,10 +213,26 @@ func (d *Dispatcher) Run(ctx context.Context) {
 			return
 		case rec := <-d.queue:
 			d.queued.Add(-1)
-			d.handle(ctx, rec)
-			d.handled.Add(1)
+			item, ok := d.routeOne(ctx, rec)
+			if !ok {
+				continue
+			}
+			d.enqueue(ctx, item, &workers)
 		}
 	}
+}
+
+// handle runs one delivery end to end on the calling goroutine.
+//
+// Production goes through Run — intake, then the runtime's own queue and worker —
+// while this is the same two steps without a scheduler in between, which is what
+// the pipeline tests want. Both call exactly the same code.
+func (d *Dispatcher) handle(ctx context.Context, rec *store.Record) {
+	item, ok := d.routeOne(ctx, rec)
+	if !ok {
+		return
+	}
+	d.runRouted(ctx, item)
 }
 
 // Paused reports whether the pause file exists. The file is the kill switch: it
@@ -205,7 +256,31 @@ func (d *Dispatcher) Snapshot() map[string]any {
 		"paused":      d.Paused(),
 		"agent":       d.opts.Agent,
 		"in_flight":   d.inFlightSnapshot(),
+		"runtimes":    d.runtimeSnapshot(),
 	}
+}
+
+// runtimeSnapshot is the per-runtime view: how much work is waiting for it, how
+// many turns it is running, and the last thing that went wrong on it. One HTTP call
+// answers "which host is stuck" instead of a log dig.
+func (d *Dispatcher) runtimeSnapshot() map[string]map[string]any {
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	out := make(map[string]map[string]any, len(d.queues))
+	for name, queue := range d.queues {
+		// Read the counter directly: busyFor would take this same lock again, and a
+		// mutex is not reentrant.
+		entry := map[string]any{
+			"queued":    len(queue),
+			"busy":      d.busyPerRT[name],
+			"in_flight": d.inFlightFor(name),
+		}
+		if message, ok := d.lastError[name]; ok {
+			entry["last_error"] = message
+		}
+		out[name] = entry
+	}
+	return out
 }
 
 // enterTurn records that a turn is running on a runtime and returns the function
@@ -246,7 +321,164 @@ func (d *Dispatcher) inFlightSnapshot() map[string]int {
 	return out
 }
 
-func (d *Dispatcher) handle(ctx context.Context, rec *store.Record) {
+// routeOne decides which runtime takes a delivery, and refuses it when none can.
+//
+// It is deliberately thin: the *rules* decision is made by the worker, against the
+// registry as it is when the turn actually starts. That ordering is what keeps a
+// second delivery for a task queueing behind the first turn instead of racing it
+// with a stale view of the task.
+func (d *Dispatcher) routeOne(ctx context.Context, rec *store.Record) (routed, bool) {
+	if d.Paused() {
+		d.ignored.Add(1)
+		d.log.Warn("dispatch is paused; delivery ignored",
+			"pause_file", d.opts.PauseFile, "issue", rec.IssueID, "event", rec.Event)
+		return routed{}, false
+	}
+
+	task, _ := d.opts.Registry.Get(rec.IssueID)
+	if name := strings.TrimSpace(task.Runtime); name != "" {
+		binding, ok := d.bindingFor(name)
+		if !ok {
+			// The binding is absolute: a task whose host is gone is refused, not
+			// re-homed, because a new session elsewhere loses the plan.
+			d.ignored.Add(1)
+			d.log.Warn("no runtime can serve this delivery; it is ignored",
+				"issue", rec.IssueID, "project", rec.ProjectKey,
+				"error", fmt.Sprintf("task is bound to runtime %q, which is no longer configured", name))
+			return routed{}, false
+		}
+		return routed{record: rec, binding: binding}, true
+	}
+
+	match, ok := d.opts.Projects.Match(rec.ProjectKey, rec.IssueID)
+	if !ok {
+		// Fail closed, and fail here rather than in the worker: an unroutable project
+		// must not take up a runtime's queue slot.
+		d.ignored.Add(1)
+		d.log.Warn("no repository is mapped for this project; delivery ignored",
+			"issue", rec.IssueID, "project", rec.ProjectKey)
+		return routed{}, false
+	}
+	binding, err := d.pickRuntime(ctx, task, match.Entry)
+	if err != nil {
+		d.ignored.Add(1)
+		d.log.Warn("no runtime can serve this delivery; it is ignored",
+			"issue", rec.IssueID, "project", rec.ProjectKey, "error", err)
+		return routed{}, false
+	}
+	return routed{record: rec, binding: binding}, true
+}
+
+// queueFor returns a runtime's queue, creating it the first time the runtime is
+// used. The second result says whether it was created, which is the caller's signal
+// to start that runtime's single worker.
+func (d *Dispatcher) queueFor(name string) (chan routed, bool) {
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	if queue, ok := d.queues[name]; ok {
+		return queue, false
+	}
+	queue := make(chan routed, d.opts.QueueSize)
+	d.queues[name] = queue
+	return queue, true
+}
+
+// enqueue hands a delivery to its runtime's worker, starting that worker on first
+// use. A full per-runtime queue drops the delivery, exactly like the intake queue:
+// blocking here would push back into the webhook request path.
+//
+// Workers are never stopped except by the context. An idle goroutine per known
+// runtime costs nothing next to the bookkeeping of stopping one safely, and a
+// runtime that is revoked and re-enrolled keeps its queue rather than losing work
+// that was already routed to it.
+func (d *Dispatcher) enqueue(ctx context.Context, item routed, workers *sync.WaitGroup) {
+	name := item.binding.Name
+	queue, created := d.queueFor(name)
+	if created {
+		d.log.Info("runtime worker started", "runtime", name, "queue_size", d.opts.QueueSize)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			d.workRuntime(ctx, name, queue)
+		}()
+	}
+	// The load is counted from the moment the delivery is committed to this runtime,
+	// not from the moment its worker picks it up. The difference matters under a
+	// burst: two deliveries that arrive together are routed back to back, and by the
+	// time the second is ranked the first may already have been dequeued — with its
+	// turn still preparing, so neither "queued" nor "in flight" would show it. That
+	// is how a spread of two tasks landed on one host.
+	d.countBusy(name, 1)
+	select {
+	case queue <- item:
+	default:
+		d.countBusy(name, -1)
+		d.dropped.Add(1)
+		d.log.Error("the runtime's queue is full, dropping delivery",
+			"runtime", name, "issue", item.record.IssueID, "queue_size", d.opts.QueueSize)
+	}
+}
+
+// workRuntime is one runtime's single worker: it runs the turns routed to that
+// runtime, one at a time, which is the granularity that matters because a session
+// belongs to one runtime for life.
+func (d *Dispatcher) workRuntime(ctx context.Context, name string, queue chan routed) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-queue:
+			d.runRouted(ctx, item)
+			d.countBusy(name, -1)
+			d.handled.Add(1)
+		}
+	}
+}
+
+// busyFor reports how much work is committed to a runtime right now: deliveries
+// waiting in its queue, being prepared, or running a turn. The spread policy reads
+// it, so two deliveries that arrive together do not both land on the host that
+// happens to sort first.
+func (d *Dispatcher) busyFor(name string) int {
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	return d.busyPerRT[name]
+}
+
+func (d *Dispatcher) countBusy(name string, delta int) {
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	d.busyPerRT[name] += delta
+	if d.busyPerRT[name] <= 0 {
+		delete(d.busyPerRT, name)
+	}
+}
+
+// setRuntimeError and clearRuntimeError keep the per-runtime view /healthz reports,
+// so "which host is stuck" is one call rather than a log dig.
+func (d *Dispatcher) setRuntimeError(name, message string) {
+	if name == "" {
+		return
+	}
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	d.lastError[name] = message
+}
+
+func (d *Dispatcher) clearRuntimeError(name string) {
+	if name == "" {
+		return
+	}
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	delete(d.lastError, name)
+}
+
+// runRouted runs the turn for a delivery the router has already assigned. It reads
+// the task afresh: the routing decision may be seconds old, and the rules depend on
+// what previous turns recorded.
+func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
+	rec, binding := item.record, item.binding
 	if d.Paused() {
 		d.ignored.Add(1)
 		d.log.Warn("dispatch is paused; delivery ignored",
@@ -305,21 +537,13 @@ func (d *Dispatcher) handle(ctx context.Context, rec *store.Record) {
 		return
 	}
 
-	// The runtime is chosen once, before the workspace exists: a task is bound to
-	// the host that prepares its worktree, and it stays there.
-	binding, err := d.pickRuntime(ctx, task, match.Entry)
-	if err != nil {
-		d.ignored.Add(1)
-		d.log.Warn("no runtime can serve this delivery; it is ignored",
-			"issue", rec.IssueID, "project", rec.ProjectKey, "error", err)
-		return
-	}
-	if task.Runtime != "" && task.Runtime != binding.Name {
-		// Defensive: pickRuntime refuses this, but a silent re-home would lose the
-		// session's whole context, so it is worth never being possible.
+	// The registry is authoritative about the binding: the router chose this runtime
+	// from the same record, but a task may never move between runtimes, so it is
+	// checked here too rather than trusted.
+	if name := strings.TrimSpace(task.Runtime); name != "" && name != binding.Name {
 		d.ignored.Add(1)
 		d.log.Error("refusing to move a bound task to another runtime",
-			"issue", rec.IssueID, "bound", task.Runtime, "chosen", binding.Name)
+			"issue", rec.IssueID, "bound", name, "chosen", binding.Name)
 		return
 	}
 
@@ -403,12 +627,15 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 		}
 	}
 
+	lock := d.prepareLock(entry.Repo.Path)
+	lock.Lock()
 	prepared, err := manager.Prepare(ctx, worktree.Request{
 		Repo:          entry.Repo.Path,
 		TaskKey:       rec.IssueID,
 		DefaultBranch: entry.Repo.DefaultBranch,
 		BaseCommit:    baseCommit,
 	})
+	lock.Unlock()
 	if err != nil {
 		return registry.Task{}, err
 	}
@@ -483,6 +710,8 @@ func Problems(projects *projectmap.Map, fallbackWorktreeBase string) []string {
 // first use. The base comes from the routing entry, because it has to sit outside
 // the repository that entry points at.
 func (d *Dispatcher) managerFor(base string) (*worktree.Manager, error) {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
 	if manager, ok := d.managers[base]; ok {
 		return manager, nil
 	}
@@ -492,6 +721,21 @@ func (d *Dispatcher) managerFor(base string) (*worktree.Manager, error) {
 	}
 	d.managers[base] = manager
 	return manager, nil
+}
+
+// prepareLock returns the mutex that serializes workspace preparation for one
+// repository. Preparation is the one step that touches a shared resource — the
+// clone's own git bookkeeping — so it is the one step that cannot run twice at once
+// in the same repository, whatever the runtime. The turns themselves stay parallel.
+func (d *Dispatcher) prepareLock(repo string) *sync.Mutex {
+	d.prepMu.Lock()
+	defer d.prepMu.Unlock()
+	if lock, ok := d.prepLocks[repo]; ok {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	d.prepLocks[repo] = lock
+	return lock
 }
 
 // runTurn delivers one prompt and records what came back.
@@ -571,12 +815,16 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 		"replied", replied, "cost", result.Cost, "tokens", result.Tokens.Total,
 		"elapsed", result.Elapsed.Round(time.Millisecond), "permissions", len(result.Permissions),
 	}
-	if err != nil {
+	switch {
+	case err != nil:
 		d.log.Error("turn failed", append(attrs, "error", err)...)
-	} else if !result.Finished {
+		d.setRuntimeError(binding.Name, err.Error())
+	case !result.Finished:
 		d.log.Warn("turn did not finish", attrs...)
-	} else {
+		d.setRuntimeError(binding.Name, "the last turn did not finish")
+	default:
 		d.log.Info("turn finished", attrs...)
+		d.clearRuntimeError(binding.Name)
 	}
 	for _, answered := range result.Permissions {
 		d.log.Info("permission decision",

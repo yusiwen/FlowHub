@@ -58,7 +58,7 @@ func (d *Dispatcher) pickRuntime(ctx context.Context, task registry.Task, entry 
 		}
 		d.log.Info("runtime chosen",
 			"runtime", load.Binding.Name, "policy", load.Policy, "eligible", len(loads),
-			"in_flight", load.InFlight, "active_tasks", load.Active,
+			"busy", load.Busy, "in_flight", load.InFlight, "active_tasks", load.Active,
 			"candidates", strings.Join(candidateNames(loads), ","))
 		return load.Binding, nil
 	}
@@ -72,7 +72,13 @@ type runtimeLoad struct {
 	Binding  runtimeBinding
 	Policy   string
 	InFlight int
-	Active   int
+	// Busy counts the work already committed to this runtime: deliveries waiting in
+	// its queue, being prepared, or running a turn. It is what makes a burst spread —
+	// two deliveries that arrive together both reach the router before either has
+	// created a task row, so without it the second would see an idle runtime and
+	// follow the first onto the same host.
+	Busy   int
+	Active int
 }
 
 // rankRuntimes lists the runtimes a new task may use, ordered by the project's
@@ -96,13 +102,15 @@ func (d *Dispatcher) rankRuntimes(entry *projectmap.Entry) []runtimeLoad {
 			Binding:  candidate,
 			Policy:   policy,
 			InFlight: d.inFlightFor(candidate.Name),
+			Busy:     d.busyFor(candidate.Name),
 			Active:   len(d.boundTasksFor(candidate.Name)),
 		})
 	}
 	if policy == projectmap.PolicySpread {
 		sort.SliceStable(loads, func(a, b int) bool {
-			if loads[a].InFlight != loads[b].InFlight {
-				return loads[a].InFlight < loads[b].InFlight
+			// "In flight or queued right now", exactly as the ADR orders it.
+			if loads[a].Busy != loads[b].Busy {
+				return loads[a].Busy < loads[b].Busy
 			}
 			if loads[a].Active != loads[b].Active {
 				return loads[a].Active < loads[b].Active
@@ -247,6 +255,8 @@ func (d *Dispatcher) bindingFor(name string) (runtimeBinding, bool) {
 // clientFor caches one client per runtime: they are stateless, but a client per
 // call would build a new connection pool every turn.
 func (d *Dispatcher) clientFor(name, url string) *opencode.Client {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
 	if client, ok := d.clients[name]; ok && client.BaseURL() == url {
 		return client
 	}

@@ -197,8 +197,12 @@ documents. The rules below are load-bearing; do not relax them casually.
    says so. The dispatcher refuses to reuse a
    session when the routing table now points at a different repository than the
    task was created against, and it never falls back to the shared checkout.
-   Only one worker runs turns: a prompt sent to a busy session is silently
-   swallowed, so more workers need per-task locking first.
+   **The unit of serialization is the runtime, not the process**: an intake loop
+   decides which runtime takes a delivery and hands it to that runtime's own queue,
+   where its own single worker runs the turns. A prompt sent to a busy session is
+   silently swallowed, and a session belongs to one runtime for life — so different
+   runtimes run turns in parallel while one runtime still runs them one at a time.
+   `max_concurrent` stays 1 until per-task locking exists.
 10. **The agent's reply must never start another turn.** Our own comments are
     recognised by content, because the agent posts as the same YouTrack user as
     the human. Three independent layers: the `<!-- flowhub-auto -->` marker in the

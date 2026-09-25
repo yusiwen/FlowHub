@@ -52,6 +52,21 @@ type fakeOpencode struct {
 	// silentFinish completes the message with tools only and no text, which is what a
 	// turn that ends without a final message looks like.
 	silentFinish bool
+	// hold, when set, blocks every prompt until release is called. It is how a test
+	// proves that two runtimes are running turns at the same time rather than in
+	// sequence.
+	hold        chan struct{}
+	releaseOnce sync.Once
+}
+
+// release unblocks every held prompt, exactly once. Tests defer it so a failed
+// assertion cannot leave a handler blocked and hang server shutdown.
+func (f *fakeOpencode) release() {
+	f.releaseOnce.Do(func() {
+		if f.hold != nil {
+			close(f.hold)
+		}
+	})
 }
 
 func newFakeOpencode(t *testing.T) *fakeOpencode {
@@ -101,6 +116,15 @@ func (f *fakeOpencode) start() *httptest.Server {
 		}
 		if !f.silentFinish {
 			parts = append(parts, opencode.Part{Type: "text", Text: "analysis done"})
+		}
+		if f.hold != nil {
+			// Block here, with the prompt recorded and no assistant message yet, so the
+			// turn really is in flight. The mutex is released first: a second prompt must
+			// be able to arrive, which is what this is here to observe.
+			hold := f.hold
+			f.mu.Unlock()
+			<-hold
+			f.mu.Lock()
 		}
 		id := len(f.messages)
 		f.messages = append(f.messages,
@@ -657,4 +681,179 @@ func TestATextlessTurnKeepsTheRecordedReply(t *testing.T) {
 	if second.Turns != 2 {
 		t.Fatalf("turns = %d, want the turn to have been counted", second.Turns)
 	}
+}
+
+// promptCount reports how many prompts the fake has received.
+func (f *fakeOpencode) promptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.prompts)
+}
+
+// newScheduledDispatcher wires a dispatcher over a real repository and two enrolled
+// runtimes on the fake server, which is what the scheduler tests need: a real
+// worktree per task, and a policy that spreads them.
+func newScheduledDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.Server, extra string) (*Dispatcher, *registry.Registry) {
+	t.Helper()
+	repo := testRepo(t)
+	base := filepath.Join(t.TempDir(), "worktrees")
+	projectsFile := filepath.Join(t.TempDir(), "config.json")
+	body := `{"projects":[{"youtrack_key":"TEST","repo":{"path":"` + repo + `","default_branch":"main"},"worktrees":"` + base + `"` + extra + `}]}`
+	if err := os.WriteFile(projectsFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(projectsFile)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+	reg, err := registry.Open(filepath.Join(t.TempDir(), "registry.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.directory = repo
+	dispatcher, err := New(Options{
+		Client:   opencode.New(opencode.Options{BaseURL: server.URL, Timeout: 5 * time.Second}),
+		Runtimes: testInventory(t, server.URL, "builder-a", "builder-b"),
+		Registry: reg,
+		Projects: projects,
+		Rules:    rules.Policy{}.Defaults(),
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agent:    "devops",
+		Deadline: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return dispatcher, reg
+}
+
+// TestRuntimesRunTurnsInParallel is the point of one queue per runtime: with two
+// runtimes eligible, the second turn starts while the first is still running. Under
+// the single worker this replaced, the second prompt could not arrive until the
+// first turn ended, and this test would time out.
+func TestRuntimesRunTurnsInParallel(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.hold = make(chan struct{})
+	server := fake.start()
+	// Order matters: Close waits for the held handlers, so the release is registered
+	// last and therefore runs first.
+	defer server.Close()
+	defer fake.release()
+	dispatcher, reg := newScheduledDispatcher(t, fake, server, `,"runtimes":["builder-a","builder-b"],"runtime_policy":"spread"`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dispatcher.Run(ctx)
+
+	dispatcher.Dispatch(delivery("TEST-50", "issueCreated", issueCreatedBody("TEST-50")))
+	dispatcher.Dispatch(delivery("TEST-51", "issueCreated", issueCreatedBody("TEST-51")))
+
+	// Both turns have to be in flight at once. The deadline is generous; what matters
+	// is that a sequential dispatcher can never reach two.
+	deadline := time.Now().Add(5 * time.Second)
+	for fake.promptCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := fake.promptCount(); got != 2 {
+		t.Fatalf("prompts in flight = %d, want 2: two runtimes must run turns in parallel", got)
+	}
+
+	// And the per-runtime view says so.
+	runtimes, _ := dispatcher.Snapshot()["runtimes"].(map[string]map[string]any)
+	if len(runtimes) != 2 {
+		t.Fatalf("snapshot runtimes = %+v, want one entry per busy runtime", runtimes)
+	}
+	for name, entry := range runtimes {
+		if inFlight, _ := entry["in_flight"].(int); inFlight != 1 {
+			t.Fatalf("%s in_flight = %v, want 1", name, entry["in_flight"])
+		}
+	}
+
+	fake.release()
+	waitFor(t, 10*time.Second, func() bool {
+		return dispatcher.Snapshot()["handled"].(int64) == 2
+	})
+
+	// The two tasks landed on different runtimes, which is what spread promised.
+	first, _ := reg.Get("TEST-50")
+	second, _ := reg.Get("TEST-51")
+	if first.Runtime == "" || second.Runtime == "" || first.Runtime == second.Runtime {
+		t.Fatalf("runtimes = %q and %q, want two different hosts", first.Runtime, second.Runtime)
+	}
+}
+
+// TestOneRuntimeStillRunsOneTurnAtATime is the other half: parallel across runtimes
+// must not become parallel within one. A project that names a single runtime keeps
+// the old guarantee, because a session belongs to that runtime.
+func TestOneRuntimeStillRunsOneTurnAtATime(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.hold = make(chan struct{})
+	server := fake.start()
+	defer server.Close()
+	defer fake.release()
+	dispatcher, _ := newScheduledDispatcher(t, fake, server, `,"runtime":"builder-a"`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dispatcher.Run(ctx)
+
+	dispatcher.Dispatch(delivery("TEST-52", "issueCreated", issueCreatedBody("TEST-52")))
+	dispatcher.Dispatch(delivery("TEST-53", "issueCreated", issueCreatedBody("TEST-53")))
+
+	// The first turn is held open, so a second prompt on the same runtime would mean
+	// two turns on one session host at once.
+	time.Sleep(500 * time.Millisecond)
+	if got := fake.promptCount(); got != 1 {
+		t.Fatalf("prompts in flight = %d, want 1: one runtime runs one turn at a time", got)
+	}
+	fake.release()
+	waitFor(t, 10*time.Second, func() bool {
+		return dispatcher.Snapshot()["handled"].(int64) == 2
+	})
+	if got := fake.promptCount(); got != 2 {
+		t.Fatalf("prompts = %d, want both turns to have run", got)
+	}
+}
+
+// TestRouteRefusesABoundTaskWhoseRuntimeIsGone: routing is where the refusal happens
+// now, so it is asserted there rather than only at the turn.
+func TestRouteRefusesABoundTaskWhoseRuntimeIsGone(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg := newScheduledDispatcher(t, fake, server, `,"runtime":"builder-a"`)
+
+	// A task bound to a runtime this process does not have: the row outlives the host.
+	if _, _, err := reg.Ensure("TEST-54", func(task *registry.Task) {
+		task.Runtime = "builder-gone"
+		task.State = registry.StateAnalyzing
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := dispatcher.routeOne(context.Background(), delivery("TEST-54", "issueCreated", issueCreatedBody("TEST-54"))); ok {
+		t.Fatal("a delivery bound to a runtime that is gone was routed")
+	}
+	if got := fake.promptCount(); got != 0 {
+		t.Fatalf("prompts = %d, want none", got)
+	}
+
+	// A delivery for an unmapped project is refused before it can take a queue slot.
+	unmapped := delivery("OTHER-1", "issueCreated", issueCreatedBody("OTHER-1"))
+	unmapped.ProjectKey = "OTHER"
+	if _, ok := dispatcher.routeOne(context.Background(), unmapped); ok {
+		t.Fatal("a delivery for an unmapped project was routed")
+	}
+}
+
+// waitFor polls a condition, failing the test if it never becomes true.
+func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the condition was never met")
 }
