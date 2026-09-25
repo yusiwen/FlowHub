@@ -252,6 +252,7 @@ switched on explicitly:
 | `FLOWHUB_DISPATCH_AGENT` | `devops` | opencode agent for turns whose routing entry names none |
 | `FLOWHUB_DISPATCH_QUEUE` | `32` | Deliveries waiting for the single worker. A full queue drops work instead of blocking the publisher |
 | `FLOWHUB_TASK_DEADLINE` | `15m` | One turn's budget. A deadline is not a failure: the session keeps running and is marked `executing` |
+| `FLOWHUB_FIRST_RESPONSE` | `90s` | How long a turn may take to produce its first assistant message before it is **failed**. A prompt the agent server never turns into a turn (a model its provider dropped) leaves the session idle with no message, which otherwise looks like a slow turn until the deadline. Capped at a third of `FLOWHUB_TASK_DEADLINE`, floored at `5s` |
 | `FLOWHUB_MAX_TURNS` | `8` | A task that triggers more often than this stops and asks for a human |
 | `FLOWHUB_TASK_MAX_COST` | `0` | Stop a task whose accumulated opencode cost passes this many dollars. `0` disables the check |
 | `FLOWHUB_TRIGGER` | `/opencode start` | The comment that means "implement it" |

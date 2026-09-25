@@ -484,6 +484,7 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 		WorktreeBase:   cfg.WorktreeBase,
 		Agent:          cfg.DispatchAgent,
 		Deadline:       cfg.TaskDeadline,
+		FirstResponse:  cfg.FirstResponse,
 		QueueSize:      cfg.DispatchQueueSize,
 		PauseFile:      cfg.ResolvedPauseFile(),
 		MaxCostPerTask: cfg.TaskMaxCost,

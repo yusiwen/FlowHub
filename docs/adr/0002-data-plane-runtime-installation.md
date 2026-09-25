@@ -363,15 +363,21 @@ warning quoted above.
    itself with a new invite when its secret is lost? Recommendation: admin-initiated
    `rotate`, plus re-invite for a lost secret, so a compromised worker cannot mint
    itself new credentials.
-5. **What should happen when the agent server fails a prompt immediately?** A turn
-   whose provider rejects the prompt dies on the server within milliseconds, but
-   the session never produces an assistant message, so the runner sees an idle
-   session with nothing to show and only gives up at `FLOWHUB_TASK_DEADLINE`
-   (measured 2026-09-25: an 11-minute wait on a turn that had already failed). The
-   poll loop needs a "no assistant message yet and the session is not busy" bound,
-   and the opencode-side error has to reach the audit line instead of the server's
-   own log. Recommendation: fail the turn after a short first-response bound, with
-   the reason naming the agent server.
+5. **What should happen when the agent server fails a prompt immediately?**
+   Settled: the runner fails the turn at a **first-response bound**
+   (`FLOWHUB_FIRST_RESPONSE`, default 90s, capped at a third of the task deadline,
+   floored at 5s). opencode writes the assistant message before it calls the
+   provider, so an idle session with no new assistant message long after the prompt
+   was delivered means the prompt was never admitted — and since nothing is
+   running, that is a failure rather than a timeout. A *busy* session with no
+   message yet is left alone: that is what a slow model looks like. Measured
+   2026-09-25 with a deliberately invalid model: the server rejected the prompt
+   0.12s after delivery (`ProviderModelNotFoundError`), and the turn was failed and
+   recorded as `state=failed` after 20.5s with a bound of 20s — where the previous
+   behaviour would have held the only worker until the ten-minute deadline (and
+   fifteen minutes by default). The opencode-side error itself is still only in the
+   agent server's log; the FlowHub error names the server and the two usual causes
+   instead of guessing, and the audit line records the elapsed time.
 6. **Is re-inviting a `revoked` name a re-enrolment, or a mistake?** Today `invite`
    replaces a revoked entry, so an explicit admin action revives the name; the
    `revoked` state otherwise only reserves it. That is probably what an operator

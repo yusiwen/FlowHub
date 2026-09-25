@@ -50,6 +50,11 @@ const (
 	DefaultDispatchAgent = "devops"
 	DefaultDispatchQueue = 32
 	DefaultTaskDeadline  = 15 * time.Minute
+	// DefaultFirstResponse bounds how long a turn may take to produce its first
+	// assistant message. It is far below the task deadline on purpose: the failure
+	// it catches (a prompt the agent server never admits) is immediate, and a turn
+	// that never starts otherwise occupies the only worker until the deadline.
+	DefaultFirstResponse = 90 * time.Second
 	DefaultMaxTurns      = 8
 	DefaultTrigger       = "/opencode start"
 	DefaultStartState    = "In Progress"
@@ -180,6 +185,11 @@ type Config struct {
 	// session keeps running and the task is marked executing.
 	TaskDeadline time.Duration
 
+	// FirstResponse bounds how long a turn may take to produce its first assistant
+	// message before it is failed. Without it, a prompt the agent server rejects
+	// immediately looks like a slow turn until TaskDeadline.
+	FirstResponse time.Duration
+
 	// MaxTurns stops a task that keeps triggering; the cheap runaway guard.
 	MaxTurns int
 
@@ -303,6 +313,9 @@ func Load() (Config, error) {
 	if cfg.TaskDeadline, err = envDuration("FLOWHUB_TASK_DEADLINE", DefaultTaskDeadline); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_TASK_DEADLINE: %w", err)
 	}
+	if cfg.FirstResponse, err = envDuration("FLOWHUB_FIRST_RESPONSE", DefaultFirstResponse); err != nil {
+		return Config{}, fmt.Errorf("FLOWHUB_FIRST_RESPONSE: %w", err)
+	}
 	if cfg.TaskMaxCost, err = envFloat("FLOWHUB_TASK_MAX_COST", 0); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_TASK_MAX_COST: %w", err)
 	}
@@ -411,6 +424,9 @@ func (c Config) validate() error {
 	if c.TaskDeadline <= 0 {
 		return fmt.Errorf("FLOWHUB_TASK_DEADLINE must be positive, got %s", c.TaskDeadline)
 	}
+	if c.FirstResponse <= 0 {
+		return fmt.Errorf("FLOWHUB_FIRST_RESPONSE must be positive, got %s", c.FirstResponse)
+	}
 	if c.MaxTurns <= 0 {
 		return fmt.Errorf("FLOWHUB_MAX_TURNS must be positive, got %d", c.MaxTurns)
 	}
@@ -473,6 +489,10 @@ func (c Config) Warnings() []string {
 	}
 	if c.ReplayWindow == 0 {
 		warns = append(warns, "FLOWHUB_REPLAY_WINDOW=0: replay window is DISABLED")
+	}
+	if c.Dispatch && c.FirstResponse >= c.TaskDeadline {
+		warns = append(warns, fmt.Sprintf("FLOWHUB_FIRST_RESPONSE (%s) is not below FLOWHUB_TASK_DEADLINE (%s), so a turn that never starts is only noticed at the deadline",
+			c.FirstResponse, c.TaskDeadline))
 	}
 	if c.ControlAPIEnabled() && c.AdminToken == "" {
 		warns = append(warns, "FLOWHUB_ADMIN_ADDR is set with no FLOWHUB_ADMIN_TOKEN: the control API will refuse to start")
@@ -670,6 +690,7 @@ func (c Config) Report() string {
 	fmt.Fprintf(&b, "dispatch_agent:     %s\n", c.DispatchAgent)
 	fmt.Fprintf(&b, "dispatch_queue:     %d\n", c.DispatchQueueSize)
 	fmt.Fprintf(&b, "task_deadline:      %s\n", c.TaskDeadline)
+	fmt.Fprintf(&b, "first_response:     %s\n", c.FirstResponse)
 	fmt.Fprintf(&b, "max_turns:          %d\n", c.MaxTurns)
 	fmt.Fprintf(&b, "task_max_cost:      %s\n", formatCost(c.TaskMaxCost))
 	fmt.Fprintf(&b, "trigger:            %q\n", c.Trigger)

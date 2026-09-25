@@ -175,6 +175,10 @@ documents. The rules below are load-bearing; do not relax them casually.
    execution — the per-task worktree is the real containment. Completion detection
    needs all three signals (new completed assistant message, status not busy, no
    pending permission): status lags, and a pending permission keeps a session busy.
+   A turn that produces no assistant message at all while the session is idle is
+   failed at `FLOWHUB_FIRST_RESPONSE` rather than held until the deadline — that is
+   the signature of a prompt the agent server rejected, and a busy session with no
+   message yet is not it.
 9. **One task, one worktree, one session.** `internal/registry` is the
    append-only record of that binding (`<DataDir>/registry.jsonl`) and
    `internal/worktree` creates the checkout. The dispatcher refuses to reuse a

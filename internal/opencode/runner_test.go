@@ -30,6 +30,10 @@ type fakeServer struct {
 	afterReply func(f *fakeServer)
 	// refusePrompt makes prompt_async fail, to exercise the error path.
 	refusePrompt bool
+	// silentPrompt accepts prompt_async but never starts a turn: the user message is
+	// recorded, no assistant message is written and the session stays idle. That is
+	// what a rejected prompt looks like from the outside.
+	silentPrompt bool
 
 	sawDirectory []string
 	sawAuth      []string
@@ -89,7 +93,7 @@ func (f *fakeServer) start() *httptest.Server {
 			Info:  MessageInfo{ID: "msg_user", Role: "user", Time: MessageTime{Created: 1}},
 			Parts: []Part{{Type: "text", Text: body.Parts[0].Text}},
 		})
-		f.busy = true
+		f.busy = !f.silentPrompt
 		w.WriteHeader(http.StatusNoContent)
 	})
 	handler.HandleFunc("/session/"+f.sessionID+"/message", func(w http.ResponseWriter, r *http.Request) {
@@ -315,6 +319,93 @@ func TestRunnerPropagatesPromptFailure(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("want an error when prompt_async fails")
+	}
+}
+
+// TestRunnerFailsWhenThePromptNeverStarts is a regression test for the expensive
+// failure measured on 2026-09-25: a prompt the agent server rejects (a model its
+// provider dropped) produces no assistant message and leaves the session idle, so
+// the runner saw a turn that looked merely slow and held the only worker for more
+// than eleven minutes. The first-response bound fails it in seconds instead.
+func TestRunnerFailsWhenThePromptNeverStarts(t *testing.T) {
+	fake := newFakeServer(t)
+	fake.directory = "/private/tmp/work"
+	fake.silentPrompt = true
+	server := fake.start()
+	defer server.Close()
+
+	runner := testRunner(t, server.URL)
+	runner.FirstResponse = 50 * time.Millisecond
+	started := time.Now()
+	result, err := runner.Run(context.Background(), Task{
+		Directory: "/private/tmp/work", Prompt: "analyse", Deadline: 30 * time.Second,
+	})
+	elapsed := time.Since(started)
+
+	if err == nil {
+		t.Fatal("a prompt that never started was reported as a turn")
+	}
+	if !strings.Contains(err.Error(), "started no turn") || !strings.Contains(err.Error(), "model the provider does not offer") {
+		t.Fatalf("the failure does not name what happened or where to look: %v", err)
+	}
+	if result.TimedOut {
+		t.Fatal("this is a failure, not a timeout: nothing is running")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("took %s; the bound, not the deadline, has to end this turn", elapsed)
+	}
+}
+
+// TestRunnerDoesNotFailASessionThatIsStillBusy is the other half: a busy session
+// with no assistant message yet is what a slow model looks like, and the
+// first-response bound must not turn that into a failure. A pending permission for
+// another session keeps this one busy for the whole turn.
+func TestRunnerDoesNotFailASessionThatIsStillBusy(t *testing.T) {
+	fake := newFakeServer(t)
+	fake.directory = "/private/tmp/work"
+	fake.addPending(PermissionRequest{
+		ID: "per_stuck", SessionID: "ses_other_session", Permission: "bash",
+		Metadata: PermissionMetadata{Command: "pwd"},
+	})
+	server := fake.start()
+	defer server.Close()
+
+	runner := testRunner(t, server.URL)
+	runner.FirstResponse = 30 * time.Millisecond
+	result, err := runner.Run(context.Background(), Task{
+		Directory: "/private/tmp/work", Prompt: "analyse", Deadline: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("a busy session was failed: %v", err)
+	}
+	if !result.TimedOut {
+		t.Fatalf("result = %+v, want a timeout", result)
+	}
+}
+
+// TestFirstResponseBoundNeverOutlivesTheDeadline pins the arithmetic: a turn with a
+// short budget fails fast, a normal one gets the default, and a tiny deadline does
+// not produce an immediate false failure.
+func TestFirstResponseBoundNeverOutlivesTheDeadline(t *testing.T) {
+	cases := []struct {
+		name     string
+		set      time.Duration
+		deadline time.Duration
+		want     time.Duration
+	}{
+		{name: "an explicit bound wins", set: 3 * time.Second, deadline: time.Hour, want: 3 * time.Second},
+		{name: "the default for a normal deadline", deadline: 15 * time.Minute, want: DefaultFirstResponse},
+		{name: "a third of a short deadline", deadline: 90 * time.Second, want: 30 * time.Second},
+		{name: "never below the floor", deadline: 2 * time.Second, want: MinimumFirstResponse},
+		{name: "no deadline at all", deadline: 0, want: DefaultFirstResponse},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &Runner{FirstResponse: test.set}
+			if got := runner.firstResponseBound(test.deadline); got != test.want {
+				t.Fatalf("firstResponseBound(%s) = %s, want %s", test.deadline, got, test.want)
+			}
+		})
 	}
 }
 

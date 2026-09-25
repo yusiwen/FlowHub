@@ -22,6 +22,11 @@ type Runner struct {
 	// documents measured that a permission request is visible within ~2s, and
 	// that the app-level timeout is generous, so one second is plenty.
 	Poll time.Duration
+	// FirstResponse bounds how long a turn may take to produce its first assistant
+	// message. Zero uses DefaultFirstResponse, capped at a third of the task
+	// deadline. A prompt the agent server never admits otherwise looks exactly like
+	// a slow turn until the deadline.
+	FirstResponse time.Duration
 }
 
 // Task is one unattended turn.
@@ -147,11 +152,15 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 
 	// The baseline is taken before the prompt, so completion is detected against
 	// the turns that already exist — which is what makes a second turn on the
-	// same session work.
-	baseline, err := r.completedAssistantCount(ctx, task.Directory, sessionID)
+	// same session work. Two counts come out of one read: the completed assistant
+	// messages decide completion, and *any* assistant message decides whether the
+	// turn started at all.
+	existing, err := r.client.Messages(ctx, task.Directory, sessionID)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("opencode: list messages: %w", err)
 	}
+	baseline := len(completedAssistant(existing))
+	startedBefore := assistantCount(existing)
 
 	if err := r.client.PromptAsync(ctx, task.Directory, sessionID, PromptRequest{
 		Agent: task.Agent,
@@ -168,6 +177,8 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 	if task.Deadline <= 0 {
 		deadline = time.Now().Add(10 * time.Minute)
 	}
+	firstResponse := r.firstResponseBound(task.Deadline)
+	firstResponseAt := time.Now().Add(firstResponse)
 
 	for {
 		if err := r.answerPending(ctx, task.Directory, sessionID, &result); err != nil {
@@ -216,6 +227,20 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 				"session", sessionID, "elapsed", result.Elapsed.Round(time.Millisecond),
 				"busy", busy, "pending_permissions", len(pending), "permissions_answered", len(result.Permissions))
 			return result, nil
+		}
+
+		// A prompt the agent server rejects before it starts a turn — a model its
+		// provider dropped, an agent profile the server does not have — produces no
+		// assistant message and leaves the session idle, which is indistinguishable
+		// from a slow turn until the deadline. Measured 2026-09-25: a turn that had
+		// already died in 30ms still held the single worker eleven minutes later. The
+		// assistant message is written before the provider is called, so this long
+		// with none means the prompt was never admitted — and nothing is running, so
+		// this is a failure rather than a timeout.
+		if assistantCount(messages) <= startedBefore && !busy && len(pending) == 0 && time.Now().After(firstResponseAt) {
+			result.Elapsed = time.Since(started)
+			return result, fmt.Errorf("opencode: the agent server accepted the prompt but started no turn within %s (session %s is idle and has no new assistant message); its own log holds the reason, usually a model the provider does not offer or an agent profile the server does not have",
+				firstResponse.Round(time.Millisecond), sessionID)
 		}
 
 		select {
@@ -272,12 +297,48 @@ func (r *Runner) pendingFor(ctx context.Context, directory, sessionID string) ([
 	return mine, nil
 }
 
-func (r *Runner) completedAssistantCount(ctx context.Context, directory, sessionID string) (int, error) {
-	messages, err := r.client.Messages(ctx, directory, sessionID)
-	if err != nil {
-		return 0, fmt.Errorf("opencode: list messages: %w", err)
+// firstResponseBound is how long a turn may take to produce its first assistant
+// message before the turn is called dead.
+//
+// opencode writes that message before it calls the provider, so the bound measures
+// the server admitting the prompt rather than the model being fast. It is
+// deliberately far below the task deadline (fifteen minutes by default), because
+// the failure it catches is immediate, and it never exceeds a third of the deadline:
+// a turn with a short budget should fail fast rather than wait for a deadline it
+// would hit first.
+func (r *Runner) firstResponseBound(deadline time.Duration) time.Duration {
+	if r.FirstResponse > 0 {
+		return r.FirstResponse
 	}
-	return len(completedAssistant(messages)), nil
+	bound := DefaultFirstResponse
+	if deadline > 0 && deadline/3 < bound {
+		bound = deadline / 3
+	}
+	if bound < MinimumFirstResponse {
+		bound = MinimumFirstResponse
+	}
+	return bound
+}
+
+const (
+	// DefaultFirstResponse is generous: an ordinary turn produces its assistant
+	// message within a second or two, and a cold provider connection within a few.
+	DefaultFirstResponse = 90 * time.Second
+	// MinimumFirstResponse keeps a short task deadline from turning the check into
+	// an immediate false failure.
+	MinimumFirstResponse = 5 * time.Second
+)
+
+// assistantCount counts the assistant messages, completed or still in flight. A
+// turn has started as soon as one exists.
+func assistantCount(messages []Message) int {
+	count := 0
+	for _, message := range messages {
+		if message.Info.Role == "assistant" {
+			count++
+		}
+	}
+	return count
 }
 
 // aggregate sums the turn's usage from its assistant messages, falling back to

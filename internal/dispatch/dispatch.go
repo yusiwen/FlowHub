@@ -64,6 +64,9 @@ type Options struct {
 	Agent string
 	// Deadline bounds one turn.
 	Deadline time.Duration
+	// FirstResponse bounds how long a turn may take to produce its first assistant
+	// message before it is failed. Zero leaves the runner's own default.
+	FirstResponse time.Duration
 	// QueueSize bounds the deliveries waiting for the worker.
 	QueueSize int
 	// PauseFile disables dispatch while it exists.
@@ -466,6 +469,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 	}
 
 	runner := opencode.NewRunner(binding.Client, arbiter, d.log)
+	runner.FirstResponse = d.opts.FirstResponse
 	result, err := runner.Run(ctx, opencode.Task{
 		Directory: task.Worktree,
 		Prompt:    prompt,
