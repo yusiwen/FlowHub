@@ -18,6 +18,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -63,20 +64,57 @@ type Entry struct {
 	// Agent and Model are passed to opencode when the task session is created.
 	Agent string `json:"agent,omitempty"`
 	Model string `json:"model,omitempty"`
+	// Runtime names one agent host that may serve this project, and Runtimes names
+	// several: their union is the eligibility set, not an ordered preference list.
+	// Naming none means "any configured runtime may serve this project".
+	Runtime  string   `json:"runtime,omitempty"`
+	Runtimes []string `json:"runtimes,omitempty"`
+	// RuntimePolicy overrides the table's runtime_policy for this project. It only
+	// decides which runtime takes a *new* task; a task that is already bound stays
+	// where it is, whatever the policy says.
+	RuntimePolicy string `json:"runtime_policy,omitempty"`
 	// Authors restricts which YouTrack logins may trigger work for this project.
 	// It is empty by default: the global allowlist still applies.
 	Authors []string `json:"authors,omitempty"`
 	// Enabled defaults to true when absent; a disabled entry is never matched.
 	Enabled *bool `json:"enabled,omitempty"`
 
-	keys []string
+	keys     []string
+	runtimes []string
+	policy   string
 }
+
+// Selection policies for a new task when a project is served by more than one
+// runtime. The names are part of the operator's surface: they appear in
+// `-print-config`, in the log line that records why a runtime was chosen, and in
+// the ADR.
+const (
+	// PolicySpread balances new tasks across the eligible runtimes, so a second
+	// machine is used rather than kept as pure failover.
+	PolicySpread = "spread"
+	// PolicyFirstHealthy takes the first eligible runtime in the declared order that
+	// answers, which is what an operator wants when one host should take everything.
+	PolicyFirstHealthy = "first-healthy"
+)
+
+// runtimeNamePattern mirrors the inventory's rule for a runtime name. A name that
+// could never be enrolled is a typo, and a typo has to fail when the table is
+// loaded instead of quietly making a project unroutable.
+var runtimeNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 
 // IsEnabled reports whether the entry participates in routing.
 func (e *Entry) IsEnabled() bool { return e.Enabled == nil || *e.Enabled }
 
 // Keys returns every key this entry answers to.
 func (e *Entry) Keys() []string { return e.keys }
+
+// RuntimeSet is the runtime names this project may be served by, in declaration
+// order and without duplicates. An empty set means "any configured runtime".
+func (e *Entry) RuntimeSet() []string { return e.runtimes }
+
+// Policy is the selection policy in force for this project. Load always fills it,
+// so it is either PolicySpread or PolicyFirstHealthy.
+func (e *Entry) Policy() string { return e.policy }
 
 // Match describes a successful routing decision.
 type Match struct {
@@ -93,10 +131,36 @@ type Map struct {
 	path    string
 	entries []*Entry
 	byKey   map[string]*Entry
+	// policy is the table-wide default; every entry resolves to PolicySpread or
+	// PolicyFirstHealthy when the file is loaded, so no caller has to re-decide.
+	policy string
+}
+
+// Policy is the table-wide default selection policy.
+func (m *Map) Policy() string {
+	if m == nil || m.policy == "" {
+		return PolicySpread
+	}
+	return m.policy
+}
+
+// normalisePolicy validates a policy value and returns it lowercased.
+func normalisePolicy(raw string) (string, error) {
+	switch value := strings.ToLower(strings.TrimSpace(raw)); value {
+	case "":
+		return PolicySpread, nil
+	case PolicySpread, PolicyFirstHealthy:
+		return value, nil
+	default:
+		return "", fmt.Errorf("runtime_policy %q: want %s or %s", raw, PolicySpread, PolicyFirstHealthy)
+	}
 }
 
 type fileFormat struct {
 	Projects []Entry `json:"projects"`
+	// RuntimePolicy is the table-wide default for how a new task picks among the
+	// runtimes its project names. A project entry may override it.
+	RuntimePolicy string `json:"runtime_policy,omitempty"`
 }
 
 // Load reads and validates the structure of the projects file.
@@ -131,6 +195,11 @@ func Load(path string) (*Map, error) {
 	if len(file.Projects) == 0 {
 		return nil, fmt.Errorf("projects file %s declares no projects", path)
 	}
+	policy, err := normalisePolicy(file.RuntimePolicy)
+	if err != nil {
+		return nil, fmt.Errorf("projects file %s: %w", path, err)
+	}
+	m.policy = policy
 
 	for index := range file.Projects {
 		entry := &file.Projects[index]
@@ -163,6 +232,34 @@ func (m *Map) register(entry *Entry, index int) error {
 	if entry.Worktrees != "" {
 		entry.Worktrees = canonicalize(entry.Worktrees)
 	}
+
+	entry.Runtime = strings.TrimSpace(entry.Runtime)
+	seenRuntimes := map[string]bool{}
+	for _, name := range append([]string{entry.Runtime}, entry.Runtimes...) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !runtimeNamePattern.MatchString(name) {
+			return fmt.Errorf("project %s: runtime %q is not a runtime name (want %s)",
+				entry.YouTrackKey, name, runtimeNamePattern)
+		}
+		if seenRuntimes[name] {
+			continue
+		}
+		seenRuntimes[name] = true
+		entry.runtimes = append(entry.runtimes, name)
+	}
+	policy, err := normalisePolicy(entry.RuntimePolicy)
+	if err != nil {
+		return fmt.Errorf("project %s: %w", entry.YouTrackKey, err)
+	}
+	// The per-project value wins; the table default is what an entry that says
+	// nothing gets. Resolving here means every reader sees one answer.
+	if strings.TrimSpace(entry.RuntimePolicy) == "" {
+		policy = m.Policy()
+	}
+	entry.policy = policy
 
 	keys := append([]string{entry.YouTrackKey}, entry.AlsoKeys...)
 	seen := map[string]bool{}

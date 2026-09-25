@@ -103,6 +103,15 @@ func run() error {
 			cfg.ProjectsFile, strings.Join(problems, "\n  - "))
 	}
 
+	// The runtime inventory is control-plane state: it lives with the audit trail
+	// and the task registry, and this process is its only writer. It is opened here,
+	// before -print-config returns, because a project may name runtimes and both the
+	// report and the startup check have to answer "does that name exist?".
+	inventory, err := runtimes.Open(cfg.ResolvedRuntimesFile())
+	if err != nil {
+		return err
+	}
+
 	if *printConfig {
 		fmt.Print(cfg.Report())
 		fmt.Print(projects.Report())
@@ -115,6 +124,13 @@ func run() error {
 		if cfg.Dispatch {
 			for _, problem := range dispatch.Problems(projects, cfg.WorktreeBase) {
 				fmt.Printf("dispatch_problem:   %s\n", problem)
+			}
+			problems, warnings := dispatch.RuntimeProblems(projects, inventory)
+			for _, warning := range warnings {
+				fmt.Printf("runtime_warning:    %s\n", warning)
+			}
+			for _, problem := range problems {
+				fmt.Printf("runtime_problem:    %s\n", problem)
 			}
 		}
 		return nil
@@ -134,6 +150,9 @@ func run() error {
 		}
 		if problems := dispatch.Problems(projects, cfg.WorktreeBase); len(problems) > 0 {
 			return fmt.Errorf("refusing to start, dispatch is not possible:\n  - %s", strings.Join(problems, "\n  - "))
+		}
+		if problems, _ := dispatch.RuntimeProblems(projects, inventory); len(problems) > 0 {
+			return fmt.Errorf("refusing to start, a project names a runtime that cannot take work:\n  - %s", strings.Join(problems, "\n  - "))
 		}
 	}
 
@@ -164,14 +183,6 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// The runtime inventory is control-plane state: it lives with the audit trail
-	// and the task registry, and this process is its only writer. A corrupt file
-	// stops the start, because "no runtimes" and "unreadable runtimes" mean
-	// opposite things.
-	inventory, err := runtimes.Open(cfg.ResolvedRuntimesFile())
-	if err != nil {
-		return err
-	}
 	if inventory.Len() > 0 {
 		logger.Info("runtime inventory loaded",
 			"path", inventory.Path(), "runtimes", inventory.Len(), "counts", inventory.Counts())

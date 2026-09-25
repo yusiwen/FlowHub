@@ -433,3 +433,100 @@ func TestKeysAndRoutableExcludeDisabledEntries(t *testing.T) {
 		t.Fatalf("report does not distinguish routable entries:\n%s", report)
 	}
 }
+
+// TestRuntimeAddressingIsParsedAndResolved covers ADR 0001 step 5's configuration
+// surface: a project may name one runtime or several, and the selection policy is
+// either the table's default or its own.
+func TestRuntimeAddressingIsParsedAndResolved(t *testing.T) {
+	path := writeFile(t, filepath.Join(t.TempDir(), "config.json"), `{
+		"runtime_policy": "first-healthy",
+		"projects": [
+			{"youtrack_key":"A","repo":{"path":"/tmp/a"},"runtime":"builder-a"},
+			{"youtrack_key":"B","repo":{"path":"/tmp/b"},"runtimes":["builder-a","builder-b","builder-a"]},
+			{"youtrack_key":"C","repo":{"path":"/tmp/c"},"runtime":"builder-c","runtimes":["builder-d"],"runtime_policy":"spread"}
+		]
+	}`)
+	projects, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if projects.Policy() != PolicyFirstHealthy {
+		t.Fatalf("table policy = %q", projects.Policy())
+	}
+
+	byKey := map[string]*Entry{}
+	for _, entry := range projects.Entries() {
+		byKey[entry.YouTrackKey] = entry
+	}
+	if got := byKey["A"].RuntimeSet(); len(got) != 1 || got[0] != "builder-a" {
+		t.Fatalf("A runtimes = %v", got)
+	}
+	// A single name and a list are the same set, and duplicates collapse.
+	if got := byKey["B"].RuntimeSet(); len(got) != 2 || got[0] != "builder-a" || got[1] != "builder-b" {
+		t.Fatalf("B runtimes = %v", got)
+	}
+	// Both spellings together union, and the entry's policy wins over the table's.
+	if got := byKey["C"].RuntimeSet(); len(got) != 2 || got[0] != "builder-c" || got[1] != "builder-d" {
+		t.Fatalf("C runtimes = %v", got)
+	}
+	if byKey["C"].Policy() != PolicySpread {
+		t.Fatalf("C policy = %q, want the entry to override the table", byKey["C"].Policy())
+	}
+	if byKey["A"].Policy() != PolicyFirstHealthy {
+		t.Fatalf("A policy = %q, want the table default", byKey["A"].Policy())
+	}
+	// The report names them, because that is what an operator reads.
+	report := projects.Report()
+	for _, want := range []string{"builder-a", "runtime_policy", PolicyFirstHealthy} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("report does not mention %q:\n%s", want, report)
+		}
+	}
+}
+
+// TestRuntimeAddressingDefaultsToSpread: a table that says nothing spreads, which is
+// the ADR's default and the only policy that uses a second machine.
+func TestRuntimeAddressingDefaultsToSpread(t *testing.T) {
+	path := writeFile(t, filepath.Join(t.TempDir(), "config.json"),
+		`{"projects":[{"youtrack_key":"A","repo":{"path":"/tmp/a"}}]}`)
+	projects, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if projects.Policy() != PolicySpread {
+		t.Fatalf("table policy = %q, want spread", projects.Policy())
+	}
+	if entry := projects.Entries()[0]; entry.Policy() != PolicySpread || len(entry.RuntimeSet()) != 0 {
+		t.Fatalf("entry = %+v, want the default policy and no declared runtimes", entry)
+	}
+}
+
+// TestRuntimeAddressingRejectsTypos keeps the failure at load time: a policy value
+// that does not exist, and a name that could never be enrolled, are both refused
+// rather than silently making a project unroutable.
+func TestRuntimeAddressingRejectsTypos(t *testing.T) {
+	cases := map[string]string{
+		"unknown policy":     `{"runtime_policy":"balanced","projects":[{"youtrack_key":"A","repo":{"path":"/tmp/a"}}]}`,
+		"entry policy":       `{"projects":[{"youtrack_key":"A","repo":{"path":"/tmp/a"},"runtime_policy":"round-robin"}]}`,
+		"uppercase name":     `{"projects":[{"youtrack_key":"A","repo":{"path":"/tmp/a"},"runtime":"Builder-A"}]}`,
+		"name with a space":  `{"projects":[{"youtrack_key":"A","repo":{"path":"/tmp/a"},"runtimes":["builder a"]}]}`,
+		"name with a slash":  `{"projects":[{"youtrack_key":"A","repo":{"path":"/tmp/a"},"runtime":"a/b"}]}`,
+		"empty list element": `{"projects":[{"youtrack_key":"A","repo":{"path":"/tmp/a"},"runtimes":[""]}]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := writeFile(t, filepath.Join(t.TempDir(), "config.json"), body)
+			if name == "empty list element" {
+				// An empty string is skipped, not refused: it is how a trailing comma
+				// in a hand-edited list arrives, and it names nothing.
+				if _, err := Load(path); err != nil {
+					t.Fatalf("an empty element should be ignored, got %v", err)
+				}
+				return
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("a typo was accepted")
+			}
+		})
+	}
+}

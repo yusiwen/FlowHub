@@ -163,6 +163,7 @@ func (m *Map) Report() string {
 		return b.String()
 	}
 
+	fmt.Fprintf(&b, "runtime_policy:     %s\n", m.Policy())
 	fmt.Fprintf(&b, "projects:           %d mapping(s)", m.Len())
 	if routable := m.Routable(); routable != m.Len() {
 		fmt.Fprintf(&b, ", %d routable", routable)
@@ -182,6 +183,11 @@ func (m *Map) Report() string {
 		}
 		if entry.Worktrees != "" {
 			fmt.Fprintf(&b, "  %-14s    worktrees %s\n", "", entry.Worktrees)
+		}
+		if set := entry.RuntimeSet(); len(set) > 0 {
+			fmt.Fprintf(&b, "  %-14s    runtimes %s (%s)\n", "", strings.Join(set, ","), entry.Policy())
+		} else {
+			fmt.Fprintf(&b, "  %-14s    runtimes any (%s)\n", "", entry.Policy())
 		}
 		var details []string
 		if entry.Agent != "" {

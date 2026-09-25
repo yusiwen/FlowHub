@@ -310,11 +310,50 @@ cp config/config.example.json ~/.config/flowhub/config.json   # then edit it
         "default_branch": "master"
       },
       "worktrees": "/Users/yusiwen/git/work/pipechina/beap-be-worktrees",
-      "agent": "devops"
+      "agent": "devops",
+      "runtimes": ["builder-a", "builder-b"],
+      "runtime_policy": "spread"
     }
   ]
 }
 ```
+
+### Which host runs the work
+
+A project names one runtime (`"runtime": "builder-a"`), several
+(`"runtimes": ["builder-a", "builder-b"]`), or none — and none means "any
+configured runtime may serve this project". A list is an **eligibility set**, not
+an ordered preference list.
+
+`runtime_policy` decides which of them takes a **new** task. It is `spread` by
+default and may be set for the whole table (the top level of the file) or per
+project:
+
+| Policy | Rule |
+| --- | --- |
+| `spread` (default) | Fewest turns in flight, then fewest non-terminal tasks in the registry, then name order — so a second machine is used instead of sitting idle |
+| `first-healthy` | The first name in the declared order that answers, so the rest are failover |
+
+Every tie-break is deterministic, and the choice is logged with the numbers it was
+made from:
+
+```
+msg="runtime chosen" runtime=builder-tmp policy=spread eligible=2 in_flight=0 active_tasks=1 candidates=builder-tmp,builder-b
+```
+
+**A task that is already bound goes to its own runtime, always**, whatever the
+policy says and whatever the project's eligibility set has become since. Failover
+happens at creation only: if the first candidate does not answer, the next
+eligible one is tried and the task binds to whichever succeeded. A bound task whose
+runtime is gone is refused with that reason rather than silently re-homed, because
+a session on another host is a fresh context that has lost the analysis and the
+plan.
+
+Startup checks the names against the inventory: a name that was **revoked** is a
+configuration error and stops the start (with the fix in the message), while a name
+that is merely not enrolled yet is a warning naming the invite/init commands — the
+normal state between the two halves of enrolment, which must not block the start
+that performs it.
 
 **Why it cannot come from YouTrack.** The webhook payload carries only
 `{key, name, shortName}` for the project, and YouTrack exposes no REST field or
@@ -331,6 +370,8 @@ even though YouTrack knows the answer. Measured evidence:
 | Fallback | Only when a payload carries **no** project object: the issue-ID prefix (`BEAP_BE-12` → `BEAP_BE`) |
 | Unmapped project key | **Hard miss.** A payload that names a project you did not map is never routed via the prefix — that would be exactly the guess this layer exists to prevent |
 | `enabled: false` | Never matched, and not validated (it may point at a checkout this host does not have) |
+| `runtime` / `runtimes` | The eligibility set for a new task. A name that is not a runtime name (`^[a-z0-9][a-z0-9._-]{0,62}$`) is refused when the table is loaded, because it could never be enrolled |
+| `runtime_policy` | `spread` or `first-healthy`, per project or for the whole table; anything else is refused at load |
 
 ### Startup validation (fail-closed)
 
@@ -344,6 +385,8 @@ before any file is created:
 * a relative path anywhere (it would depend on the caller's working directory);
 * `worktrees` inside `repo.path` or equal to it;
 * a duplicate key, or an `agent` name that is not a plain identifier;
+* `runtime_policy` that is neither `spread` nor `first-healthy`, or a runtime name
+  that could never be enrolled (see above);
 * any unknown JSON member (a typo in a field name is an error, not a no-op).
 
 Keys whose name starts with `_` are documentation and are ignored, which is how

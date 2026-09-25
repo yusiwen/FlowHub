@@ -273,7 +273,10 @@ documents. The rules below are load-bearing; do not relax them casually.
    at the first task. Activation checks more than liveness too: the profile the
    host claimed must exist on the advertised server (otherwise every turn runs
    under that server's default agent) and the model it reported must be one the
-   server offers.
+   server offers. **Which** runtime takes a new task is a routing decision: the
+   project's `runtime`/`runtimes` set is an eligibility set, `runtime_policy`
+   (`spread` by default) ranks it, every tie-break is deterministic, and the choice
+   is logged with the numbers it came from. A bound task ignores all of that.
 
 ## Before you finish a change
 

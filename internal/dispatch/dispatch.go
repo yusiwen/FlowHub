@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -96,6 +97,11 @@ type Dispatcher struct {
 	handled atomic.Int64
 	dropped atomic.Int64
 	ignored atomic.Int64
+
+	// loadMu guards inFlight, which the selection policy reads from the worker
+	// goroutine and /healthz reads from an HTTP handler.
+	loadMu   sync.Mutex
+	inFlight map[string]int
 }
 
 // New builds a dispatcher. It does not start working until Run is called.
@@ -129,6 +135,7 @@ func New(opts Options) (*Dispatcher, error) {
 		log:      opts.Log,
 		managers: map[string]*worktree.Manager{},
 		clients:  map[string]*opencode.Client{},
+		inFlight: map[string]int{},
 		queue:    make(chan *store.Record, opts.QueueSize),
 	}, nil
 }
@@ -197,7 +204,46 @@ func (d *Dispatcher) Snapshot() map[string]any {
 		"queue_depth": len(d.queue),
 		"paused":      d.Paused(),
 		"agent":       d.opts.Agent,
+		"in_flight":   d.inFlightSnapshot(),
 	}
+}
+
+// enterTurn records that a turn is running on a runtime and returns the function
+// that clears it. The spread policy ranks by these counters, so with one worker
+// per runtime (ADR 0001 step 5) they say which host is busy right now.
+func (d *Dispatcher) enterTurn(runtime string) func() {
+	if runtime == "" {
+		return func() {}
+	}
+	d.loadMu.Lock()
+	d.inFlight[runtime]++
+	d.loadMu.Unlock()
+	return func() {
+		d.loadMu.Lock()
+		d.inFlight[runtime]--
+		if d.inFlight[runtime] <= 0 {
+			delete(d.inFlight, runtime)
+		}
+		d.loadMu.Unlock()
+	}
+}
+
+// inFlightFor reports how many turns are running on a runtime right now.
+func (d *Dispatcher) inFlightFor(runtime string) int {
+	d.loadMu.Lock()
+	defer d.loadMu.Unlock()
+	return d.inFlight[runtime]
+}
+
+// inFlightSnapshot copies the counters for /healthz.
+func (d *Dispatcher) inFlightSnapshot() map[string]int {
+	d.loadMu.Lock()
+	defer d.loadMu.Unlock()
+	out := make(map[string]int, len(d.inFlight))
+	for name, count := range d.inFlight {
+		out[name] = count
+	}
+	return out
 }
 
 func (d *Dispatcher) handle(ctx context.Context, rec *store.Record) {
@@ -261,7 +307,7 @@ func (d *Dispatcher) handle(ctx context.Context, rec *store.Record) {
 
 	// The runtime is chosen once, before the workspace exists: a task is bound to
 	// the host that prepares its worktree, and it stays there.
-	binding, err := d.pickRuntime(ctx, task)
+	binding, err := d.pickRuntime(ctx, task, match.Entry)
 	if err != nil {
 		d.ignored.Add(1)
 		d.log.Warn("no runtime can serve this delivery; it is ignored",
@@ -467,6 +513,8 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 	if model == "" {
 		model = binding.modelFor(agent)
 	}
+
+	defer d.enterTurn(binding.Name)()
 
 	runner := opencode.NewRunner(binding.Client, arbiter, d.log)
 	runner.FirstResponse = d.opts.FirstResponse
