@@ -1,13 +1,13 @@
 # ADR 0002 — Data-plane runtime installation and enrollment
 
 **Status:** Proposed, partially implemented. The five decisions below were approved
-in review on 2026-09-22. **Migration steps 1–4 are implemented** — the capability
+in review on 2026-09-22. **Migration steps 1–5 are implemented** — the capability
 report, the embedded artifacts, the manifest with drift refusal, `uninstall`, the
-runtime inventory with its states, the admin API, enrolment, and `doctor --push`
-(the heartbeat that keeps the control plane's view of a worker current). Step 5,
-the service-side activation smoke turn, is not started. Five refinements were made
-while implementing them, recorded here because the body above still reads as the
-original sketch:
+runtime inventory with its states, the admin API, enrolment, `doctor --push` (the
+heartbeat that keeps the control plane's view of a worker current), and the
+activation check that refuses a host which answers but cannot run the work. Six
+refinements were made while implementing them, recorded here because the body above
+still reads as the original sketch:
 
 * The manifest lives in FlowHub's own configuration directory
   (`<config-root>/../flowhub/manifest.json`) rather than beside the artifacts: the
@@ -42,6 +42,21 @@ original sketch:
   to mean "a host that was verified fit", otherwise the inventory would advertise a
   worker whose credential expired. This also settles open question 2 below — the
   routine check reports and pushes, and only `init` writes files.
+* **Activation verifies the agent and its model, not only liveness.** Step 5 asked
+  for an activation *smoke turn*; what it is for is catching "the host answers but
+  cannot do the work", and that does not need a paid turn or a mutated session. The
+  service now reads the server's agent registry (`GET /agent`) and refuses to
+  activate when the profile the host claimed is not in it — opencode accepts a
+  session for an agent it does not have and silently falls back to its own default
+  agent, which drops the profile's step budget and permission block. It also
+  requires the model the host reported to be one that server offers, which is the
+  remote counterpart of the local model check. The server's *cached* model being
+  older than the reported one is a warning, not a refusal: the dispatcher pins the
+  reported model, so the turn is correct either way, and the warning tells the
+  operator to restart the agent server. On 2026-09-25 that warning fired on this
+  development host, naming `server_model=deepseek/deepseek-v4-flash` against
+  `reported_model=deepseek/deepseek-flash` — the failure that had cost a task when
+  nothing checked it.
 **Revision:** 1
 **Date:** 2026-09-22
 **Depends on:** [ADR 0001](./0001-pluggable-sources-and-runtimes.md) — it settles
@@ -165,9 +180,12 @@ admin API must return real errors and refusals.
    rather than from memory.
 2. **`flowhub runtime init --server … --token … --agent opencode`** on the worker.
    It verifies locally, installs, reports, then registers (§ below).
-3. **The service probes `--advertise`** (`/global/health`, version compatibility)
-   and refuses to activate a host it cannot reach or whose agent is too old. The
-   refusal is returned to `init`, which prints it.
+3. **The service probes `--advertise`** and refuses to activate a host it cannot
+   use. It asks `/global/health` for liveness and version, `/agent` for the profile
+   the host claims (a host without it would run every turn under the agent server's
+   own default agent), and `/provider` for the model the host reported (a model the
+   server no longer offers would kill the first turn). The refusal is returned to
+   `init`, which prints it, and the pending entry keeps the reason.
 4. **The worker keeps a long-lived secret** for heartbeat and re-registration; the
    service stores only its hash.
 5. **Revocation** is `DELETE`. A revoked host's next heartbeat gets a refusal that
@@ -296,7 +314,7 @@ staticcheck test test-race smoke` green.
 | 2 | Embedded artifacts, manifest, drift refusal, `--force`, `uninstall` | Re-running `init` is a no-op; a hand-edited artifact is refused with a diff; `uninstall` restores the pre-`init` file set exactly |
 | 3 | `runtimes.json` with states, the admin listener and token, `invite`/`list`/`show`/`remove`, and hot application to the dispatcher | Invite then register a host; the inventory shows `pending` then `active`; removing a runtime with a bound task is refused without `force`; the change takes effect without restarting the service |
 | 4 | Capability checks wired into `init` (forges, auth, clone, dry-run push) and `doctor --push` | A host missing `tea`, or with a read-only clone, is refused with a message naming the gap; an expired credential is caught by `doctor`, not by the first task |
-| 5 | Optional activation smoke turn on the service side | A host whose opencode answers but whose agent is missing fails activation with that reason |
+| 5 | Activation check on the service side: a host whose agent server answers but lacks the claimed agent profile or the claimed model is refused | Verified: a claim for an agent the server does not have, and a claim for a dropped model, both fail activation with that reason |
 
 Steps 1–3 were verified live on this host against the `TEST` project: an invite
 produced a `pending` entry, `init --server … --name … --token … --advertise …`
@@ -313,6 +331,14 @@ the dispatcher without a restart, and the next turn logged and used
 repository with no `tea` on PATH failed with "git.yusiwen.cn needs the tea
 command-line tool, which is not on PATH" and exit 2, and that failing report was
 **not** pushed, leaving `last_seen` untouched.
+
+Step 5's criterion was verified against the live control plane: a claim naming an
+agent profile the server does not have was refused with `the host answers but has
+no agent named "ghost"`, and a claim naming a model the provider dropped was
+refused with `does not offer model deepseek/dropped: provider deepseek offers
+deepseek-flash, deepseek-v4-pro` — both `403`, both naming the gap, and neither
+activated. The real enrolment then succeeded and the log carried the stale-registry
+warning quoted above.
 
 ## Open questions
 

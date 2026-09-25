@@ -194,10 +194,19 @@ flowhub runtime init --server http://gateway.lan:8081 --name builder-a \
 The host keeps the returned secret in `<config-root>/../flowhub/runtime.json`
 (mode `0600`); the service stores only its SHA-256. `--advertise` is what the
 service probes, so a NAT or firewall mistake fails at enrolment rather than at the
-first task. The claim carries the models the installed profiles pin, and the
-dispatcher pins that model on every turn: the agent server resolves an agent name
-against a list it cached when it started, so without pinning a repaired profile
-would be verified by the check and ignored by the turn.
+first task. The probe is more than a health check: it also requires the agent
+profile the host claimed to exist on **that** server, and the model the host
+reported to be one the server offers. opencode accepts a session for an agent it
+does not have and silently falls back to its own default agent, so without that
+check a host could enrol and then run every turn with the wrong step budget and
+permission block. A server whose *cached* agent is older than the reported one is a
+warning rather than a refusal — the dispatcher pins the reported model, so the turn
+is correct either way, and the warning says to restart the agent server.
+
+The claim carries the models the installed profiles pin, and the dispatcher pins
+that model on every turn: the agent server resolves an agent name against a list it
+cached when it started, so without pinning a repaired profile would be verified by
+the check and ignored by the turn.
 
 **A task is bound to the runtime that prepared its worktree, for life.** Removing a
 runtime refuses while non-terminal tasks are bound to it (`--force` overrides, and
@@ -867,9 +876,8 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 Siwen Yu.
   the project table; a pinned base commit per task) and
   [`docs/adr/0002-data-plane-runtime-installation.md`](./docs/adr/0002-data-plane-runtime-installation.md)
   (`flowhub runtime init` / `invite`, the admin API, the artifact manifest).
-  ADR 0002 steps 1–4 are implemented (`init` / `--check` / `doctor --push`,
-  `invite`, the admin API, the artifact manifest); step 5, a service-side
-  activation smoke turn, is not. The per-project runtime list and the `spread` /
-  `first-healthy` policy of ADR 0001 step 5 are also not — today the dispatcher
-  takes the first healthy runtime in name order for a new task, and a task that is
-  already bound stays where it is.
+  ADR 0002 steps 1–5 are implemented (`init` / `--check` / `doctor --push`,
+  `invite`, the admin API, the artifact manifest, the activation check); the
+  per-project runtime list and the `spread` / `first-healthy` policy of ADR 0001
+  step 5 are not — today the dispatcher takes the first healthy runtime in name
+  order for a new task, and a task that is already bound stays where it is.

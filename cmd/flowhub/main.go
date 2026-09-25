@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -313,23 +314,86 @@ func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher) webhook.
 	return opts
 }
 
-// opencodeProber checks that the control plane can reach a host before activating
-// it. It is the same health endpoint the dispatcher uses for liveness, so an
-// enrolment cannot succeed against a host the dispatcher could not use.
-type opencodeProber struct{ timeout time.Duration }
+// opencodeProber decides whether a host that just claimed a name is usable.
+//
+// Answering /global/health is not enough. opencode accepts a session for an agent
+// it does not have and falls back to its own default — a looser agent with a
+// different step budget and permission block — so activation also requires the
+// profile the host claimed to exist on *that* server, and the model the host
+// reported to be one the server offers. Those are the checks `init --check` runs
+// locally, repeated from the side that will actually send the turns.
+type opencodeProber struct {
+	timeout time.Duration
+	log     *slog.Logger
+}
 
-func (p opencodeProber) Probe(ctx context.Context, advertiseURL string) error {
+func (p opencodeProber) Probe(ctx context.Context, claim runtimes.Claim) error {
 	timeout := p.timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	client := opencode.New(opencode.Options{BaseURL: advertiseURL, Timeout: timeout})
+	client := opencode.New(opencode.Options{BaseURL: claim.Advertise, Timeout: timeout})
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
 	if _, err := client.Health(probeCtx); err != nil {
 		return err
 	}
+
+	profile := strings.TrimSpace(claim.AgentProfile)
+	if profile == "" {
+		// A host that claims no profile is judged by liveness alone: there is nothing
+		// to compare against the server.
+		return nil
+	}
+	agents, err := client.Agents(probeCtx)
+	if err != nil {
+		return fmt.Errorf("the host answered but its agent list could not be read: %w", err)
+	}
+	var claimed *opencode.AgentInfo
+	for index := range agents {
+		if agents[index].Name == profile {
+			claimed = &agents[index]
+			break
+		}
+	}
+	if claimed == nil {
+		return fmt.Errorf("the host answers but has no agent named %q, so every turn would run under the server's default agent instead; install the agent files there (`flowhub runtime init`) and restart its agent server", profile)
+	}
+
+	model := strings.TrimSpace(claim.Models[profile])
+	if model == "" {
+		return nil
+	}
+	provider, id, ok := opencode.SplitModel(model)
+	if !ok {
+		return fmt.Errorf("the host reported model %q for agent %s, which is not spelled provider/model", model, profile)
+	}
+	catalogue, err := client.Catalogue(probeCtx)
+	if err != nil {
+		return fmt.Errorf("the host answered but its model catalogue could not be read: %w", err)
+	}
+	if !slices.Contains(catalogue[provider], id) {
+		return fmt.Errorf("this host's agent server does not offer model %s: provider %s offers %s",
+			model, provider, orNone(catalogue[provider]))
+	}
+	if effective := claimed.ModelString(); effective != "" && effective != model && p.log != nil {
+		// Not fatal — the dispatcher pins the model the host reported, so the turn
+		// uses the repaired one — but the server is answering from a registry it built
+		// before the profile was installed, and that is worth saying out loud.
+		p.log.Warn("the agent server still reports an older model for this agent; restart it to pick the profile up",
+			"runtime", claim.Name, "agent", profile, "server_model", effective, "reported_model", model)
+	}
 	return nil
+}
+
+// orNone renders a list for an error message, so an unknown provider does not
+// produce a trailing "offers: ".
+func orNone(values []string) string {
+	if len(values) == 0 {
+		return "none"
+	}
+	return strings.Join(values, ", ")
 }
 
 // startControlAPI starts the control listener, or returns (nil, nil) when it is
@@ -347,7 +411,7 @@ func startControlAPI(ctx context.Context, cfg config.Config, inventory *runtimes
 	control := &runtimes.Server{
 		Inventory:  inventory,
 		AdminToken: cfg.AdminToken,
-		Prober:     opencodeProber{timeout: 5 * time.Second},
+		Prober:     opencodeProber{timeout: 5 * time.Second, log: logger},
 		BoundTasks: boundTasks,
 		Log:        logger,
 	}

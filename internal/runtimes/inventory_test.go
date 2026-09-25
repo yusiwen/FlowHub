@@ -19,14 +19,17 @@ import (
 
 var fixedNow = time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
 
-// probeOK accepts any address; probeFail refuses with a message.
-type probeOK struct{ calls int }
+// probeOK accepts any host; probeFail refuses with a message.
+type probeOK struct {
+	calls int
+	last  Claim
+}
 
-func (p *probeOK) Probe(context.Context, string) error { p.calls++; return nil }
+func (p *probeOK) Probe(_ context.Context, claim Claim) error { p.calls++; p.last = claim; return nil }
 
 type probeFail struct{ err error }
 
-func (p *probeFail) Probe(context.Context, string) error { return p.err }
+func (p *probeFail) Probe(context.Context, Claim) error { return p.err }
 
 func newInventory(t *testing.T) *Inventory {
 	t.Helper()
@@ -44,6 +47,7 @@ func validClaim() Claim {
 		URL:            "https://builder-a.lan:4096",
 		Advertise:      "https://builder-a.lan:4096",
 		Agent:          "opencode",
+		AgentProfile:   "devops",
 		AgentVersion:   "1.18.31",
 		FlowHubVersion: "test",
 		Models:         map[string]string{"devops": "deepseek/deepseek-flash"},
@@ -73,6 +77,14 @@ func TestInviteThenRegisterActivates(t *testing.T) {
 	}
 	if prober.calls != 1 {
 		t.Fatalf("the host was not probed before activation (calls=%d)", prober.calls)
+	}
+	// The prober gets the whole claim, not just the address: what makes a host usable
+	// is that it answers with the agent profile and the model the host says it runs.
+	if prober.last.AgentProfile != "devops" || prober.last.Advertise != "https://builder-a.lan:4096" {
+		t.Fatalf("the prober did not receive the claim: %+v", prober.last)
+	}
+	if prober.last.Models["devops"] != "deepseek/deepseek-flash" {
+		t.Fatalf("the prober did not receive the reported models: %+v", prober.last.Models)
 	}
 	if runtime.State != StateActive || secret == "" {
 		t.Fatalf("runtime = %+v secret=%q", runtime, secret)

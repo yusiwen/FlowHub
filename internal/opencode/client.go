@@ -83,6 +83,18 @@ func (c *Client) Health(ctx context.Context) (Health, error) {
 	return health, err
 }
 
+// Agents lists the agents a server resolves names against.
+//
+// The list is what makes "the host answers, but does it have the agent?" a
+// question with an answer. It is also built once per server *process*, which is
+// why an agent file repaired on disk keeps answering with its old settings — the
+// model included — until the server restarts.
+func (c *Client) Agents(ctx context.Context) ([]AgentInfo, error) {
+	var agents []AgentInfo
+	err := c.do(ctx, http.MethodGet, "/agent", nil, nil, &agents)
+	return agents, err
+}
+
 // CreateSession binds a new session to directory. The session-level ruleset in
 // req.Permission is the first line of defence: it overrides the project and
 // global configuration, and a "deny" on a wildcard pattern removes the tool

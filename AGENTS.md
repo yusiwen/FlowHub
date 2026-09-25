@@ -88,7 +88,7 @@ Nix flakes in a git repository only see files in the git index. New files must b
 ## Project Structure
 
 ```
-cmd/flowhub/        CLI entry: wiring, flags, HTTP server, /healthz, shutdown
+cmd/flowhub/        CLI entry: wiring, flags, HTTP server, /healthz, shutdown, activation prober
 internal/config/    Environment parsing, validation, masked reporting
 internal/logging/   Application logger: stderr tee + size-rotated log file
 internal/webhook/   Lenient payload model, payload schema report, delivery pipeline
@@ -266,7 +266,10 @@ documents. The rules below are load-bearing; do not relax them casually.
    `doctor --push` keeps that report current under the runtime secret, and it
    pushes only a report that passed: `last_seen` means "a host that was verified
    fit", so an expired credential surfaces while the operator is looking instead of
-   at the first task.
+   at the first task. Activation checks more than liveness too: the profile the
+   host claimed must exist on the advertised server (otherwise every turn runs
+   under that server's default agent) and the model it reported must be one the
+   server offers.
 
 ## Before you finish a change
 

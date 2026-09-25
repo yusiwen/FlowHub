@@ -25,9 +25,14 @@ import (
 	"time"
 )
 
-// Prober proves that the control plane can reach a host before activating it.
+// Prober decides whether a host that just claimed a name is usable.
+//
+// It takes the whole claim, not just the address: what makes a host usable is not
+// only that something answers there, but that it answers with the agent profile
+// and the model the claim says it runs. A host that answers with neither would
+// accept every turn and run it under the agent server's own defaults.
 type Prober interface {
-	Probe(ctx context.Context, advertiseURL string) error
+	Probe(ctx context.Context, claim Claim) error
 }
 
 // State is where a runtime is in its life.
@@ -304,12 +309,14 @@ func (i *Inventory) Register(ctx context.Context, claim Claim, inviteToken strin
 	runtime.RegisteredAt = now.UTC()
 
 	if prober != nil {
-		if err := prober.Probe(ctx, claim.Advertise); err != nil {
-			runtime.Note = fmt.Sprintf("registered but not reachable at %s: %v", claim.Advertise, err)
+		if err := prober.Probe(ctx, claim); err != nil {
+			// The entry stays pending with the reason recorded, so the next invite
+			// can fix the host and claim the name again.
+			runtime.Note = fmt.Sprintf("registered but not usable at %s: %v", claim.Advertise, err)
 			if saveErr := i.save(); saveErr != nil {
 				return Runtime{}, "", saveErr
 			}
-			return runtime.Redacted(), "", fmt.Errorf("cannot reach %s: %w", claim.Advertise, err)
+			return runtime.Redacted(), "", fmt.Errorf("cannot activate %s: %w", claim.Advertise, err)
 		}
 	}
 

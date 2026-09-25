@@ -49,9 +49,29 @@ type PermissionRule struct {
 }
 
 // ModelRef is the prompt-level model reference (note modelID).
+//
+// GET /agent uses the same spelling, so one type covers both: the registry entry
+// carries the model the server would use if a caller does not pin one.
 type ModelRef struct {
 	ProviderID string `json:"providerID"`
 	ModelID    string `json:"modelID"`
+}
+
+// AgentInfo is one entry of GET /agent.
+type AgentInfo struct {
+	Name   string    `json:"name"`
+	Mode   string    `json:"mode"`
+	Hidden bool      `json:"hidden"`
+	Model  *ModelRef `json:"model,omitempty"`
+}
+
+// ModelString renders the agent's model as "provider/model-id", or "" when the
+// server let the agent inherit one.
+func (a AgentInfo) ModelString() string {
+	if a.Model == nil || a.Model.ProviderID == "" || a.Model.ModelID == "" {
+		return ""
+	}
+	return a.Model.ProviderID + "/" + a.Model.ModelID
 }
 
 // TextPart is a prompt part carrying text.
