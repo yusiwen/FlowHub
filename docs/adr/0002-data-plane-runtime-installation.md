@@ -1,11 +1,11 @@
 # ADR 0002 — Data-plane runtime installation and enrollment
 
 **Status:** Proposed, partially implemented. The five decisions below were approved
-in review on 2026-09-22. **Migration steps 1 and 2 are implemented** — the
-capability report, the embedded artifacts, the manifest with drift refusal, and
-`uninstall`; steps 3–5 are not started, so `init` installs and reports but does not
-enroll. Two small refinements were made while implementing them, recorded here
-because the body above still reads as the original sketch:
+in review on 2026-09-22. **Migration steps 1, 2 and 3 are implemented** — the
+capability report, the embedded artifacts, the manifest with drift refusal,
+`uninstall`, the runtime inventory with its states, the admin API, and enrolment.
+Steps 4–5 are not started. Four refinements were made while implementing them,
+recorded here because the body above still reads as the original sketch:
 
 * The manifest lives in FlowHub's own configuration directory
   (`<config-root>/../flowhub/manifest.json`) rather than beside the artifacts: the
@@ -15,6 +15,25 @@ because the body above still reads as the original sketch:
   missing, but a missing forge tool or an unreadable clone only sets the exit
   status to "not ready" — the operator fixes that while the files are already in
   place, and a re-run of the install is a no-op.
+* **The host reports the model each installed agent profile pins, and the
+  dispatcher pins that model on every turn.** The capability check verifies the
+  model against the agent server's catalogue, but the server resolves an agent
+  *name* against a list it cached when it started: on 2026-09-25, a profile
+  repaired from `deepseek/deepseek-v4-flash` to `deepseek/deepseek-flash` was
+  reported as available by `init --check` while every turn still died with
+  `ProviderModelNotFoundError`, because the running server kept answering with the
+  id it had cached. The reported model now travels with the claim (`runtimes.json`
+  → `models`), the dispatcher passes it to the session, and the turn log records
+  it, so what the check verified is what the turn runs. A routing entry that names
+  a model still overrides it, and a runtime enrolled before this change keeps the
+  old behaviour (the agent server's own default). Known gap until step 4: the
+  reported models are only refreshed at enrolment, so a host that repairs a profile
+  and re-runs `init` without re-enrolling keeps the model its claim carried —
+  `doctor --push` is where that refresh belongs.
+* **A capability report names the configuration directory it actually read.** With
+  `--config-root` the agent's files live somewhere else, and the report used to
+  print the default `~/.config/opencode` anyway — sending the operator to inspect a
+  profile this host does not run, while the model check read the real one.
 **Revision:** 1
 **Date:** 2026-09-22
 **Depends on:** [ADR 0001](./0001-pluggable-sources-and-runtimes.md) — it settles
@@ -271,6 +290,14 @@ staticcheck test test-race smoke` green.
 | 4 | Capability checks wired into `init` (forges, auth, clone, dry-run push) and `doctor --push` | A host missing `tea`, or with a read-only clone, is refused with a message naming the gap; an expired credential is caught by `doctor`, not by the first task |
 | 5 | Optional activation smoke turn on the service side | A host whose opencode answers but whose agent is missing fails activation with that reason |
 
+Steps 1–3 were verified live on this host against the `TEST` project: an invite
+produced a `pending` entry, `init --server … --name … --token … --advertise …`
+produced `active` after the service probed the advertised address, the inventory
+survived a restart, `remove` refused while a task was bound (naming the task) and
+`--force` left it to be refused one by one, the removal took effect in the running
+process, and a delivery for the newly created issue ran a real turn that finished
+in 20 s and posted its reply on the issue.
+
 ## Open questions
 
 1. **Admin token provisioning.** Environment only, or also generated on first start
@@ -288,3 +315,18 @@ staticcheck test test-race smoke` green.
    itself with a new invite when its secret is lost? Recommendation: admin-initiated
    `rotate`, plus re-invite for a lost secret, so a compromised worker cannot mint
    itself new credentials.
+5. **What should happen when the agent server fails a prompt immediately?** A turn
+   whose provider rejects the prompt dies on the server within milliseconds, but
+   the session never produces an assistant message, so the runner sees an idle
+   session with nothing to show and only gives up at `FLOWHUB_TASK_DEADLINE`
+   (measured 2026-09-25: an 11-minute wait on a turn that had already failed). The
+   poll loop needs a "no assistant message yet and the session is not busy" bound,
+   and the opencode-side error has to reach the audit line instead of the server's
+   own log. Recommendation: fail the turn after a short first-response bound, with
+   the reason naming the agent server.
+6. **Is re-inviting a `revoked` name a re-enrolment, or a mistake?** Today `invite`
+   replaces a revoked entry, so an explicit admin action revives the name; the
+   `revoked` state otherwise only reserves it. That is probably what an operator
+   wants after a host is rebuilt, but the body above calls `revoked` terminal.
+   Recommendation: keep the behaviour and say so in the body, since the invite is
+   itself the authorisation decision.

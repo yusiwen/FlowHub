@@ -54,6 +54,16 @@ const (
 	DefaultTrigger       = "/opencode start"
 	DefaultStartState    = "In Progress"
 
+	// DefaultAdminAddr is the control API listener. It is not started unless
+	// the address is set: an always-on control surface would either be
+	// unauthenticated or break every existing deployment, and the default posture
+	// of this process is to expose no control surface at all.
+	DefaultAdminAddr = ""
+
+	// DefaultRuntimesName is the runtime inventory, which lives with the audit
+	// trail and the task registry because it is control-plane state.
+	DefaultRuntimesName = "runtimes.json"
+
 	// DefaultRegistryName and DefaultPauseName live inside DataDir. The pause
 	// file is the kill switch: touching it stops dispatch without an API, a
 	// restart or a credential, which is the only kind of switch that works
@@ -199,6 +209,20 @@ type Config struct {
 	// do not declare one. Entries normally declare their own, because the base
 	// has to sit outside the repository it belongs to.
 	WorktreeBase string
+
+	// AdminAddr is the control API listen address. Empty means no control API,
+	// which is the default: `flowhub runtime invite` and enrolment need it, and
+	// nothing else does.
+	AdminAddr string
+
+	// AdminToken authenticates every control API call. It is required whenever
+	// AdminAddr is set — an unauthenticated control surface is the worst outcome,
+	// the same rule the entry locks follow.
+	AdminToken string
+
+	// RuntimesFile is the runtime inventory. Empty resolves to
+	// <DataDir>/runtimes.json.
+	RuntimesFile string
 }
 
 // Load reads the configuration from the environment and validates it.
@@ -254,6 +278,9 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("FLOWHUB_ALLOWED_SOURCES: %w", err)
 	}
 
+	cfg.AdminAddr = env("FLOWHUB_ADMIN_ADDR", DefaultAdminAddr)
+	cfg.AdminToken = os.Getenv("FLOWHUB_ADMIN_TOKEN")
+	cfg.RuntimesFile = env("FLOWHUB_RUNTIMES_FILE", "")
 	cfg.OpenCodeURL = env("FLOWHUB_OPENCODE_URL", DefaultOpenCodeURL)
 	cfg.DispatchAgent = env("FLOWHUB_DISPATCH_AGENT", DefaultDispatchAgent)
 	cfg.Trigger = env("FLOWHUB_TRIGGER", DefaultTrigger)
@@ -390,6 +417,15 @@ func (c Config) validate() error {
 	if c.TaskMaxCost < 0 {
 		return fmt.Errorf("FLOWHUB_TASK_MAX_COST must not be negative, got %v", c.TaskMaxCost)
 	}
+	if c.AdminAddr != "" {
+		if _, _, err := net.SplitHostPort(c.AdminAddr); err != nil {
+			return fmt.Errorf("FLOWHUB_ADMIN_ADDR %q: %w", c.AdminAddr, err)
+		}
+		if c.AdminToken == "" {
+			// Fail closed rather than start an unauthenticated control surface.
+			return fmt.Errorf("FLOWHUB_ADMIN_ADDR is set but FLOWHUB_ADMIN_TOKEN is empty: the control API refuses to run unauthenticated")
+		}
+	}
 	// The URL is checked even when dispatch is off, because a typo in the
 	// environment is a mistake either way and startup is the only cheap place
 	// to catch it.
@@ -438,6 +474,9 @@ func (c Config) Warnings() []string {
 	if c.ReplayWindow == 0 {
 		warns = append(warns, "FLOWHUB_REPLAY_WINDOW=0: replay window is DISABLED")
 	}
+	if c.ControlAPIEnabled() && c.AdminToken == "" {
+		warns = append(warns, "FLOWHUB_ADMIN_ADDR is set with no FLOWHUB_ADMIN_TOKEN: the control API will refuse to start")
+	}
 	if c.ListensOnAllInterfaces() {
 		if c.AllowWildcardListen {
 			warns = append(warns, fmt.Sprintf("FLOWHUB_ALLOW_WILDCARD_LISTEN=1: FLOWHUB_ADDR %s listens on every interface; make sure only the container/pod network can reach the port", c.Addr))
@@ -456,6 +495,11 @@ func (c Config) Warnings() []string {
 // validate (Load fails); this is the semantic/security gate.
 func (c Config) Problems() []string {
 	var problems []string
+	if c.ControlAPIListensOnAllInterfaces() && !c.AllowWildcardListen {
+		problems = append(problems, fmt.Sprintf(
+			"FLOWHUB_ADMIN_ADDR %s listens on every interface: the control API can invite, remove and rotate runtimes, so bind it to loopback or the WireGuard address (or acknowledge a wildcard with FLOWHUB_ALLOW_WILDCARD_LISTEN=1 if a container genuinely requires it)",
+			c.AdminAddr))
+	}
 	if c.ListensOnAllInterfaces() && !c.AllowWildcardListen {
 		problems = append(problems, fmt.Sprintf(
 			"FLOWHUB_ADDR %s listens on every interface, which exposes the receiver on whatever network the host is attached to (LAN, Wi-Fi) instead of only the intended path: bind a specific address (the WireGuard address, the LAN address a router forwards to, or 127.0.0.1 behind a reverse proxy), or set FLOWHUB_ALLOW_WILDCARD_LISTEN=1 if a wildcard bind is genuinely required (for example inside a container)",
@@ -556,6 +600,35 @@ func (c Config) ResolvedRegistryFile() string {
 	return filepath.Join(c.DataDir, DefaultRegistryName)
 }
 
+// ControlAPIEnabled reports whether the control API should be started.
+func (c Config) ControlAPIEnabled() bool { return c.AdminAddr != "" }
+
+// ControlAPIListensOnAllInterfaces reports whether the control API would be
+// reachable from every network the host is attached to.
+func (c Config) ControlAPIListensOnAllInterfaces() bool {
+	if c.AdminAddr == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(c.AdminAddr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
+}
+
+// ResolvedRuntimesFile returns the runtime inventory path. An unset
+// FLOWHUB_RUNTIMES_FILE defaults to <DataDir>/runtimes.json.
+func (c Config) ResolvedRuntimesFile() string {
+	if c.RuntimesFile != "" {
+		return c.RuntimesFile
+	}
+	return filepath.Join(c.DataDir, DefaultRuntimesName)
+}
+
 // ResolvedPauseFile returns the dispatcher kill switch. An unset
 // FLOWHUB_PAUSE_FILE defaults to <DataDir>/DISPATCH_OFF.
 func (c Config) ResolvedPauseFile() string {
@@ -604,6 +677,8 @@ func (c Config) Report() string {
 	fmt.Fprintf(&b, "skip_analyze_on_create: %t\n", c.SkipAnalyzeOnCreate)
 	fmt.Fprintf(&b, "registry_file:      %s\n", c.ResolvedRegistryFile())
 	fmt.Fprintf(&b, "pause_file:         %s (touch it to pause dispatch)\n", c.ResolvedPauseFile())
+	fmt.Fprintf(&b, "control_api:        %s\n", controlAPIReport(c))
+	fmt.Fprintf(&b, "runtimes_file:      %s\n", c.ResolvedRuntimesFile())
 	worktreeBase := c.WorktreeBase
 	if worktreeBase == "" {
 		worktreeBase = "<none: every routing entry must declare worktrees>"
@@ -625,6 +700,14 @@ func orNone(s string) string {
 		return "<none>"
 	}
 	return s
+}
+
+// controlAPIReport describes the control API without printing its token.
+func controlAPIReport(c Config) string {
+	if c.AdminAddr == "" {
+		return "disabled (set FLOWHUB_ADMIN_ADDR to manage runtimes)"
+	}
+	return fmt.Sprintf("%s (admin_token %s)", c.AdminAddr, MaskSecret(c.AdminToken))
 }
 
 // formatCost renders the cost budget so that "disabled" is visible instead of

@@ -5,8 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/yusiwen/flowhub/internal/opencode"
+	"github.com/yusiwen/flowhub/internal/runtimes"
 )
 
 // Version is the build's version string. The CLI entry point sets it so the
@@ -48,9 +52,18 @@ func runtimeCommand(args []string, stdout, stderr io.Writer) int {
 		return initCommand(args[1:], stdout, stderr)
 	case "uninstall":
 		return uninstallCommand(args[1:], stdout, stderr)
-	case "doctor", "invite", "list", "show", "remove", "reconfigure", "rotate":
+	case "invite", "list", "show", "remove", "rotate":
+		// These run on the service host and talk to the running service over its
+		// admin listener. They live in the runtimes package because they own the
+		// control-plane client, but the subcommand router stays here so `flowhub
+		// runtime …` is one surface.
+		if code := runtimes.CLI(args[0], args[1:], stdout, stderr, os.Getenv); code != runtimes.ExitOK {
+			return code
+		}
+		return ExitOK
+	case "doctor", "reconfigure":
 		fmt.Fprintf(stderr, "flowhub runtime %s: not implemented in this build\n", args[0])
-		fmt.Fprintln(stderr, "this build implements `flowhub runtime init --check` (see docs/adr/0002).")
+		fmt.Fprintln(stderr, "this build implements init, uninstall and the control-plane commands (see docs/adr/0002).")
 		return ExitUsage
 	case "-h", "--help", "help":
 		usage(stdout)
@@ -73,6 +86,13 @@ func usage(w io.Writer) {
       --config-root <dir>     agent configuration directory (default ~/.config/<agent>)
       --force                 overwrite a file FlowHub did not write, or that a
                               human edited after FlowHub wrote it
+      --opencode-url <url>    this host's agent server, whose model catalogue is
+                              checked (default http://127.0.0.1:4096)
+      --server <url>          control plane to register with
+      --token <token>         invite token from 'flowhub runtime invite'
+      --name <name>           the runtime name the control plane invited
+      --advertise <url>       how the control plane reaches this host (probed before
+                              it is activated, so a NAT mistake fails here)
       --repo <remote>[=<clone>]
                               a repository this host must serve; repeatable. The
                               clone path enables the write check (git push --dry-run)
@@ -98,12 +118,17 @@ func usage(w io.Writer) {
 // initOptions is the parsed form of `runtime init`.
 type initOptions struct {
 	Options
-	check      bool
-	json       bool
-	force      bool
-	configRoot string
-	version    string
-	timeout    time.Duration
+	check       bool
+	json        bool
+	force       bool
+	configRoot  string
+	version     string
+	timeout     time.Duration
+	server      string
+	token       string
+	advertise   string
+	name        string
+	openCodeURL string
 }
 
 func initCommand(args []string, stdout, stderr io.Writer) int {
@@ -113,29 +138,12 @@ func initCommand(args []string, stdout, stderr io.Writer) int {
 	}
 
 	runner := ExecRunner{Timeout: parsed.timeout}
-	report, err := Check(context.Background(), runner, parsed.Options)
-	if err != nil {
-		fmt.Fprintf(stderr, "flowhub runtime init: %v\n", err)
-		return ExitUsage
-	}
-
-	// Under --json, stdout carries only the JSON document, so everything written
-	// for a human goes to stderr. A report that has to be parsed must not have a
-	// file listing glued in front of it.
-	human := stdout
-	if parsed.json {
-		human = stderr
-	}
-
-	// The agent has to exist before anything can be installed into its tree. The
-	// other gaps are reported and gated on the exit status without blocking the
-	// installation: a missing forge tool is something an operator fixes while the
-	// files are already in place, and a re-run is a no-op.
-	if report.Agent == nil || report.Agent.Path == "" {
-		printCheck(report, parsed.json, stdout, stderr)
-		fmt.Fprintln(stderr, "flowhub runtime init: nothing was installed because the agent runtime is missing")
-		return ExitNotReady
-	}
+	parsed.OpenCodeURL = parsed.openCodeURL
+	// Without --config-root the effective root is the agent's own directory, and the
+	// model check has to look at the profile the server will load — not merely at
+	// what this binary would install.
+	parsed.ConfigRoot = ConfigRootFor(runner, InstallOptions{Agent: parsed.Agent, ConfigRoot: parsed.configRoot})
+	parsed.Catalogue = catalogueFor(parsed.openCodeURL)
 
 	install := InstallOptions{
 		Agent:          parsed.Agent,
@@ -144,12 +152,49 @@ func initCommand(args []string, stdout, stderr io.Writer) int {
 		Force:          parsed.force,
 	}
 
+	// Under --json, stdout carries only the JSON document, so everything written
+	// for a human goes to stderr.
+	human := stdout
+	if parsed.json {
+		human = stderr
+	}
+
+	var outcome *InstallReport
+	if !parsed.check {
+		// The one thing that has to be true before writing anything is that there is
+		// an agent to write for. Everything else is reported and gated on the exit
+		// status: a missing forge tool is fixed while the files are already in place,
+		// and re-running the install is a no-op.
+		if _, found := runner.Lookup(parsed.Agent); !found {
+			report, err := Check(context.Background(), runner, parsed.Options)
+			if err != nil {
+				fmt.Fprintf(stderr, "flowhub runtime init: %v\n", err)
+				return ExitUsage
+			}
+			printCheck(report, parsed.json, stdout, stderr)
+			fmt.Fprintln(stderr, "flowhub runtime init: nothing was installed because the agent runtime is missing")
+			return ExitNotReady
+		}
+		outcome, err = Install(runner, install)
+		if err != nil {
+			fmt.Fprintf(stderr, "flowhub runtime init: %v\n", err)
+			return ExitUsage
+		}
+	}
+
+	// The report is generated *after* the install so it describes the host as it now
+	// is. Reporting the pre-install state told an operator who had just repaired a
+	// profile that the profile was still broken, and exited non-zero after a
+	// successful repair.
+	report, err := Check(context.Background(), runner, parsed.Options)
+	if err != nil {
+		fmt.Fprintf(stderr, "flowhub runtime init: %v\n", err)
+		return ExitUsage
+	}
 	printCheck(report, parsed.json, stdout, stderr)
 
 	refused := false
 	if parsed.check {
-		// --check reports; it must not write, so the plan is computed and rendered
-		// without applying it.
 		plan, _, err := Plan(runner, install)
 		if err != nil {
 			fmt.Fprintf(stderr, "flowhub runtime init: %v\n", err)
@@ -160,21 +205,46 @@ func initCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(human, "note: --check wrote nothing and registered nothing")
 		refused = plan.Refused()
 	} else {
-		outcome, err := Install(runner, install)
-		if err != nil {
-			fmt.Fprintf(stderr, "flowhub runtime init: %v\n", err)
-			return ExitUsage
-		}
 		fmt.Fprintf(human, "\nfiles FlowHub manages\n")
 		outcome.Text(human, "install")
-		fmt.Fprintln(human, "note: this host is not registered with a control plane yet (docs/adr/0002 step 3)")
 		refused = outcome.Refused()
+
+		// Enrolment is optional at this point: a host can be prepared before the
+		// control plane is reachable, and `init --server … --token …` finishes the
+		// job once it is.
+		switch {
+		case parsed.server == "" && parsed.token == "" && parsed.name == "":
+			fmt.Fprintln(human, "note: not registered with a control plane; pass --server, --name and --token (from the invite) to enrol")
+		case parsed.server == "" || parsed.token == "" || parsed.name == "":
+			fmt.Fprintln(stderr, "flowhub runtime init: --server, --name and --token go together; nothing was registered")
+			refused = true
+		default:
+			client := runtimes.NewClient(parsed.server, "")
+			registerCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			enrolled, err := Register(registerCtx, client, parsed.token, parsed.name, report, parsed.advertise, install)
+			cancel()
+			if err != nil {
+				fmt.Fprintf(stderr, "flowhub runtime init: registration failed: %v\n", err)
+				refused = true
+				break
+			}
+			fmt.Fprintf(human, "\nregistered as %s with %s (the secret is in %s, mode 0600)\n",
+				enrolled.Runtime.Name, parsed.server, enrolled.Stored)
+		}
 	}
 
 	if !report.OK || refused {
 		return ExitNotReady
 	}
 	return ExitOK
+}
+
+// catalogueFor builds the model-catalogue reader for a host's own agent server.
+func catalogueFor(url string) ModelCatalogue {
+	if strings.TrimSpace(url) == "" {
+		return nil
+	}
+	return opencode.New(opencode.Options{BaseURL: strings.TrimSpace(url), Timeout: catalogueTimeout})
 }
 
 // printCheck renders the capability report, in whichever form was asked for.
@@ -246,9 +316,14 @@ func parseInit(args []string, stderr io.Writer) (initOptions, error) {
 	fs.Var(&forges, "forge", "forge tooling for a git host: <host>=<github|gitea|none>; repeatable")
 	fs.Var(&requiredEnv, "require-env", "environment variable that must be present; repeatable")
 	fs.StringVar(&parsed.configRoot, "config-root", "", "agent configuration directory")
+	fs.StringVar(&parsed.server, "server", "", "control plane to register with (with --token and --name)")
+	fs.StringVar(&parsed.token, "token", "", "invite token from the control plane's invite command")
+	fs.StringVar(&parsed.name, "name", "", "the runtime name the control plane invited")
+	fs.StringVar(&parsed.advertise, "advertise", "", "how the control plane reaches this host")
 	fs.BoolVar(&parsed.force, "force", false, "overwrite files FlowHub did not write")
 	fs.BoolVar(&parsed.json, "json", false, "print the machine-readable report")
 	fs.BoolVar(&parsed.Strict, "strict", false, "treat warnings as failures")
+	fs.StringVar(&parsed.openCodeURL, "opencode-url", DefaultOpenCodeURL, "agent server whose model catalogue is checked")
 	fs.DurationVar(&parsed.timeout, "timeout", DefaultCommandTimeout, "bound a single command")
 	if err := fs.Parse(args); err != nil {
 		return initOptions{}, err
@@ -264,6 +339,10 @@ func parseInit(args []string, stderr io.Writer) (initOptions, error) {
 
 	parsed.Agent = strings.TrimSpace(agent)
 	parsed.configRoot = strings.TrimSpace(parsed.configRoot)
+	parsed.server = strings.TrimRight(strings.TrimSpace(parsed.server), "/")
+	parsed.token = strings.TrimSpace(parsed.token)
+	parsed.advertise = strings.TrimSpace(parsed.advertise)
+	parsed.name = strings.TrimSpace(parsed.name)
 	parsed.version = Version
 	parsed.Forges = map[string]string{}
 	for _, entry := range forges {

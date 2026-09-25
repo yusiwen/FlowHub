@@ -98,15 +98,32 @@ flowhub                      # run the receiver (and the dispatcher)
 flowhub -version             # print the version
 flowhub -print-config        # print the effective configuration, secrets masked
 flowhub runtime init --check # report what this host can and cannot do; writes nothing
-flowhub runtime init         # report, then install the files FlowHub manages
+flowhub runtime init         # report, install the files FlowHub manages, enrol
 flowhub runtime uninstall    # remove exactly what the manifest records
 ```
+
+On the service host, the same binary manages the runtime inventory over the
+control API — the running service is the only writer, so a change applies without
+a restart:
+
+```bash
+flowhub runtime invite builder-a --projects TEST --ttl 30m   # prints a one-time token
+flowhub runtime list                                         # state, address, agent, pinned models
+flowhub runtime show builder-a
+flowhub runtime remove builder-a [--force]                   # refuses while tasks are bound
+flowhub runtime rotate builder-a                             # re-issue the runtime secret
+```
+
+Flags may appear on either side of the positional argument (`remove builder-a
+--force` and `--force builder-a` are the same command; the flag package alone
+would silently drop the trailing form).
 
 `runtime init --check` is the first half of
 [`docs/adr/0002`](./docs/adr/0002-data-plane-runtime-installation.md): it checks
 the agent runtime, `git`, the forge command-line tools the declared repositories
 need, each clone's `origin`, read access (`git ls-remote`) and **write** access
-(`git push --dry-run`, which contacts the remote and updates nothing), plus the
+(`git push --dry-run`, which contacts the remote and updates nothing), the model
+each installed agent profile pins against the agent server's catalogue, plus the
 presence of required environment variables. It reports the identity it ran as,
 because a check that runs as the wrong user passes and then the first push fails.
 Exit status is 0 for ready, 2 for not ready, 1 for a usage mistake.
@@ -145,10 +162,38 @@ destroy. That file may hold comments and other servers, and a JSON round-trip wo
 delete both.
 
 `--config-root <dir>` installs into a throwaway tree instead of the real one, which
-is how the round trip is tested without touching an operator's configuration.
+is how the round trip is tested without touching an operator's configuration. The
+capability report names the configuration directory it *read*, so a report from an
+overridden root never points the operator at the default one.
 
-Enrollment and the runtime inventory (ADR 0002 step 3) are not implemented:
-`init` installs and reports, and says so.
+### Enrolling a host
+
+A host becomes a runtime in three steps: an operator invites the name on the
+service, the host installs and registers, and the service probes the address the
+host advertised before it activates it.
+
+```bash
+# on the service host
+flowhub runtime invite builder-a --projects TEST
+# -> prints the token and the command to run on the other machine
+
+# on the host that will run turns
+flowhub runtime init --server http://gateway.lan:8081 --name builder-a \
+  --token <one-time token> --advertise http://builder-a.lan:4096
+```
+
+The host keeps the returned secret in `<config-root>/../flowhub/runtime.json`
+(mode `0600`); the service stores only its SHA-256. `--advertise` is what the
+service probes, so a NAT or firewall mistake fails at enrolment rather than at the
+first task. The claim carries the models the installed profiles pin, and the
+dispatcher pins that model on every turn: the agent server resolves an agent name
+against a list it cached when it started, so without pinning a repaired profile
+would be verified by the check and ignored by the turn.
+
+**A task is bound to the runtime that prepared its worktree, for life.** Removing a
+runtime refuses while non-terminal tasks are bound to it (`--force` overrides, and
+those tasks are then refused one by one with the reason instead of silently moving
+to another host).
 
 ## Configuration
 
@@ -197,6 +242,22 @@ switched on explicitly:
 | `FLOWHUB_REGISTRY_FILE` | `<DataDir>/registry.jsonl` | Task registry: issue → repository, worktree, session, state, cost |
 | `FLOWHUB_PAUSE_FILE` | `<DataDir>/DISPATCH_OFF` | Kill switch. While this file exists, deliveries are audited and ignored |
 | `FLOWHUB_WORKTREE_BASE` | *(unset)* | Fallback worktree directory for routing entries that declare none |
+
+The control API (ADR 0002 step 3) is a second listener, because the webhook entry
+and the admin API have opposite semantics: the webhook answers `202` to everything
+and explains nothing, and the admin API returns real errors and refusals.
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `FLOWHUB_ADMIN_ADDR` | *(unset)* | Control API listen address, e.g. `127.0.0.1:8081`. Unset turns the listener off. A wildcard bind is refused like the webhook's |
+| `FLOWHUB_ADMIN_TOKEN` | *(unset)* | **Required** when `FLOWHUB_ADMIN_ADDR` is set; the listener refuses to start without it |
+| `FLOWHUB_RUNTIMES_FILE` | `<DataDir>/runtimes.json` | Runtime inventory. Written only by the service |
+
+The control API serves `/control/v1/runtimes` (`GET` inventory, `POST …/invite`,
+`POST …/register`, `POST …/{name}/heartbeat`, `POST …/{name}/rotate`,
+`DELETE …/{name}`) plus an open `/control/v1/health`. Everything but `register`,
+`heartbeat` and the health endpoint needs the admin token as
+`Authorization: Bearer …`.
 
 `FLOWHUB_DISPATCH=1` refuses to start when dispatching cannot work: no routing
 table, an entry with no `default_branch`, an entry with no `worktrees` directory
@@ -797,4 +858,7 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 Siwen Yu.
   the project table; a pinned base commit per task) and
   [`docs/adr/0002-data-plane-runtime-installation.md`](./docs/adr/0002-data-plane-runtime-installation.md)
   (`flowhub runtime init` / `invite`, the admin API, the artifact manifest).
-  Nothing in either is implemented yet.
+  ADR 0002 steps 1–3 are implemented; the per-project runtime list and the
+  `spread` / `first-healthy` policy of ADR 0001 step 5 are not — today the
+  dispatcher takes the first healthy runtime in name order for a new task, and a
+  task that is already bound stays where it is.

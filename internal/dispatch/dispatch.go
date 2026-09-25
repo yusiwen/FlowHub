@@ -21,6 +21,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
+	"github.com/yusiwen/flowhub/internal/runtimes"
 	"github.com/yusiwen/flowhub/internal/store"
 	"github.com/yusiwen/flowhub/internal/webhook"
 	"github.com/yusiwen/flowhub/internal/worktree"
@@ -51,6 +52,10 @@ type Options struct {
 	Projects *projectmap.Map
 	Rules    rules.Policy
 	Log      *slog.Logger
+	// Runtimes is the enrolled runtime inventory. When it is nil or empty the
+	// dispatcher falls back to Client, which is the environment-configured runtime
+	// named "default".
+	Runtimes *runtimes.Inventory
 	// WorktreeBase is the fallback directory for task worktrees, used when a
 	// routing entry does not declare its own. Entries normally declare one,
 	// because the base has to be outside the repository it belongs to.
@@ -78,6 +83,10 @@ type Dispatcher struct {
 	// managers caches one worktree manager per base directory. Only the worker
 	// goroutine touches it, which is why it needs no lock.
 	managers map[string]*worktree.Manager
+
+	// clients caches one opencode client per runtime. Only the worker goroutine
+	// touches it.
+	clients map[string]*opencode.Client
 
 	queue   chan *store.Record
 	queued  atomic.Int64
@@ -116,6 +125,7 @@ func New(opts Options) (*Dispatcher, error) {
 		opts:     opts,
 		log:      opts.Log,
 		managers: map[string]*worktree.Manager{},
+		clients:  map[string]*opencode.Client{},
 		queue:    make(chan *store.Record, opts.QueueSize),
 	}, nil
 }
@@ -246,18 +256,36 @@ func (d *Dispatcher) handle(ctx context.Context, rec *store.Record) {
 		return
 	}
 
-	task, err = d.ensureTask(ctx, rec, match.Entry, task, known)
+	// The runtime is chosen once, before the workspace exists: a task is bound to
+	// the host that prepares its worktree, and it stays there.
+	binding, err := d.pickRuntime(ctx, task)
+	if err != nil {
+		d.ignored.Add(1)
+		d.log.Warn("no runtime can serve this delivery; it is ignored",
+			"issue", rec.IssueID, "project", rec.ProjectKey, "error", err)
+		return
+	}
+	if task.Runtime != "" && task.Runtime != binding.Name {
+		// Defensive: pickRuntime refuses this, but a silent re-home would lose the
+		// session's whole context, so it is worth never being possible.
+		d.ignored.Add(1)
+		d.log.Error("refusing to move a bound task to another runtime",
+			"issue", rec.IssueID, "bound", task.Runtime, "chosen", binding.Name)
+		return
+	}
+
+	task, err = d.ensureTask(ctx, rec, match.Entry, task, known, binding)
 	if err != nil {
 		d.log.Error("cannot prepare the task", "issue", rec.IssueID, "error", err)
 		return
 	}
 
-	d.runTurn(ctx, rec, delivery, task, match, decision)
+	d.runTurn(ctx, rec, delivery, task, match, decision, binding)
 }
 
 // ensureTask creates the registry row and the worktree if they do not exist yet,
 // and refuses to continue when the mapping changed under a running task.
-func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *projectmap.Entry, task registry.Task, known bool) (registry.Task, error) {
+func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *projectmap.Entry, task registry.Task, known bool, binding runtimeBinding) (registry.Task, error) {
 	if known && task.Repo != "" && task.Repo != entry.Repo.Path {
 		return registry.Task{}, fmt.Errorf("task %s is bound to %s but the mapping now points at %s; refusing to reuse the session",
 			rec.IssueID, task.Repo, entry.Repo.Path)
@@ -266,7 +294,8 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 	if !known {
 		created, _, err := d.opts.Registry.Ensure(rec.IssueID, func(t *registry.Task) {
 			t.Repo = entry.Repo.Path
-			t.Agent = d.opts.Agent
+			t.Runtime = binding.Name
+			t.Agent = runtimeAgent(entry, binding, d.opts.Agent)
 			t.State = registry.StateAnalyzing
 			t.Plan = registry.PlanNone
 		})
@@ -276,6 +305,15 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 		task = created
 	}
 
+	// An existing row written before runtimes were recorded still gets its
+	// binding, so the removal check has something to compare.
+	if task.Runtime == "" {
+		if task, err := d.opts.Registry.Update(rec.IssueID, func(t *registry.Task) {
+			t.Runtime = binding.Name
+		}); err == nil {
+			task.Runtime = binding.Name
+		}
+	}
 	if task.Worktree != "" {
 		return task, nil
 	}
@@ -305,6 +343,25 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 		t.Worktree = prepared.Path
 		t.Repo = prepared.Repo
 	})
+}
+
+// runtimeAgent resolves which agent *profile* runs a turn: the routing entry may
+// name one, then the runtime's enrolled profile, then the process-wide default.
+//
+// The runtime's product name is deliberately not consulted. On an opencode host,
+// asking for the agent "opencode" makes the server fall back to its own default
+// agent, which drops the step budget and the permission block the installed
+// profile carries — a silent widening of what an unattended turn may do.
+func runtimeAgent(entry *projectmap.Entry, binding runtimeBinding, fallback string) string {
+	if entry != nil {
+		if agent := strings.TrimSpace(entry.Agent); agent != "" {
+			return agent
+		}
+	}
+	if profile := strings.TrimSpace(binding.AgentProfile); profile != "" {
+		return profile
+	}
+	return fallback
 }
 
 // authorAllowed applies a routing entry's author allowlist. An empty list allows
@@ -362,7 +419,7 @@ func (d *Dispatcher) managerFor(base string) (*worktree.Manager, error) {
 }
 
 // runTurn delivers one prompt and records what came back.
-func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery rules.Delivery, task registry.Task, match projectmap.Match, decision rules.Decision) {
+func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery rules.Delivery, task registry.Task, match projectmap.Match, decision rules.Decision, binding runtimeBinding) {
 	phase := opencode.PhaseAnalysis
 	if decision.Action == rules.ActionExecute {
 		phase = opencode.PhaseExecution
@@ -395,17 +452,25 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 	// The routing entry owns the agent when it names one: which agent runs is a
 	// permission decision (that agent's own rules and tools), so it belongs next
 	// to the repository, not only in the environment.
-	agent := strings.TrimSpace(match.Entry.Agent)
-	if agent == "" {
-		agent = d.opts.Agent
+	agent := runtimeAgent(match.Entry, binding, d.opts.Agent)
+
+	// The model is pinned for the same reason the agent is. The enrolment check
+	// verified the model the installed profile pins, but the agent server resolves
+	// an agent name against a list it cached when it started: a server running since
+	// before the profile was installed answers with the old model id, so without
+	// pinning, the check passes and every turn dies on a model its provider dropped.
+	// That happened on 2026-09-25. The routing entry still wins when it names one.
+	model := strings.TrimSpace(match.Entry.Model)
+	if model == "" {
+		model = binding.modelFor(agent)
 	}
 
-	runner := opencode.NewRunner(d.opts.Client, arbiter, d.log)
+	runner := opencode.NewRunner(binding.Client, arbiter, d.log)
 	result, err := runner.Run(ctx, opencode.Task{
 		Directory: task.Worktree,
 		Prompt:    prompt,
 		Agent:     agent,
-		Model:     strings.TrimSpace(match.Entry.Model),
+		Model:     model,
 		Title:     rec.IssueID,
 		SessionID: task.SessionID,
 		Ruleset:   ruleset,
@@ -422,7 +487,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 		}
 	}
 	attrs := []any{
-		"issue", rec.IssueID, "action", decision.Action, "phase", phase,
+		"issue", rec.IssueID, "action", decision.Action, "phase", phase, "runtime", binding.Name,
 		"session", result.SessionID, "finished", result.Finished, "timed_out", result.TimedOut,
 		"replied", replied, "cost", result.Cost, "tokens", result.Tokens.Total,
 		"elapsed", result.Elapsed.Round(time.Millisecond), "permissions", len(result.Permissions),

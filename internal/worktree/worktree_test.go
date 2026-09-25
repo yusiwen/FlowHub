@@ -201,3 +201,102 @@ func runGitForTest(t *testing.T, dir string, args ...string) string {
 	}
 	return string(out)
 }
+
+// TestPrepareRecreatesAWorktreeWhoseDirectoryVanished is a regression test for a
+// live failure: the directory was deleted with `rm -rf` (rather than through
+// Remove), git still had it registered, and every later delivery failed with
+// "fatal: not a git repository" — the task could never start again. Git's
+// bookkeeping is not proof that the checkout is still there.
+func TestPrepareRecreatesAWorktreeWhoseDirectoryVanished(t *testing.T) {
+	repo := testRepo(t)
+	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
+	request := Request{Repo: repo, TaskKey: "TEST-9", DefaultBranch: "main"}
+
+	first, err := manager.Prepare(context.Background(), request)
+	if err != nil {
+		t.Fatalf("first Prepare: %v", err)
+	}
+	if err := os.RemoveAll(first.Path); err != nil {
+		t.Fatal(err)
+	}
+	// Git still lists it, which is exactly the stale state.
+	listed, err := manager.List(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stillRegistered bool
+	for _, candidate := range listed {
+		if candidate == first.Path {
+			stillRegistered = true
+		}
+	}
+	if !stillRegistered {
+		t.Skip("git already pruned the missing worktree; nothing to regress")
+	}
+
+	second, err := manager.Prepare(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Prepare after the directory vanished: %v", err)
+	}
+	if second.Reused {
+		t.Fatal("a missing worktree was reported as reused")
+	}
+	if _, err := os.Stat(filepath.Join(second.Path, ".git")); err != nil {
+		t.Fatalf("the worktree was not recreated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(second.Path, ScratchDir)); err != nil {
+		t.Fatalf("the recreated worktree has no scratch directory: %v", err)
+	}
+}
+
+// TestPrepareClearsALeftoverDirectoryWithoutLosingFiles covers the other half of a
+// live failure: a directory can sit at the worktree path without git knowing about
+// it (a half-finished cleanup, or scratch left by an earlier run). `git worktree
+// add` refuses to write into it, so it has to be dealt with — and a directory that
+// holds anything FlowHub does not recognise is moved aside, never deleted.
+func TestPrepareClearsALeftoverDirectoryWithoutLosingFiles(t *testing.T) {
+	repo := testRepo(t)
+	base := filepath.Join(t.TempDir(), "worktrees")
+	manager := newManager(t, base)
+
+	// Only FlowHub's own scratch: removed and recreated.
+	scratchOnly := filepath.Join(base, "TEST-7")
+	if err := os.MkdirAll(filepath.Join(scratchOnly, ScratchDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := manager.Prepare(context.Background(), Request{Repo: repo, TaskKey: "TEST-7", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("Prepare over our own scratch: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(prepared.Path, ".git")); err != nil {
+		t.Fatalf("the worktree was not created: %v", err)
+	}
+
+	// Somebody else's file: moved aside, not deleted.
+	occupied := filepath.Join(base, "TEST-8")
+	if err := os.MkdirAll(occupied, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	precious := filepath.Join(occupied, "notes.txt")
+	if err := os.WriteFile(precious, []byte("do not lose me\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err = manager.Prepare(context.Background(), Request{Repo: repo, TaskKey: "TEST-8", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("Prepare over an occupied directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(prepared.Path, ".git")); err != nil {
+		t.Fatalf("the worktree was not created: %v", err)
+	}
+	matches, err := filepath.Glob(occupied + ".stale-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("the occupied directory was not moved aside: %v", matches)
+	}
+	content, err := os.ReadFile(filepath.Join(matches[0], "notes.txt"))
+	if err != nil || string(content) != "do not lose me\n" {
+		t.Fatalf("the file that was in the way did not survive: %v %q", err, content)
+	}
+}

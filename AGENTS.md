@@ -53,9 +53,13 @@ agent definition lives in the opencode configuration, not here — on this host
 FLOWHUB_DISPATCH=1 make run
 ```
 
-A new agent file is only picked up by a *new* directory instance: opencode caches
-the agent list per instance, so an already-used directory needs a server restart,
-while the per-task worktree the dispatcher creates is always fresh.
+A new agent file is picked up by a *new* directory instance, while the per-task
+worktree the dispatcher creates is always fresh. That is not enough on its own:
+the agent *registry* the server resolves an agent name against is built once per
+server process, so a repaired profile keeps answering with its old settings — the
+cached model included — until `opencode serve` restarts. FlowHub therefore pins the
+model the runtime reported for that profile (ADR 0002), and `init` refuses a
+profile whose model the provider no longer offers.
 
 Then post to `http://127.0.0.1:8080/hooks/youtrack/$FLOWHUB_HOOK_KEY` with the
 header `X-YouTrack-Token: $FLOWHUB_TOKEN`. See `README.md`.
@@ -92,7 +96,8 @@ internal/projectmap/ YouTrack project -> repository routing table (~/.config/flo
 internal/opencode/  opencode client, permission arbiter, one-turn runner (make test-live)
 internal/rules/     trigger policy (ignore/analyze/plan/execute) and the per-turn prompt
 internal/dispatch/  the worker: queue, routing, worktree, session, arbiter, registry
-internal/provision/ data-plane host prep: `flowhub runtime init [--check]`, `uninstall` (capability report, embedded artifacts, manifest)
+internal/provision/ data-plane host prep: `flowhub runtime init [--check]`, `uninstall`, enrolment (capability report, embedded artifacts, manifest, runtime identity)
+internal/runtimes/  control plane: runtime inventory, states, invites, secrets (hashes only), `/control/v1` admin API and the `invite`/`list`/`show`/`remove`/`rotate` CLI
 internal/dedupe/    TTL idempotency cache
 internal/store/     Audit record, non-blocking queue, JSONL audit, payload log
 internal/metrics/   Counters behind /healthz
@@ -251,6 +256,13 @@ documents. The rules below are load-bearing; do not relax them casually.
    opencode health probe, the routing-table checks above, and a loud warning when
    the pause file is already present. Anything that would let the agent run
    unattended in a repository nobody chose is a bug.
+7. **A task is bound to the runtime that prepared its worktree, for life.** The
+   inventory lives behind the control API (`internal/runtimes`), the service is its
+   only writer, and a mutation applies to the running process: `remove` refuses
+   while non-terminal tasks are bound, and `--force` leaves those tasks to be
+   refused one by one with the reason instead of silently re-homing them. The host
+   reports what its profiles pin, and the dispatcher pins that model on the
+   session, so what `init --check` verified is what the turn actually runs.
 
 ## Before you finish a change
 

@@ -38,6 +38,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/provision"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
+	"github.com/yusiwen/flowhub/internal/runtimes"
 	"github.com/yusiwen/flowhub/internal/store"
 	"github.com/yusiwen/flowhub/internal/webhook"
 )
@@ -162,6 +163,19 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The runtime inventory is control-plane state: it lives with the audit trail
+	// and the task registry, and this process is its only writer. A corrupt file
+	// stops the start, because "no runtimes" and "unreadable runtimes" mean
+	// opposite things.
+	inventory, err := runtimes.Open(cfg.ResolvedRuntimesFile())
+	if err != nil {
+		return err
+	}
+	if inventory.Len() > 0 {
+		logger.Info("runtime inventory loaded",
+			"path", inventory.Path(), "runtimes", inventory.Len(), "counts", inventory.Counts())
+	}
+
 	started := time.Now()
 	stats := metrics.New()
 
@@ -187,7 +201,16 @@ func run() error {
 
 	// The dispatcher is built before the handler so that a delivery can never be
 	// accepted before there is something to hand it to.
-	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, logger)
+	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, logger)
+	if err != nil {
+		return err
+	}
+
+	// The control API is the only authenticated write surface in this process, and
+	// it is opt-in: an operator who does not enrol hosts from here never exposes
+	// it. It reads and writes the inventory the dispatcher is already using, so a
+	// change applies without a restart.
+	adminServer, err := startControlAPI(ctx, cfg, inventory, dispatcher, logger)
 	if err != nil {
 		return err
 	}
@@ -200,7 +223,7 @@ func run() error {
 	mux := http.NewServeMux()
 	mux.Handle(base, handler)
 	mux.Handle(base+"/{key}", handler)
-	mux.Handle("GET /healthz", healthHandler(cfg, projects, stats, sink, cache, audit, detail, dispatcher, started))
+	mux.Handle("GET /healthz", healthHandler(cfg, projects, stats, sink, cache, audit, detail, dispatcher, inventory, started))
 
 	server := &http.Server{
 		Handler:           mux,
@@ -235,7 +258,15 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
-	// Stop the dispatcher first: no new turn may start while the process is
+	// Stop the control API first: it must not accept an enrolment while the
+	// process is winding down.
+	if adminServer != nil {
+		if err := adminServer.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("control API shutdown incomplete", "error", err)
+		}
+	}
+
+	// Stop the dispatcher next: no new turn may start while the process is
 	// shutting down. A turn already in flight sees the cancelled context and
 	// unwinds; the wait is bounded so a stuck session cannot block the exit.
 	if stopAndWait := stopDispatcher(stop, dispatchDone, shutdownCtx, logger); stopAndWait != nil {
@@ -282,12 +313,72 @@ func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher) webhook.
 	return opts
 }
 
+// opencodeProber checks that the control plane can reach a host before activating
+// it. It is the same health endpoint the dispatcher uses for liveness, so an
+// enrolment cannot succeed against a host the dispatcher could not use.
+type opencodeProber struct{ timeout time.Duration }
+
+func (p opencodeProber) Probe(ctx context.Context, advertiseURL string) error {
+	timeout := p.timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	client := opencode.New(opencode.Options{BaseURL: advertiseURL, Timeout: timeout})
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if _, err := client.Health(probeCtx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// startControlAPI starts the control listener, or returns (nil, nil) when it is
+// not configured.
+func startControlAPI(ctx context.Context, cfg config.Config, inventory *runtimes.Inventory, dispatcher *dispatch.Dispatcher, logger *slog.Logger) (*http.Server, error) {
+	if !cfg.ControlAPIEnabled() {
+		logger.Info("control API is off: runtimes are configured through the environment only",
+			"hint", "set FLOWHUB_ADMIN_ADDR and FLOWHUB_ADMIN_TOKEN to invite and enrol agent hosts")
+		return nil, nil
+	}
+	boundTasks := func(string) []string { return nil }
+	if dispatcher != nil {
+		boundTasks = dispatcher.BoundTasks
+	}
+	control := &runtimes.Server{
+		Inventory:  inventory,
+		AdminToken: cfg.AdminToken,
+		Prober:     opencodeProber{timeout: 5 * time.Second},
+		BoundTasks: boundTasks,
+		Log:        logger,
+	}
+	server := &http.Server{
+		Handler:           control.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelDebug),
+	}
+	listener, err := net.Listen("tcp", cfg.AdminAddr)
+	if err != nil {
+		return nil, fmt.Errorf("control API: listen on %s: %w", cfg.AdminAddr, err)
+	}
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("control API stopped", "error", err)
+		}
+	}()
+	logger.Info("control API listening", "addr", listener.Addr().String(),
+		"runtimes_file", inventory.Path(), "wildcard", cfg.ControlAPIListensOnAllInterfaces())
+	return server, nil
+}
+
 // startDispatcher builds and starts the opencode dispatcher, or returns (nil,
 // nil, nil) when FLOWHUB_DISPATCH is off.
 //
 // The returned channel closes when the worker has stopped, so shutdown can wait
 // for an in-flight turn instead of killing the process under it.
-func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, logger *slog.Logger) (*dispatch.Dispatcher, <-chan struct{}, error) {
+func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, logger *slog.Logger) (*dispatch.Dispatcher, <-chan struct{}, error) {
 	if !cfg.Dispatch {
 		return nil, nil, nil
 	}
@@ -301,15 +392,13 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 	}
 
 	client := opencode.New(opencode.Options{BaseURL: cfg.OpenCodeURL})
-	// Refuse to start when opencode is not answering: a dispatcher that accepts
-	// deliveries and then fails every turn is worse than a refused start.
-	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	health, err := client.Health(probeCtx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("FLOWHUB_DISPATCH=1 but opencode at %s is not answering: %w", cfg.OpenCodeURL, err)
+	// Refuse to start when nothing can serve a turn: a dispatcher that accepts
+	// deliveries and then fails every one of them is worse than a refused start.
+	// With an inventory the rule becomes "at least one runtime answers", because
+	// the point of several hosts is that one may be down.
+	if err := checkRuntimesReachable(ctx, cfg, inventory, client, logger); err != nil {
+		return nil, nil, err
 	}
-	logger.Info("opencode is reachable", "url", cfg.OpenCodeURL, "version", health.Version)
 
 	tasks, err := registry.Open(cfg.ResolvedRegistryFile())
 	if err != nil {
@@ -318,6 +407,7 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 
 	dispatcher, err := dispatch.New(dispatch.Options{
 		Client:   client,
+		Runtimes: inventory,
 		Registry: tasks,
 		Projects: projects,
 		Rules: rules.Policy{
@@ -363,6 +453,48 @@ func stopDispatcher(stop context.CancelFunc, done <-chan struct{}, ctx context.C
 	}
 }
 
+// checkRuntimesReachable probes every runtime the dispatcher could use, warns about
+// each one that does not answer, and fails only when none does.
+func checkRuntimesReachable(ctx context.Context, cfg config.Config, inventory *runtimes.Inventory, fallback *opencode.Client, logger *slog.Logger) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	active := inventory.Active()
+	if len(active) == 0 {
+		health, err := fallback.Health(probeCtx)
+		if err != nil {
+			return fmt.Errorf("FLOWHUB_DISPATCH=1 but opencode at %s is not answering: %w", cfg.OpenCodeURL, err)
+		}
+		logger.Info("opencode is reachable", "url", cfg.OpenCodeURL, "version", health.Version, "runtime", dispatch.DefaultRuntimeName)
+		return nil
+	}
+
+	var reachable []string
+	for _, runtime := range active {
+		address := strings.TrimSpace(runtime.Advertise)
+		if address == "" {
+			address = strings.TrimSpace(runtime.URL)
+		}
+		if address == "" {
+			logger.Warn("a runtime has no address; it cannot be used", "runtime", runtime.Name)
+			continue
+		}
+		runtimeCtx, runtimeCancel := context.WithTimeout(probeCtx, 5*time.Second)
+		health, err := opencode.New(opencode.Options{BaseURL: address, Timeout: 5 * time.Second}).Health(runtimeCtx)
+		runtimeCancel()
+		if err != nil {
+			logger.Warn("runtime is not answering; new work will avoid it", "runtime", runtime.Name, "url", address, "error", err)
+			continue
+		}
+		logger.Info("runtime is reachable", "runtime", runtime.Name, "url", address, "version", health.Version)
+		reachable = append(reachable, runtime.Name)
+	}
+	if len(reachable) == 0 {
+		return fmt.Errorf("FLOWHUB_DISPATCH=1 but none of the %d enrolled runtime(s) answered; the hosts or the network between them need attention", len(active))
+	}
+	return nil
+}
+
 func logStartup(logger *slog.Logger, cfg config.Config, projects *projectmap.Map, addr string) {
 	logger.Info("flowhub receiver starting",
 		"version", versionLine(),
@@ -387,7 +519,9 @@ func logStartup(logger *slog.Logger, cfg config.Config, projects *projectmap.Map
 		"trigger", cfg.Trigger,
 		"start_states", strings.Join(cfg.StartStates, ","),
 		"task_deadline", cfg.TaskDeadline.String(),
-		"max_turns", cfg.MaxTurns)
+		"max_turns", cfg.MaxTurns,
+		"control_api", cfg.ControlAPIEnabled(),
+		"control_api_addr", cfg.AdminAddr)
 	for _, warning := range cfg.Warnings() {
 		logger.Warn(warning)
 	}
@@ -431,7 +565,7 @@ func startSweeper(ctx context.Context, cache *dedupe.Cache, ttl time.Duration, l
 
 // healthHandler serves GET /healthz for local operations. nginx never proxies
 // this path, so it is not part of the public attack surface.
-func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.Counters, sink *store.Async, cache *dedupe.Cache, audit *store.JSONL, detail *store.Detail, dispatcher *dispatch.Dispatcher, started time.Time) http.HandlerFunc {
+func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.Counters, sink *store.Async, cache *dedupe.Cache, audit *store.JSONL, detail *store.Detail, dispatcher *dispatch.Dispatcher, inventory *runtimes.Inventory, started time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Payload and audit paths are only known after the first record of the
 		// day, so they are read per request rather than captured at startup.
@@ -466,8 +600,44 @@ func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.C
 			"dedupe_keys":               cache.Len(),
 			"projects":                  map[string]any{"file": cfg.ProjectsFile, "mappings": projects.Len(), "routable": projects.Routable(), "keys": projects.Keys()},
 			"dispatch":                  dispatchState,
+			"runtimes":                  runtimeHealth(inventory),
+			"control_api":               controlAPIHealth(cfg),
 			"counters":                  stats.Snapshot(),
 		})
+	}
+}
+
+// runtimeHealth reports the inventory, including the enrolled runtimes so a
+// registration is visible here without a restart.
+func runtimeHealth(inventory *runtimes.Inventory) map[string]any {
+	if inventory == nil {
+		return map[string]any{"enabled": false}
+	}
+	runtimes_ := inventory.List()
+	names := make([]string, 0, len(runtimes_))
+	states := map[string]string{}
+	for _, runtime := range runtimes_ {
+		names = append(names, runtime.Name)
+		states[runtime.Name] = string(runtime.State)
+	}
+	return map[string]any{
+		"enabled":  true,
+		"file":     inventory.Path(),
+		"counts":   inventory.Counts(),
+		"runtimes": names,
+		"states":   states,
+	}
+}
+
+// controlAPIHealth describes the control API without leaking its token.
+func controlAPIHealth(cfg config.Config) map[string]any {
+	if !cfg.ControlAPIEnabled() {
+		return map[string]any{"enabled": false}
+	}
+	return map[string]any{
+		"enabled":  true,
+		"addr":     cfg.AdminAddr,
+		"wildcard": cfg.ControlAPIListensOnAllInterfaces(),
 	}
 }
 

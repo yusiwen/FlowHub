@@ -469,3 +469,24 @@ func TestPlanReportsWithoutWriting(t *testing.T) {
 		t.Fatal("Plan wrote a file")
 	}
 }
+
+// TestTheInstalledProfileMatchesTheClaim keeps the name FlowHub installs and the
+// name a turn asks for from drifting apart: the claim reports the profile, and it
+// has to be the profile the asset actually defines.
+func TestTheInstalledProfileMatchesTheClaim(t *testing.T) {
+	profile := AgentProfileFor(AgentOpenCode)
+	if profile == "" {
+		t.Fatal("no agent profile is defined for opencode")
+	}
+	assets, err := AssetsFor(AgentOpenCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.TrimSuffix(filepath.Base(assets[0].Target), ".md")
+	if profile != want {
+		t.Fatalf("AgentProfileFor = %q but the installed asset defines %q", profile, want)
+	}
+	if profile == AgentOpenCode {
+		t.Fatal("the profile must not be the product name")
+	}
+}

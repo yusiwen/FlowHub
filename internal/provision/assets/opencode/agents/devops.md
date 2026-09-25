@@ -2,7 +2,7 @@
 description: FlowHub's unattended DevOps agent. Analyses a YouTrack issue, plans it, and implements the agreed plan inside that task's own git worktree.
 mode: primary
 hidden: true
-model: deepseek/deepseek-v4-flash
+model: deepseek/deepseek-flash
 temperature: 0.1
 steps: 40
 color: "#2563EB"

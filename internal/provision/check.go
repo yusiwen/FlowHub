@@ -36,6 +36,16 @@ type Options struct {
 	RequiredEnv []string
 	// Strict turns warnings into failures, for use as a gate in automation.
 	Strict bool
+	// OpenCodeURL is the agent server whose model catalogue is checked. Empty uses
+	// DefaultOpenCodeURL.
+	OpenCodeURL string
+	// ConfigRoot is where the agent's configuration lives, so the model check reads
+	// the profile the server will actually load. Empty means "use the embedded
+	// assets only".
+	ConfigRoot string
+	// Catalogue is injected so the model check is testable. Nil skips the check
+	// with a note.
+	Catalogue ModelCatalogue
 }
 
 // RepoExpectation is one repository this host must serve.
@@ -58,6 +68,9 @@ type Report struct {
 	Forges        map[string]Forge `json:"forges,omitempty"`
 	Repos         []Repo           `json:"repos,omitempty"`
 	EnvPresent    map[string]bool  `json:"env_present,omitempty"`
+	// Profiles are the agent profiles this host would run, with the model each
+	// pins resolved against the agent server's catalogue.
+	Profiles []ProfileCheck `json:"profiles,omitempty"`
 	// Artifacts lists managed files once installation exists (ADR 0002 step 2).
 	Artifacts []Artifact `json:"artifacts"`
 	Failures  []string   `json:"failures"`
@@ -163,6 +176,7 @@ func Check(ctx context.Context, runner Runner, opts Options) (*Report, error) {
 
 	checkAgent(ctx, runner, opts, report)
 	checkGit(ctx, runner, report)
+	checkProfiles(ctx, opts.Catalogue, opts, report)
 	checkForgeTools(ctx, runner, opts, report)
 	checkRepos(ctx, runner, opts, report)
 	checkEnv(runner, opts, report)
@@ -172,14 +186,20 @@ func Check(ctx context.Context, runner Runner, opts Options) (*Report, error) {
 }
 
 func checkAgent(ctx context.Context, runner Runner, opts Options, report *Report) {
-	agent := &Agent{Name: opts.Agent, ConfigDir: tildify(runner.Identity().Home, agentConfigDir(runner))}
+	// The directory the report names must be the one this check actually read.
+	// With --config-root the agent's files live somewhere other than the default,
+	// and naming the default anyway sends the operator to look at a profile this
+	// host does not run: the model check reads opts.ConfigRoot, so the report has
+	// to agree with it.
+	configDir := ConfigRootFor(runner, InstallOptions{Agent: opts.Agent, ConfigRoot: opts.ConfigRoot})
+	agent := &Agent{Name: opts.Agent, ConfigDir: tildify(runner.Identity().Home, configDir)}
 	report.Agent = agent
 
 	// The configuration directory is checked even when the binary is missing. It
 	// is tempting to return early here, and doing so reported a directory that
 	// exists as "does not exist", because a zero-valued bool is indistinguishable
 	// from a checked-and-absent one.
-	exists, _, err := statDir(runner, agentConfigDir(runner))
+	exists, _, err := statDir(runner, configDir)
 	switch {
 	case err != nil:
 		agent.ConfigDirError = err.Error()
@@ -199,7 +219,7 @@ func checkAgent(ctx context.Context, runner Runner, opts Options, report *Report
 		return
 	}
 	agent.Path = path
-	if out, versionErr := runner.Run(ctx, configDirFor(runner), opts.Agent, "--version"); versionErr == nil {
+	if out, versionErr := runner.Run(ctx, configDirFor(runner, configDir), opts.Agent, "--version"); versionErr == nil {
 		agent.Version = firstLine(out)
 	} else {
 		report.Warnings = append(report.Warnings, fmt.Sprintf("%s --version failed: %s", opts.Agent, boundedError(out, versionErr)))
@@ -505,8 +525,12 @@ func agentConfigDir(runner Runner) string {
 }
 
 // configDirFor returns an existing directory to run the agent binary in, or "" to
-// inherit the caller's working directory.
-func configDirFor(runner Runner) string {
+// inherit the caller's working directory. The agent's own configuration directory
+// is preferred when it exists, so a version probe runs where the agent expects to.
+func configDirFor(runner Runner, configDir string) string {
+	if configDir != "" && dirExists(runner, configDir) {
+		return configDir
+	}
 	if dir := agentConfigDir(runner); dirExists(runner, dir) {
 		return dir
 	}

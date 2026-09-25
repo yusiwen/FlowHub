@@ -54,6 +54,19 @@ func AssetsFor(agent string) ([]Asset, error) {
 	}
 }
 
+// AgentProfileFor is the opencode agent name that the installed assets define.
+//
+// "opencode" is the *product*; this is the profile inside it (the name in the
+// agent file). The claim carries it so a host runs exactly the agent whose file
+// FlowHub installed, instead of whatever the control plane's default happens to
+// be — which is how a host ends up running a looser agent than intended.
+func AgentProfileFor(agent string) string {
+	if agent == AgentOpenCode {
+		return "devops"
+	}
+	return ""
+}
+
 // ReadAsset returns the embedded content of an asset.
 func ReadAsset(asset Asset) ([]byte, error) {
 	content, err := assets.ReadFile(asset.Source)

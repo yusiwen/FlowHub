@@ -205,6 +205,39 @@ func TestConfigDirIsCheckedEvenWhenTheBinaryIsMissing(t *testing.T) {
 	}
 }
 
+// TestConfigRootIsWhatTheReportNames is a regression test for a report that
+// described the wrong host: `init --check --config-root /srv/agent` read the
+// profile under /srv/agent while the report still printed the default
+// ~/.config/opencode, so the operator was sent to inspect a file this host does
+// not run.
+func TestConfigRootIsWhatTheReportNames(t *testing.T) {
+	f := healthyHost()
+	f.dirs["/srv/agent"] = true
+
+	report, err := Check(context.Background(), f, Options{ConfigRoot: "/srv/agent"})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if report.Agent == nil || report.Agent.ConfigDir != "/srv/agent" {
+		t.Fatalf("config dir = %+v, want the directory the check read", report.Agent)
+	}
+	if !report.Agent.ConfigDirExists {
+		t.Fatal("the overridden configuration directory exists but was reported as missing")
+	}
+
+	// And a check that could not see the overridden root reports that root, not a
+	// reassuring default.
+	f2 := healthyHost()
+	f2.statErrs["/srv/agent"] = fmt.Errorf("permission denied")
+	report2, err := Check(context.Background(), f2, Options{ConfigRoot: "/srv/agent"})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if report2.Agent.ConfigDir != "/srv/agent" || report2.Agent.ConfigDirError == "" {
+		t.Fatalf("agent = %+v, want the unreadable override named", report2.Agent)
+	}
+}
+
 // TestUnreadablePathIsNotReportedAsMissing covers the other half of the same
 // mistake: a directory the check cannot look at must say so, not "does not exist".
 func TestUnreadablePathIsNotReportedAsMissing(t *testing.T) {
@@ -556,6 +589,106 @@ func TestTextReportIsStableAndReadable(t *testing.T) {
 		if strings.Contains(first.String(), unwanted) {
 			t.Errorf("the report claims something about the caller's run: %q", unwanted)
 		}
+	}
+}
+
+// fakeCatalogue is a server's model list, or an error when it cannot be read.
+type fakeCatalogue struct {
+	models map[string][]string
+	err    error
+}
+
+func (f fakeCatalogue) Catalogue(context.Context) (map[string][]string, error) {
+	return f.models, f.err
+}
+
+// TestProfileModelMustExistOnTheServer is the check that turns a provider quietly
+// dropping a model id into an enrolment failure. It cost a real task to discover
+// when it was missing.
+func TestProfileModelMustExistOnTheServer(t *testing.T) {
+	profiles, err := agentProfiles(AgentOpenCode, "")
+	if err != nil {
+		t.Fatalf("agentProfiles: %v", err)
+	}
+	if len(profiles) == 0 {
+		t.Fatal("the embedded agent asset pins no model")
+	}
+	pinned := profiles[0].Model
+	provider, model, ok := splitModel(pinned)
+	if !ok {
+		t.Fatalf("the embedded asset pins %q, which is not provider/model", pinned)
+	}
+
+	// Available: no failure, and the report says so.
+	f := healthyHost()
+	available, err := Check(context.Background(), f, Options{
+		Catalogue: fakeCatalogue{models: map[string][]string{provider: {model, "another"}}},
+	})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if len(available.Profiles) != 1 || !available.Profiles[0].Available || !available.Profiles[0].Checked {
+		t.Fatalf("profiles = %+v", available.Profiles)
+	}
+	if containsSubstring(available.Failures, "does not offer") {
+		t.Fatalf("an available model was reported as missing: %v", available.Failures)
+	}
+
+	// Missing: a failure that names the model and what is on offer.
+	missing, err := Check(context.Background(), f, Options{
+		Catalogue: fakeCatalogue{models: map[string][]string{provider: {"something-else"}}},
+	})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if missing.OK {
+		t.Fatal("a missing model was accepted")
+	}
+	if !containsSubstring(missing.Failures, pinned) || !containsSubstring(missing.Failures, "does not offer") {
+		t.Fatalf("failures = %v", missing.Failures)
+	}
+
+	// Unreachable server: a warning, never a failure. Not running yet is a
+	// different problem with a different message.
+	unreachable, err := Check(context.Background(), f, Options{
+		Catalogue: fakeCatalogue{err: fmt.Errorf("connection refused")},
+	})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if !unreachable.OK {
+		t.Fatalf("an unreachable server failed the check: %v", unreachable.Failures)
+	}
+	if len(unreachable.Profiles) != 1 || unreachable.Profiles[0].Checked {
+		t.Fatalf("profiles = %+v", unreachable.Profiles)
+	}
+	if !containsSubstring(unreachable.Warnings, "could not be verified") {
+		t.Fatalf("warnings = %v", unreachable.Warnings)
+	}
+
+	// No catalogue injected: reported as not checked, not as missing.
+	skipped, err := Check(context.Background(), f, Options{})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if skipped.OK != true {
+		t.Fatal("a skipped model check failed the host")
+	}
+	if len(skipped.Profiles) != 1 || skipped.Profiles[0].Checked {
+		t.Fatalf("profiles = %+v", skipped.Profiles)
+	}
+}
+
+func TestFrontmatterValueReadsOnlyTheHeader(t *testing.T) {
+	content := "---\ndescription: x\nmodel: deepseek/deepseek-flash\nsteps: 40\n---\n\nmodel: not-this-one\n"
+	if got := frontmatterValue(content, "model"); got != "deepseek/deepseek-flash" {
+		t.Fatalf("frontmatterValue = %q", got)
+	}
+	if got := frontmatterValue("model: outside\n", "model"); got != "" {
+		t.Fatalf("a file without frontmatter returned %q", got)
+	}
+	if got := frontmatterValue("---\nmodel: \"quoted/id\"\n---\n", "model"); got != "quoted/id" {
+		t.Fatalf("quotes were not stripped: %q", got)
 	}
 }
 

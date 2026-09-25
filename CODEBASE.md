@@ -12,7 +12,9 @@ first implemented source is YouTrack.
 Current state: the YouTrack webhook receiver and the opencode dispatcher are
 both implemented and tested. The receiver always records; the dispatcher is
 opt-in (`FLOWHUB_DISPATCH=1`) and turns an accepted delivery into one opencode
-turn inside a per-task git worktree.
+turn inside a per-task git worktree. A second host can be prepared and enrolled as
+a named runtime (`flowhub runtime init` / `invite`, an inventory behind a control
+API), and a task is bound to the runtime that prepared its worktree for life.
 
 ## Where things live
 
@@ -36,9 +38,10 @@ turn inside a per-task git worktree.
 | `internal/registry/` | Append-only task registry (`registry.jsonl`): issue → repository, worktree, session, state, plan state, turns, cost, last reply |
 | `internal/rules/` | Trigger policy (`rules.go`: ignore/analyze/plan/execute, trigger origin, `Basis`, self-comment detection, turn budget) and the per-turn prompt (`prompt.go`: ground rules, phase instructions, the reply sign-off contract) |
 | `internal/dispatch/` | The worker: queue, routing, worktree cache, phase arbiter, session reuse, registry update, audit log |
-| `internal/provision/` | Data-plane host preparation. `runner.go` is the host boundary (bounded commands, injected environment, identity), so the checks are tested without executing anything; `check.go` collects the capability report; `assets.go` embeds the agent definition and MCP snippet; `manifest.go` records what was installed (path, SHA-256, version); `install.go` plans and applies, refusing to overwrite a hand edit unless `--force`; `diff.go` renders the refusal |
+| `internal/provision/` | Data-plane host preparation. `runner.go` is the host boundary (bounded commands, injected environment, identity), so the checks are tested without executing anything; `check.go` collects the capability report; `model.go` resolves each installed agent profile and the model it pins against the agent server's catalogue; `assets.go` embeds the agent definition and MCP snippet; `manifest.go` records what was installed (path, SHA-256, version); `install.go` plans and applies, refusing to overwrite a hand edit unless `--force`; `diff.go` renders the refusal; `register.go` enrols the host with a control plane and stores the runtime identity (`0600`); `command.go` routes `runtime init` / `uninstall` |
+| `internal/runtimes/` | The control plane's runtime inventory (ADR 0002 step 3): `inventory.go` holds the states (`pending`/`active`/`revoked`), invites and runtime secrets (SHA-256 only, never the value) and the sticky runtime binding; `admin.go` is the `/control/v1` listener and its client; `command.go` is the `invite`/`list`/`show`/`remove`/`rotate` CLI, which talks to the running service so a change needs no restart |
 | `internal/metrics/metrics.go` | Counters behind `/healthz` |
-| `docs/adr/` | Architecture decision records, both **proposed and not implemented**: `0001` the seam that would make event sources and agent runtimes pluggable (including a v2 configuration format, addressed runtimes and a pinned base commit), `0002` how a data-plane host is installed and enrolled as a runtime (`flowhub runtime init`, the admin API, the artifact manifest) |
+| `docs/adr/` | Architecture decision records: `0001` the seam that would make event sources and agent runtimes pluggable (a v2 configuration format, addressed runtimes, a pinned base commit per task) — proposed, not implemented; `0002` how a data-plane host is installed and enrolled as a runtime — **steps 1–3 implemented** (capability report, artifacts + manifest, inventory + admin API + enrolment), steps 4–5 open |
 | `README.md` | Operator-facing documentation: config table, log formats, pipeline, jq recipes, verification checklist |
 
 Tests live next to the code (`*_test.go`). `go test ./...` and `go vet ./...` are

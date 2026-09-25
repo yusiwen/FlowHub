@@ -55,8 +55,12 @@ const (
 
 // Task is one YouTrack issue being worked on.
 type Task struct {
-	Key      string `json:"task_key"`
-	Repo     string `json:"repo"`
+	Key  string `json:"task_key"`
+	Repo string `json:"repo"`
+	// Runtime is the agent host this task is bound to. A session cannot move
+	// between hosts, so the binding is for the task's life: a task whose runtime is
+	// gone is refused rather than re-homed. Empty means "not yet chosen".
+	Runtime  string `json:"runtime,omitempty"`
 	Worktree string `json:"worktree,omitempty"`
 	// SessionID is the opencode session this task runs in. Empty until the first
 	// turn has created one.

@@ -162,7 +162,7 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 	}
 	r.log.Info("opencode turn started",
 		"session", sessionID, "directory", task.Directory, "agent", task.Agent,
-		"continued", task.SessionID != "", "deadline", task.Deadline)
+		"model", task.Model, "continued", task.SessionID != "", "deadline", task.Deadline)
 
 	deadline := time.Now().Add(task.Deadline)
 	if task.Deadline <= 0 {

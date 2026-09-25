@@ -74,6 +74,27 @@ func (r *Report) Text(w io.Writer) {
 		}
 	}
 
+	if len(r.Profiles) > 0 {
+		fmt.Fprintln(w, "\nagent profiles")
+		for _, profile := range r.Profiles {
+			state := "not checked"
+			switch {
+			case profile.Checked && profile.Available:
+				state = "model available"
+			case profile.Checked:
+				state = "MODEL MISSING"
+			}
+			source := ""
+			if profile.Source != "" {
+				source = " (" + profile.Source + ")"
+			}
+			fmt.Fprintf(w, "  %-12s %-28s %s%s\n", profile.Agent, profile.Model, state, source)
+			if profile.Detail != "" && !profile.Available {
+				fmt.Fprintf(w, "               %s\n", profile.Detail)
+			}
+		}
+	}
+
 	if len(r.Forges) > 0 {
 		fmt.Fprintln(w, "\nforges")
 		for _, host := range sortedKeys(r.Forges) {

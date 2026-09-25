@@ -113,13 +113,30 @@ func (m *Manager) Prepare(ctx context.Context, req Request) (Worktree, error) {
 
 	// Reuse an existing worktree: a second event for the same task must land in
 	// the same checkout, otherwise the agent loses its own previous work.
+	//
+	// Git's bookkeeping is not proof that the directory is still there. A human
+	// running `rm -rf`, or a cleanup that died halfway, leaves the worktree
+	// registered and missing; reusing it then fails inside a directory that does not
+	// exist ("not a git repository"), and the task can never start again. So the
+	// registration is verified, and a stale one is pruned rather than trusted.
 	if registered, err := m.registered(ctx, req.Repo, path); err != nil {
 		return Worktree{}, err
 	} else if registered {
-		if err := m.ensureScratch(path); err != nil {
+		switch usable, err := m.usable(ctx, path); {
+		case err != nil:
 			return Worktree{}, err
+		case usable:
+			if err := m.ensureScratch(path); err != nil {
+				return Worktree{}, err
+			}
+			return Worktree{Path: path, Branch: branch, Repo: req.Repo, Reused: true}, nil
+		default:
+			// Prune clears the bookkeeping for every worktree whose directory is
+			// gone, which is what makes recreating this one possible.
+			if _, err := m.run(ctx, req.Repo, "worktree", "prune"); err != nil {
+				return Worktree{}, err
+			}
 		}
-		return Worktree{Path: path, Branch: branch, Repo: req.Repo, Reused: true}, nil
 	}
 
 	if err := os.MkdirAll(m.opts.Base, 0o700); err != nil {
@@ -129,6 +146,17 @@ func (m *Manager) Prepare(ctx context.Context, req Request) (Worktree, error) {
 		// A failed fetch is not fatal: the task should still start, from whatever
 		// the clone already has.
 		_, _ = m.run(ctx, req.Repo, "fetch", "--prune", "origin")
+	}
+
+	// A directory can be sitting at the target path without belonging to a worktree
+	// git knows about: a half-finished cleanup, or the scratch directory an earlier
+	// failed run created. `git worktree add` refuses to write into it, so it has to
+	// be dealt with — and never by deleting content FlowHub does not recognise.
+	if moved, err := m.clearForCreate(path); err != nil {
+		return Worktree{}, err
+	} else if moved != "" {
+		// Nothing is thrown away: the operator can look at what was there.
+		_ = moved
 	}
 
 	if exists, err := m.branchExists(ctx, req.Repo, branch); err != nil {
@@ -267,6 +295,58 @@ func (m *Manager) ensureScratch(path string) error {
 		return fmt.Errorf("worktree: write %s: %w", exclude, err)
 	}
 	return nil
+}
+
+// clearForCreate makes the target path available for a fresh checkout.
+//
+// A directory holding nothing, or holding only FlowHub's own scratch, is removed:
+// neither can be anybody's work. Anything else is moved aside rather than deleted,
+// because a checkout that git no longer recognises may still hold uncommitted work
+// and this code cannot tell. The moved path is returned so the caller can report it.
+func (m *Manager) clearForCreate(path string) (string, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("worktree: inspect %s: %w", path, err)
+	}
+	onlyScratch := true
+	for _, entry := range entries {
+		if entry.Name() != ScratchDir {
+			onlyScratch = false
+			break
+		}
+	}
+	if len(entries) == 0 || onlyScratch {
+		if err := os.RemoveAll(path); err != nil {
+			return "", fmt.Errorf("worktree: clear %s: %w", path, err)
+		}
+		return "", nil
+	}
+	moved := fmt.Sprintf("%s.stale-%d", path, time.Now().Unix())
+	if err := os.Rename(path, moved); err != nil {
+		return "", fmt.Errorf("worktree: %s is in the way and could not be moved aside: %w", path, err)
+	}
+	return moved, nil
+}
+
+// usable reports whether the path is a working tree git can actually use. It is
+// the check that turns a stale registration into a recreate instead of a failure.
+func (m *Manager) usable(ctx context.Context, path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	out, err := m.run(ctx, path, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		// The directory is there but git cannot use it: treat it as unusable rather
+		// than failing the task forever.
+		return false, nil
+	}
+	return strings.TrimSpace(out) == "true", nil
 }
 
 func (m *Manager) registered(ctx context.Context, repo, path string) (bool, error) {
