@@ -99,6 +99,8 @@ flowhub -version             # print the version
 flowhub -print-config        # print the effective configuration, secrets masked
 flowhub runtime init --check # report what this host can and cannot do; writes nothing
 flowhub runtime init         # report, install the files FlowHub manages, enrol
+flowhub runtime doctor       # re-check this host; writes nothing
+flowhub runtime doctor --push# re-check and report to the control plane
 flowhub runtime uninstall    # remove exactly what the manifest records
 ```
 
@@ -132,6 +134,13 @@ Exit status is 0 for ready, 2 for not ready, 1 for a usage mistake.
 flowhub runtime init --check --forge git.yusiwen.cn=gitea \
   --repo git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git=/Users/me/git/beap-be
 ```
+
+`runtime doctor` runs exactly the same check later, so the first task is never the
+thing that discovers an expired credential. With `--push` it sends the report to
+the control plane, authenticated by this host's **runtime secret**, which refreshes
+`last_seen` and the models the dispatcher pins — a repaired profile reaches the next
+turn without a restart. A report that does not pass is deliberately **not** pushed,
+so `last_seen` keeps meaning "a host that was verified fit".
 
 ### Installing the agent files
 
@@ -858,7 +867,9 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 Siwen Yu.
   the project table; a pinned base commit per task) and
   [`docs/adr/0002-data-plane-runtime-installation.md`](./docs/adr/0002-data-plane-runtime-installation.md)
   (`flowhub runtime init` / `invite`, the admin API, the artifact manifest).
-  ADR 0002 steps 1–3 are implemented; the per-project runtime list and the
-  `spread` / `first-healthy` policy of ADR 0001 step 5 are not — today the
-  dispatcher takes the first healthy runtime in name order for a new task, and a
-  task that is already bound stays where it is.
+  ADR 0002 steps 1–4 are implemented (`init` / `--check` / `doctor --push`,
+  `invite`, the admin API, the artifact manifest); step 5, a service-side
+  activation smoke turn, is not. The per-project runtime list and the `spread` /
+  `first-healthy` policy of ADR 0001 step 5 are also not — today the dispatcher
+  takes the first healthy runtime in name order for a new task, and a task that is
+  already bound stays where it is.

@@ -144,14 +144,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	name := r.PathValue("name")
 	var request struct {
-		Report map[string]any `json:"report,omitempty"`
+		Report map[string]any    `json:"report,omitempty"`
+		Models map[string]string `json:"models,omitempty"`
 	}
 	if err := decodeJSON(r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	secret := bearerToken(r)
-	runtime, err := s.Inventory.Heartbeat(name, secret, request.Report, s.now())
+	runtime, err := s.Inventory.Heartbeat(name, secret, request.Report, request.Models, s.now())
 	if err != nil {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
@@ -398,11 +399,25 @@ func (c *Client) Register(ctx context.Context, token string, claim Claim) (Runti
 }
 
 // Heartbeat reports in.
-func (c *Client) Heartbeat(ctx context.Context, name, secret string, report map[string]any) error {
+// Heartbeat reports that this host is alive and replaces the capability report the
+// control plane holds. The runtime secret, not the admin token, authenticates it:
+// this is the data plane speaking, and it is the only control-plane call a worker
+// can make on its own.
+func (c *Client) Heartbeat(ctx context.Context, name, secret string, report map[string]any, models map[string]string) (Runtime, error) {
 	previous := c.Token
 	c.Token = secret
 	defer func() { c.Token = previous }()
-	return c.do(ctx, http.MethodPost, "/control/v1/runtimes/"+name+"/heartbeat", map[string]any{"report": report}, nil)
+	body := map[string]any{"report": report}
+	if len(models) > 0 {
+		body["models"] = models
+	}
+	var response struct {
+		Runtime Runtime `json:"runtime"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/control/v1/runtimes/"+name+"/heartbeat", body, &response); err != nil {
+		return Runtime{}, err
+	}
+	return response.Runtime, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {

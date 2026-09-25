@@ -1,16 +1,21 @@
 # ADR 0002 — Data-plane runtime installation and enrollment
 
 **Status:** Proposed, partially implemented. The five decisions below were approved
-in review on 2026-09-22. **Migration steps 1, 2 and 3 are implemented** — the
-capability report, the embedded artifacts, the manifest with drift refusal,
-`uninstall`, the runtime inventory with its states, the admin API, and enrolment.
-Steps 4–5 are not started. Four refinements were made while implementing them,
-recorded here because the body above still reads as the original sketch:
+in review on 2026-09-22. **Migration steps 1–4 are implemented** — the capability
+report, the embedded artifacts, the manifest with drift refusal, `uninstall`, the
+runtime inventory with its states, the admin API, enrolment, and `doctor --push`
+(the heartbeat that keeps the control plane's view of a worker current). Step 5,
+the service-side activation smoke turn, is not started. Five refinements were made
+while implementing them, recorded here because the body above still reads as the
+original sketch:
 
 * The manifest lives in FlowHub's own configuration directory
   (`<config-root>/../flowhub/manifest.json`) rather than beside the artifacts: the
   agent's directory should hold the agent's files, and a manifest that follows the
-  agent's layout would move with it.
+  agent's layout would move with it. The runtime identity sits beside the manifest,
+  for the same reason; an empty `--config-root` used to resolve to the *relative*
+  path `./flowhub/runtime.json` there, so the identity landed in whatever directory
+  the command ran in.
 * `init` runs the capability check first and refuses to install when the *agent* is
   missing, but a missing forge tool or an unreadable clone only sets the exit
   status to "not ready" — the operator fixes that while the files are already in
@@ -25,15 +30,18 @@ recorded here because the body above still reads as the original sketch:
   id it had cached. The reported model now travels with the claim (`runtimes.json`
   → `models`), the dispatcher passes it to the session, and the turn log records
   it, so what the check verified is what the turn runs. A routing entry that names
-  a model still overrides it, and a runtime enrolled before this change keeps the
-  old behaviour (the agent server's own default). Known gap until step 4: the
-  reported models are only refreshed at enrolment, so a host that repairs a profile
-  and re-runs `init` without re-enrolling keeps the model its claim carried —
-  `doctor --push` is where that refresh belongs.
+  a model still overrides it. `doctor --push` refreshes the value, and because the
+  dispatcher reads the inventory on every delivery, the refresh applies to the next
+  turn without a restart.
 * **A capability report names the configuration directory it actually read.** With
   `--config-root` the agent's files live somewhere else, and the report used to
   print the default `~/.config/opencode` anyway — sending the operator to inspect a
   profile this host does not run, while the model check read the real one.
+* **A report that does not pass is not pushed.** `doctor --push` sends the report
+  under the runtime secret, and only when the local check passes: `last_seen` has
+  to mean "a host that was verified fit", otherwise the inventory would advertise a
+  worker whose credential expired. This also settles open question 2 below — the
+  routine check reports and pushes, and only `init` writes files.
 **Revision:** 1
 **Date:** 2026-09-22
 **Depends on:** [ADR 0001](./0001-pluggable-sources-and-runtimes.md) — it settles
@@ -298,19 +306,33 @@ survived a restart, `remove` refused while a task was bound (naming the task) an
 process, and a delivery for the newly created issue ran a real turn that finished
 in 20 s and posted its reply on the issue.
 
+Step 4 was verified the same way: `doctor --push` reported `active` and refreshed
+`last_seen` and the pinned model; a profile edited to pin a different model reached
+the dispatcher without a restart, and the next turn logged and used
+`model=deepseek/deepseek-v4-pro` and finished in 26 s; a host asked for a Gitea
+repository with no `tea` on PATH failed with "git.yusiwen.cn needs the tea
+command-line tool, which is not on PATH" and exit 2, and that failing report was
+**not** pushed, leaving `last_seen` untouched.
+
 ## Open questions
 
 1. **Admin token provisioning.** Environment only, or also generated on first start
    into a `0600` file so a fresh install works without the operator inventing one?
    Recommendation: environment only, and refuse to start without it — an
    auto-generated token in a file is one more secret on disk to find and rotate.
-2. **Should `doctor` repair, or only report?** Recommendation: `doctor` reports and
-   `init` installs, with `init --refresh` as the explicit repair path, so a routine
-   check never writes.
+2. **Should `doctor` repair, or only report?** Settled while implementing step 4:
+   `doctor` reports and pushes, `init` installs. `doctor --push` sends the report
+   only when the local check passes, so a routine check never writes files and
+   never advances `last_seen` for a host that would fail its next task. The
+   `init --refresh` name this question proposed is unnecessary — a re-run of `init`
+   already updates an outdated artifact.
 3. **What does a stale heartbeat mean?** Options: mark the runtime `degraded` and
    keep using it, or stop selecting it for new tasks. Recommendation: exclude a
    runtime from selection after a configurable two missed intervals, but never move
    a task already bound to it — the binding rule from ADR 0001 stays absolute.
+   Step 4 gives this something to measure: `last_seen` now moves only on a push the
+   host itself made and only for a report that passed, so a stale value really does
+   mean "no verified host here".
 4. **Secret rotation direction.** Admin-initiated only, or can a worker re-enroll
    itself with a new invite when its secret is lost? Recommendation: admin-initiated
    `rotate`, plus re-invite for a lost secret, so a compromised worker cannot mint

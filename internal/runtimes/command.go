@@ -342,22 +342,26 @@ func orDash(value string) string {
 	return value
 }
 
-// modelsOf renders the models a runtime reported, keyed by agent profile, in a
+// ModelsText renders the models a runtime reported, keyed by agent profile, in a
 // stable order so two runs are comparable. It answers the operator's question
 // "which model will this host run", which otherwise needs a look inside the
-// runtime's own agent files on the other machine.
-func modelsOf(runtime Runtime) string {
-	if len(runtime.Models) == 0 {
+// runtime's own agent files on the other machine. It is exported because the
+// data-plane commands print the same summary when they push a report.
+func ModelsText(models map[string]string) string {
+	if len(models) == 0 {
 		return ""
 	}
-	names := make([]string, 0, len(runtime.Models))
-	for name := range runtime.Models {
+	names := make([]string, 0, len(models))
+	for name := range models {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	parts := make([]string, 0, len(names))
 	for _, name := range names {
-		parts = append(parts, name+"="+runtime.Models[name])
+		parts = append(parts, name+"="+models[name])
 	}
 	return strings.Join(parts, ",")
 }
+
+// modelsOf renders one runtime's models.
+func modelsOf(runtime Runtime) string { return ModelsText(runtime.Models) }

@@ -328,8 +328,12 @@ func (i *Inventory) Register(ctx context.Context, claim Claim, inviteToken strin
 	return runtime.Redacted(), secret, nil
 }
 
-// Heartbeat records that a host is still there and refreshes its report.
-func (i *Inventory) Heartbeat(name, secret string, report map[string]any, now time.Time) (Runtime, error) {
+// Heartbeat records that a host is still there and replaces what the control plane
+// knows about it with the report it just pushed.
+//
+// A host that is not active is refused, and the refusal names the state: a revoked
+// host has to learn that it was revoked instead of quietly believing it still works.
+func (i *Inventory) Heartbeat(name, secret string, report map[string]any, models map[string]string, now time.Time) (Runtime, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
@@ -347,6 +351,14 @@ func (i *Inventory) Heartbeat(name, secret string, report map[string]any, now ti
 		if encoded, err := json.Marshal(report); err == nil {
 			runtime.ReportSHA256 = hashToken(string(encoded))
 		}
+	}
+	// A host that repaired an agent profile reports the model it now pins, and the
+	// dispatcher pins that on the next turn. An empty map leaves what enrolment
+	// recorded alone: "this build did not report models" is not the same claim as
+	// "this host runs no model", and clearing it would silently return every turn to
+	// whatever the agent server happens to have cached.
+	if len(models) > 0 {
+		runtime.Models = models
 	}
 	runtime.LastSeen = now.UTC()
 	if err := i.save(); err != nil {

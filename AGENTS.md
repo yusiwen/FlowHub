@@ -96,7 +96,7 @@ internal/projectmap/ YouTrack project -> repository routing table (~/.config/flo
 internal/opencode/  opencode client, permission arbiter, one-turn runner (make test-live)
 internal/rules/     trigger policy (ignore/analyze/plan/execute) and the per-turn prompt
 internal/dispatch/  the worker: queue, routing, worktree, session, arbiter, registry
-internal/provision/ data-plane host prep: `flowhub runtime init [--check]`, `uninstall`, enrolment (capability report, embedded artifacts, manifest, runtime identity)
+internal/provision/ data-plane host prep: `flowhub runtime init [--check]`, `doctor --push`, `uninstall` (capability report, embedded artifacts, manifest, runtime identity, heartbeat)
 internal/runtimes/  control plane: runtime inventory, states, invites, secrets (hashes only), `/control/v1` admin API and the `invite`/`list`/`show`/`remove`/`rotate` CLI
 internal/dedupe/    TTL idempotency cache
 internal/store/     Audit record, non-blocking queue, JSONL audit, payload log
@@ -263,6 +263,10 @@ documents. The rules below are load-bearing; do not relax them casually.
    refused one by one with the reason instead of silently re-homing them. The host
    reports what its profiles pin, and the dispatcher pins that model on the
    session, so what `init --check` verified is what the turn actually runs.
+   `doctor --push` keeps that report current under the runtime secret, and it
+   pushes only a report that passed: `last_seen` means "a host that was verified
+   fit", so an expired credential surfaces while the operator is looking instead of
+   at the first task.
 
 ## Before you finish a change
 

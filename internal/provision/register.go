@@ -128,6 +128,18 @@ func Register(ctx context.Context, client *runtimes.Client, inviteToken, name st
 	if err != nil {
 		return RegisterOutcome{}, err
 	}
+	// Resolve the configuration root here rather than trusting the caller. An empty
+	// root used to reach ManifestPathFor as "", which cleans to "." and produced the
+	// relative path ./flowhub/runtime.json — the identity landed in whatever
+	// directory the command happened to run in, and the next command could not find
+	// it. ConfigRootFor is what Install already uses, so the manifest and the
+	// identity now agree on where "FlowHub's own directory" is.
+	configRoot := strings.TrimSpace(opts.ConfigRoot)
+	if configRoot == "" {
+		// Register runs no command, so a zero ExecRunner is enough to read the
+		// environment and the user's home.
+		configRoot = ConfigRootFor(ExecRunner{}, opts)
+	}
 	identity := RuntimeIdentity{
 		Version:    1,
 		Name:       runtime.Name,
@@ -135,10 +147,24 @@ func Register(ctx context.Context, client *runtimes.Client, inviteToken, name st
 		Secret:     secret,
 		Registered: time.Now().UTC(),
 	}
-	if err := saveRuntimeIdentity(opts.ConfigRoot, identity); err != nil {
+	if err := saveRuntimeIdentity(configRoot, identity); err != nil {
 		return RegisterOutcome{}, err
 	}
-	return RegisterOutcome{Runtime: runtime, Secret: secret, Stored: RuntimeIdentityPathFor(opts.ConfigRoot)}, nil
+	return RegisterOutcome{Runtime: runtime, Secret: secret, Stored: RuntimeIdentityPathFor(configRoot)}, nil
+}
+
+// Push reports this host's current capabilities to the control plane under the
+// identity it stored at enrolment.
+//
+// This is the other half of the claim: the claim says what the host was when it
+// enrolled, and this says what it is now — including the model each installed
+// profile pins, which is the value the dispatcher pins on the next turn. The
+// runtime secret authenticates it; the admin token never reaches a data plane.
+func Push(ctx context.Context, client *runtimes.Client, identity RuntimeIdentity, report *Report) (runtimes.Runtime, error) {
+	if strings.TrimSpace(identity.Name) == "" || strings.TrimSpace(identity.Secret) == "" {
+		return runtimes.Runtime{}, errors.New("this host has no usable runtime identity; enrol it again before pushing a report")
+	}
+	return client.Heartbeat(ctx, identity.Name, identity.Secret, reportAsMap(report), profileModelsOf(report))
 }
 
 func versionOf(report *Report) string {

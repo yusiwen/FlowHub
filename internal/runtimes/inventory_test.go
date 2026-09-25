@@ -207,11 +207,11 @@ func TestHeartbeatRequiresTheSecretAndUpdatesLastSeen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := inventory.Heartbeat("builder-a", "wrong", nil, fixedNow.Add(time.Minute)); err == nil {
+	if _, err := inventory.Heartbeat("builder-a", "wrong", nil, nil, fixedNow.Add(time.Minute)); err == nil {
 		t.Fatal("a wrong secret was accepted")
 	}
 	later := fixedNow.Add(10 * time.Minute)
-	runtime, err := inventory.Heartbeat("builder-a", secret, map[string]any{"ok": true}, later)
+	runtime, err := inventory.Heartbeat("builder-a", secret, map[string]any{"ok": true}, map[string]string{"devops": "deepseek/deepseek-v4-pro"}, later)
 	if err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
@@ -220,6 +220,22 @@ func TestHeartbeatRequiresTheSecretAndUpdatesLastSeen(t *testing.T) {
 	}
 	if runtime.ReportSHA256 == "" {
 		t.Fatal("the report hash was not recorded")
+	}
+	// A host that repaired a profile reports the model it now pins, and the
+	// dispatcher pins that on the next turn. Without this refresh the control plane
+	// keeps handing out the model the host enrolled with.
+	if runtime.Models["devops"] != "deepseek/deepseek-v4-pro" {
+		t.Fatalf("the pushed models did not replace the enrolled ones: %v", runtime.Models)
+	}
+
+	// A push that carries no models must not erase what the host reported before:
+	// an older build saying nothing is not the same claim as "this host has none".
+	unchanged, err := inventory.Heartbeat("builder-a", secret, nil, nil, later)
+	if err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	if unchanged.Models["devops"] != "deepseek/deepseek-v4-pro" {
+		t.Fatalf("an empty push cleared the models: %v", unchanged.Models)
 	}
 }
 
@@ -238,10 +254,10 @@ func TestRotateInvalidatesTheOldSecret(t *testing.T) {
 	if newSecret == oldSecret {
 		t.Fatal("rotation returned the same secret")
 	}
-	if _, err := inventory.Heartbeat("builder-a", oldSecret, nil, fixedNow); err == nil {
+	if _, err := inventory.Heartbeat("builder-a", oldSecret, nil, nil, fixedNow); err == nil {
 		t.Fatal("the old secret still works")
 	}
-	if _, err := inventory.Heartbeat("builder-a", newSecret, nil, fixedNow); err != nil {
+	if _, err := inventory.Heartbeat("builder-a", newSecret, nil, nil, fixedNow); err != nil {
 		t.Fatalf("the new secret does not work: %v", err)
 	}
 }
@@ -252,7 +268,8 @@ func TestRotateInvalidatesTheOldSecret(t *testing.T) {
 func TestRemoveRefusesWhileTasksAreBound(t *testing.T) {
 	inventory := newInventory(t)
 	token, _, _ := inventory.Invite("builder-a", nil, time.Hour)
-	if _, _, err := inventory.Register(context.Background(), validClaim(), token, &probeOK{}, fixedNow); err != nil {
+	_, secret, err := inventory.Register(context.Background(), validClaim(), token, &probeOK{}, fixedNow)
+	if err != nil {
 		t.Fatal(err)
 	}
 	bound := func(name string) []string {
@@ -281,6 +298,13 @@ func TestRemoveRefusesWhileTasksAreBound(t *testing.T) {
 	}
 	if inventory.SecretMatches("builder-a", "anything") {
 		t.Fatal("a revoked runtime still matches a secret")
+	}
+	// Its next heartbeat is refused with the reason, so a revoked host learns that
+	// it was revoked instead of believing it is still enrolled (ADR 0002).
+	if _, err := inventory.Heartbeat("builder-a", secret, nil, nil, fixedNow.Add(time.Hour)); err == nil {
+		t.Fatal("a revoked runtime heartbeat was accepted")
+	} else if !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("the refusal does not name the state: %v", err)
 	}
 }
 
@@ -441,11 +465,27 @@ func TestControlAPIEnrolmentRoundTrip(t *testing.T) {
 		t.Fatalf("Show: %+v %v %v", shown, bound, err)
 	}
 
-	if err := client.Heartbeat(context.Background(), "builder-a", secret, map[string]any{"ok": true}); err != nil {
+	if _, err := client.Heartbeat(context.Background(), "builder-a", secret, map[string]any{"ok": true}, map[string]string{"devops": "deepseek/deepseek-flash"}); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
-	if err := client.Heartbeat(context.Background(), "builder-a", "wrong", nil); err == nil {
+	if _, err := client.Heartbeat(context.Background(), "builder-a", "wrong", nil, nil); err == nil {
 		t.Fatal("a wrong runtime secret was accepted")
+	}
+
+	// The pushed report and the models travel through the API, not only through the
+	// in-process call: `doctor --push` is the only thing that refreshes them.
+	pushed, _, err := client.Show(context.Background(), "builder-a")
+	if err != nil {
+		t.Fatalf("Show: %v", err)
+	}
+	if pushed.ReportSHA256 == "" {
+		t.Fatal("the pushed report was not fingerprinted")
+	}
+	if pushed.Models["devops"] != "deepseek/deepseek-flash" {
+		t.Fatalf("the pushed models were not recorded: %v", pushed.Models)
+	}
+	if pushed.LastSeen.IsZero() {
+		t.Fatal("the heartbeat did not move last_seen")
 	}
 }
 
@@ -507,7 +547,7 @@ func TestControlAPIRoundTripsAReportAndRotates(t *testing.T) {
 	if secret == "" {
 		t.Fatal("no secret was returned")
 	}
-	if err := client.Heartbeat(context.Background(), "builder-a", secret, nil); err != nil {
+	if _, err := client.Heartbeat(context.Background(), "builder-a", secret, nil, nil); err != nil {
 		t.Fatalf("the rotated secret does not work: %v", err)
 	}
 }

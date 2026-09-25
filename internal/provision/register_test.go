@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"path/filepath"
 	"testing"
 
 	"github.com/yusiwen/flowhub/internal/runtimes"
@@ -108,9 +108,13 @@ func TestRegisterSendsThePinnedModels(t *testing.T) {
 		t.Errorf("claim = %v, want the product and the profile kept apart", claims[0])
 	}
 
-	// The registration secret goes to the host's identity file and nowhere else.
-	if !strings.Contains(outcome.Stored, "runtime.json") {
-		t.Errorf("Stored = %q, want the identity path", outcome.Stored)
+	// The registration secret goes to the host's identity file and nowhere else. The
+	// identity sits beside the manifest in FlowHub's own directory, which is the
+	// sibling of the agent's root — an empty root used to resolve to the relative
+	// path ./flowhub/runtime.json, so the identity landed in the working directory.
+	want := filepath.Join(filepath.Dir(configRoot), "flowhub", RuntimeIdentityFileName)
+	if outcome.Stored != want {
+		t.Errorf("Stored = %q, want %q", outcome.Stored, want)
 	}
 	identity, err := LoadRuntimeIdentity(configRoot)
 	if err != nil {

@@ -61,9 +61,11 @@ func runtimeCommand(args []string, stdout, stderr io.Writer) int {
 			return code
 		}
 		return ExitOK
-	case "doctor", "reconfigure":
+	case "doctor":
+		return doctorCommand(args[1:], stdout, stderr)
+	case "reconfigure":
 		fmt.Fprintf(stderr, "flowhub runtime %s: not implemented in this build\n", args[0])
-		fmt.Fprintln(stderr, "this build implements init, uninstall and the control-plane commands (see docs/adr/0002).")
+		fmt.Fprintln(stderr, "this build implements init, uninstall, doctor and the control-plane commands (see docs/adr/0002).")
 		return ExitUsage
 	case "-h", "--help", "help":
 		usage(stdout)
@@ -104,31 +106,120 @@ func usage(w io.Writer) {
       --strict                treat warnings as failures
       --timeout <duration>    bound a single command (default 20s)
 
+  flowhub runtime doctor [--push] [flags]
+      Re-check this host and report what it can and cannot do. With --push the
+      report is sent to the control plane under this host's runtime secret, which
+      also refreshes the models the dispatcher pins. A report that does not pass
+      is not pushed: last_seen has to mean "a host that was verified fit".
+
   flowhub runtime uninstall [--agent <name>] [--config-root <dir>] [--force]
       Remove exactly the files the manifest records. A file a human edited is
       kept unless --force is given.
 
   What init installs comes from the binary, never from the network; the manifest
   records a hash of every file so a re-run is a no-op and a hand edit is refused
-  with a diff. Enrollment in the control plane is not implemented yet
-  (docs/adr/0002 step 3): this command installs and reports, it does not register.
+  with a diff. "init --server … --name … --token …" enrols the host, and
+  "doctor --push" keeps the control plane's view of it current.
 `)
+}
+
+// checkFlags are the flags that configure the capability check itself.
+//
+// `init --check` and `doctor` run the same check, so they share one parser: a flag
+// only one of them honoured would let the two commands disagree about the same
+// machine, which is exactly what makes a report untrustworthy.
+type checkFlags struct {
+	Options
+	configRoot  string
+	json        bool
+	timeout     time.Duration
+	openCodeURL string
+	repos       listFlag
+	forges      listFlag
+	requiredEnv listFlag
+}
+
+func addCheckFlags(fs *flag.FlagSet, into *checkFlags) {
+	fs.StringVar(&into.Agent, "agent", AgentOpenCode, "agent runtime to look for")
+	fs.StringVar(&into.configRoot, "config-root", "", "agent configuration directory")
+	fs.StringVar(&into.openCodeURL, "opencode-url", DefaultOpenCodeURL, "agent server whose model catalogue is checked")
+	fs.Var(&into.repos, "repo", "repository to check: <remote>[=<clone path>]; repeatable")
+	fs.Var(&into.forges, "forge", "forge tooling for a git host: <host>=<github|gitea|none>; repeatable")
+	fs.Var(&into.requiredEnv, "require-env", "environment variable that must be present; repeatable")
+	fs.BoolVar(&into.json, "json", false, "print the machine-readable report")
+	fs.BoolVar(&into.Strict, "strict", false, "treat warnings as failures")
+	fs.DurationVar(&into.timeout, "timeout", DefaultCommandTimeout, "bound a single command")
+}
+
+// finish validates and normalises what the shared flags collected.
+func (c *checkFlags) finish(command string, stderr io.Writer) error {
+	if c.timeout <= 0 {
+		fmt.Fprintf(stderr, "%s: --timeout must be positive\n", command)
+		return fmt.Errorf("bad timeout")
+	}
+	c.Agent = strings.TrimSpace(c.Agent)
+	if c.Agent == "" {
+		fmt.Fprintf(stderr, "%s: --agent must name the agent runtime to look for\n", command)
+		return fmt.Errorf("bad agent")
+	}
+	c.configRoot = strings.TrimSpace(c.configRoot)
+	c.openCodeURL = strings.TrimRight(strings.TrimSpace(c.openCodeURL), "/")
+
+	c.Forges = map[string]string{}
+	for _, entry := range c.forges {
+		host, kind, found := strings.Cut(entry, "=")
+		host, kind = strings.TrimSpace(host), strings.TrimSpace(kind)
+		if !found || host == "" || kind == "" {
+			fmt.Fprintf(stderr, "%s: --forge %q: want <host>=<github|gitea|none>\n", command, entry)
+			return fmt.Errorf("bad forge")
+		}
+		c.Forges[strings.ToLower(host)] = strings.ToLower(kind)
+	}
+	for _, entry := range c.repos {
+		remote, clone, _ := strings.Cut(entry, "=")
+		remote, clone = strings.TrimSpace(remote), strings.TrimSpace(clone)
+		if remote == "" {
+			fmt.Fprintf(stderr, "%s: --repo %q: the remote is required\n", command, entry)
+			return fmt.Errorf("bad repo")
+		}
+		c.Repos = append(c.Repos, RepoExpectation{Remote: remote, Clone: clone})
+	}
+	for _, name := range c.requiredEnv {
+		if name = strings.TrimSpace(name); name != "" {
+			c.RequiredEnv = append(c.RequiredEnv, name)
+		}
+	}
+	return nil
+}
+
+// resolve fills in the two values the check derives from the flags: the effective
+// configuration directory, and the model catalogue of this host's own agent server.
+func (c *checkFlags) resolve(runner Runner) {
+	c.OpenCodeURL = c.openCodeURL
+	// Without --config-root the effective root is the agent's own directory, and the
+	// model check has to look at the profile the server will load — not merely at
+	// what this binary would install.
+	c.ConfigRoot = ConfigRootFor(runner, InstallOptions{Agent: c.Agent, ConfigRoot: c.configRoot})
+	c.Catalogue = catalogueFor(c.openCodeURL)
 }
 
 // initOptions is the parsed form of `runtime init`.
 type initOptions struct {
-	Options
-	check       bool
-	json        bool
-	force       bool
-	configRoot  string
-	version     string
-	timeout     time.Duration
-	server      string
-	token       string
-	advertise   string
-	name        string
-	openCodeURL string
+	checkFlags
+	check     bool
+	force     bool
+	version   string
+	server    string
+	token     string
+	advertise string
+	name      string
+}
+
+// doctorOptions is the parsed form of `runtime doctor`.
+type doctorOptions struct {
+	checkFlags
+	push   bool
+	server string
 }
 
 func initCommand(args []string, stdout, stderr io.Writer) int {
@@ -138,16 +229,14 @@ func initCommand(args []string, stdout, stderr io.Writer) int {
 	}
 
 	runner := ExecRunner{Timeout: parsed.timeout}
-	parsed.OpenCodeURL = parsed.openCodeURL
-	// Without --config-root the effective root is the agent's own directory, and the
-	// model check has to look at the profile the server will load — not merely at
-	// what this binary would install.
-	parsed.ConfigRoot = ConfigRootFor(runner, InstallOptions{Agent: parsed.Agent, ConfigRoot: parsed.configRoot})
-	parsed.Catalogue = catalogueFor(parsed.openCodeURL)
+	parsed.resolve(runner)
 
 	install := InstallOptions{
-		Agent:          parsed.Agent,
-		ConfigRoot:     parsed.configRoot,
+		Agent:      parsed.Agent,
+		ConfigRoot: parsed.ConfigRoot,
+		// The resolved root, not the raw flag: the manifest and the runtime identity
+		// both live in FlowHub's own configuration directory, and an empty root used
+		// to resolve to a relative path there.
 		FlowHubVersion: parsed.version,
 		Force:          parsed.force,
 	}
@@ -214,7 +303,12 @@ func initCommand(args []string, stdout, stderr io.Writer) int {
 		// job once it is.
 		switch {
 		case parsed.server == "" && parsed.token == "" && parsed.name == "":
-			fmt.Fprintln(human, "note: not registered with a control plane; pass --server, --name and --token (from the invite) to enrol")
+			if identity, identityErr := LoadRuntimeIdentity(parsed.ConfigRoot); identityErr == nil {
+				fmt.Fprintf(human, "note: already enrolled as %s with %s; run `flowhub runtime doctor --push` to refresh the report and the models the control plane pins\n",
+					identity.Name, identity.Server)
+			} else {
+				fmt.Fprintln(human, "note: not registered with a control plane; pass --server, --name and --token (from the invite) to enrol")
+			}
 		case parsed.server == "" || parsed.token == "" || parsed.name == "":
 			fmt.Fprintln(stderr, "flowhub runtime init: --server, --name and --token go together; nothing was registered")
 			refused = true
@@ -234,6 +328,85 @@ func initCommand(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if !report.OK || refused {
+		return ExitNotReady
+	}
+	return ExitOK
+}
+
+// doctorCommand re-checks this host and, with --push, reports the result to the
+// control plane.
+//
+// The push is what keeps the control plane's view of a worker current: the claim
+// made at enrolment is a snapshot, and a repaired agent profile changes the model
+// the dispatcher has to pin. A report that does not pass is deliberately not
+// pushed, so `last_seen` keeps meaning "a host that was verified fit" — an expired
+// credential has to surface here, while the operator is looking, rather than at the
+// first task that needs it.
+func doctorCommand(args []string, stdout, stderr io.Writer) int {
+	parsed, err := parseDoctor(args, stderr)
+	if err != nil {
+		return ExitUsage
+	}
+
+	runner := ExecRunner{Timeout: parsed.timeout}
+	parsed.resolve(runner)
+
+	report, err := Check(context.Background(), runner, parsed.Options)
+	if err != nil {
+		fmt.Fprintf(stderr, "flowhub runtime doctor: %v\n", err)
+		return ExitUsage
+	}
+	printCheck(report, parsed.json, stdout, stderr)
+
+	// Under --json, stdout carries only the JSON document, so everything written for
+	// a human goes to stderr.
+	human := stdout
+	if parsed.json {
+		human = stderr
+	}
+
+	pushed := true
+	switch {
+	case !parsed.push:
+		fmt.Fprintln(human, "note: --push was not given, so the control plane still holds the report from the last push")
+		if identity, identityErr := LoadRuntimeIdentity(parsed.ConfigRoot); identityErr == nil {
+			fmt.Fprintf(human, "this host is enrolled as %s with %s\n", identity.Name, identity.Server)
+		}
+	case !report.OK:
+		fmt.Fprintln(stderr, "flowhub runtime doctor: the report is not pushed while the check fails; fix the gap and run this again")
+		pushed = false
+	default:
+		pushed = false
+		identity, identityErr := LoadRuntimeIdentity(parsed.ConfigRoot)
+		if identityErr != nil {
+			fmt.Fprintf(stderr, "flowhub runtime doctor: %v\n", identityErr)
+			break
+		}
+		server := parsed.server
+		if server == "" {
+			server = identity.Server
+		}
+		if server == "" {
+			fmt.Fprintln(stderr, "flowhub runtime doctor: this host's identity names no control plane; pass --server")
+			break
+		}
+		client := runtimes.NewClient(server, "")
+		pushCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		runtime, pushErr := Push(pushCtx, client, identity, report)
+		cancel()
+		if pushErr != nil {
+			fmt.Fprintf(stderr, "flowhub runtime doctor: the control plane did not accept the report: %v\n", pushErr)
+			break
+		}
+		pushed = true
+		fmt.Fprintf(human, "\npushed to %s: %s is %s (last seen %s)\n",
+			server, runtime.Name, runtime.State, runtime.LastSeen.Format(time.RFC3339))
+		if models := runtimes.ModelsText(runtime.Models); models != "" {
+			fmt.Fprintf(human, "models the dispatcher will pin: %s\n", models)
+		}
+	}
+
+	if !report.OK || !pushed {
 		return ExitNotReady
 	}
 	return ExitOK
@@ -300,31 +473,17 @@ func uninstallCommand(args []string, stdout, stderr io.Writer) int {
 
 // parseInit turns the command line into options, printing usage on a mistake.
 func parseInit(args []string, stderr io.Writer) (initOptions, error) {
-	var (
-		agent       string
-		repos       listFlag
-		forges      listFlag
-		requiredEnv listFlag
-	)
 	parsed := initOptions{}
 
 	fs := flag.NewFlagSet("flowhub runtime init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	addCheckFlags(fs, &parsed.checkFlags)
 	fs.BoolVar(&parsed.check, "check", false, "report only: write nothing and register nothing")
-	fs.StringVar(&agent, "agent", AgentOpenCode, "agent runtime to look for")
-	fs.Var(&repos, "repo", "repository to check: <remote>[=<clone path>]; repeatable")
-	fs.Var(&forges, "forge", "forge tooling for a git host: <host>=<github|gitea|none>; repeatable")
-	fs.Var(&requiredEnv, "require-env", "environment variable that must be present; repeatable")
-	fs.StringVar(&parsed.configRoot, "config-root", "", "agent configuration directory")
+	fs.BoolVar(&parsed.force, "force", false, "overwrite files FlowHub did not write")
 	fs.StringVar(&parsed.server, "server", "", "control plane to register with (with --token and --name)")
 	fs.StringVar(&parsed.token, "token", "", "invite token from the control plane's invite command")
 	fs.StringVar(&parsed.name, "name", "", "the runtime name the control plane invited")
 	fs.StringVar(&parsed.advertise, "advertise", "", "how the control plane reaches this host")
-	fs.BoolVar(&parsed.force, "force", false, "overwrite files FlowHub did not write")
-	fs.BoolVar(&parsed.json, "json", false, "print the machine-readable report")
-	fs.BoolVar(&parsed.Strict, "strict", false, "treat warnings as failures")
-	fs.StringVar(&parsed.openCodeURL, "opencode-url", DefaultOpenCodeURL, "agent server whose model catalogue is checked")
-	fs.DurationVar(&parsed.timeout, "timeout", DefaultCommandTimeout, "bound a single command")
 	if err := fs.Parse(args); err != nil {
 		return initOptions{}, err
 	}
@@ -332,42 +491,38 @@ func parseInit(args []string, stderr io.Writer) (initOptions, error) {
 		fmt.Fprintf(stderr, "flowhub runtime init: unexpected argument %q\n", fs.Arg(0))
 		return initOptions{}, fmt.Errorf("unexpected argument")
 	}
-	if parsed.timeout <= 0 {
-		fmt.Fprintln(stderr, "flowhub runtime init: --timeout must be positive")
-		return initOptions{}, fmt.Errorf("bad timeout")
+	if err := parsed.checkFlags.finish("flowhub runtime init", stderr); err != nil {
+		return initOptions{}, err
 	}
 
-	parsed.Agent = strings.TrimSpace(agent)
-	parsed.configRoot = strings.TrimSpace(parsed.configRoot)
 	parsed.server = strings.TrimRight(strings.TrimSpace(parsed.server), "/")
 	parsed.token = strings.TrimSpace(parsed.token)
 	parsed.advertise = strings.TrimSpace(parsed.advertise)
 	parsed.name = strings.TrimSpace(parsed.name)
 	parsed.version = Version
-	parsed.Forges = map[string]string{}
-	for _, entry := range forges {
-		host, kind, found := strings.Cut(entry, "=")
-		host, kind = strings.TrimSpace(host), strings.TrimSpace(kind)
-		if !found || host == "" || kind == "" {
-			fmt.Fprintf(stderr, "flowhub runtime init: --forge %q: want <host>=<github|gitea|none>\n", entry)
-			return initOptions{}, fmt.Errorf("bad forge")
-		}
-		parsed.Forges[strings.ToLower(host)] = strings.ToLower(kind)
+	return parsed, nil
+}
+
+// parseDoctor turns the command line into options for the re-check.
+func parseDoctor(args []string, stderr io.Writer) (doctorOptions, error) {
+	parsed := doctorOptions{}
+
+	fs := flag.NewFlagSet("flowhub runtime doctor", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	addCheckFlags(fs, &parsed.checkFlags)
+	fs.BoolVar(&parsed.push, "push", false, "send the report to the control plane")
+	fs.StringVar(&parsed.server, "server", "", "control plane to push to (default: the one in the stored identity)")
+	if err := fs.Parse(args); err != nil {
+		return doctorOptions{}, err
 	}
-	for _, entry := range repos {
-		remote, clone, _ := strings.Cut(entry, "=")
-		remote, clone = strings.TrimSpace(remote), strings.TrimSpace(clone)
-		if remote == "" {
-			fmt.Fprintf(stderr, "flowhub runtime init: --repo %q: the remote is required\n", entry)
-			return initOptions{}, fmt.Errorf("bad repo")
-		}
-		parsed.Repos = append(parsed.Repos, RepoExpectation{Remote: remote, Clone: clone})
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "flowhub runtime doctor: unexpected argument %q\n", fs.Arg(0))
+		return doctorOptions{}, fmt.Errorf("unexpected argument")
 	}
-	for _, name := range requiredEnv {
-		if name = strings.TrimSpace(name); name != "" {
-			parsed.RequiredEnv = append(parsed.RequiredEnv, name)
-		}
+	if err := parsed.checkFlags.finish("flowhub runtime doctor", stderr); err != nil {
+		return doctorOptions{}, err
 	}
+	parsed.server = strings.TrimRight(strings.TrimSpace(parsed.server), "/")
 	return parsed, nil
 }
 

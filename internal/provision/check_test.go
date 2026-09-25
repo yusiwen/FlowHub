@@ -5,8 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/yusiwen/flowhub/internal/runtimes"
 )
 
 // fakeRunner is a host described by maps, so the checks can be tested without
@@ -541,6 +545,90 @@ func TestParseInitRejectsMalformedFlags(t *testing.T) {
 	}
 }
 
+// TestParseDoctorSharesTheCheckFlags: doctor and `init --check` have to describe
+// the same machine, so they parse the same flags. A flag only one of them honoured
+// would make one report differ from the other for no reason an operator can see.
+func TestParseDoctorSharesTheCheckFlags(t *testing.T) {
+	parsed, err := parseDoctor([]string{
+		"--push",
+		"--agent", "opencode",
+		"--config-root", "/srv/agent",
+		"--opencode-url", "http://127.0.0.1:4096/",
+		"--repo", "git@git.yusiwen.cn:o/r.git=/srv/repos/r",
+		"--forge", "git.yusiwen.cn=gitea",
+		"--require-env", "YOUTRACK_TOKEN",
+		"--json",
+		"--strict",
+		"--server", "http://gateway.lan:8081/",
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseDoctor: %v", err)
+	}
+	if !parsed.push || !parsed.json || !parsed.Strict {
+		t.Fatalf("parsed = %+v", parsed)
+	}
+	if parsed.Agent != "opencode" || parsed.configRoot != "/srv/agent" {
+		t.Fatalf("parsed = %+v", parsed)
+	}
+	if parsed.openCodeURL != "http://127.0.0.1:4096" || parsed.server != "http://gateway.lan:8081" {
+		t.Fatalf("the trailing slashes were not trimmed: %q %q", parsed.openCodeURL, parsed.server)
+	}
+	if parsed.Forges["git.yusiwen.cn"] != ForgeGitea || len(parsed.Repos) != 1 || len(parsed.RequiredEnv) != 1 {
+		t.Fatalf("parsed = %+v", parsed)
+	}
+
+	for _, args := range [][]string{{"--timeout", "0s"}, {"--forge", "git.example.com"}, {"extra"}} {
+		if _, err := parseDoctor(args, &bytes.Buffer{}); err == nil {
+			t.Errorf("parseDoctor(%v) accepted malformed input", args)
+		}
+	}
+}
+
+// TestPushUsesTheRuntimeSecretAndCarriesTheModels is the data-plane half of
+// `doctor --push`: the report and the models travel under the runtime secret, so a
+// worker needs no admin token to keep the control plane's view of it current.
+func TestPushUsesTheRuntimeSecretAndCarriesTheModels(t *testing.T) {
+	var (
+		auth string
+		body map[string]any
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"runtime":{"name":"builder-a","state":"active","models":{"devops":"deepseek/deepseek-flash"}}}`))
+	}))
+	defer server.Close()
+
+	report := &Report{Profiles: []ProfileCheck{{Agent: "devops", Model: "deepseek/deepseek-flash", Source: "installed"}}}
+	client := runtimes.NewClient(server.URL, "")
+	runtime, err := Push(context.Background(), client, RuntimeIdentity{Name: "builder-a", Server: server.URL, Secret: "s3cret"}, report)
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if auth != "Bearer s3cret" {
+		t.Fatalf("authorization = %q, want the runtime secret", auth)
+	}
+	if body["report"] == nil {
+		t.Fatal("the capability report was not sent")
+	}
+	models, _ := body["models"].(map[string]any)
+	if models["devops"] != "deepseek/deepseek-flash" {
+		t.Fatalf("the pinned model was not sent: %v", body["models"])
+	}
+	if runtime.Name != "builder-a" || runtime.State != "active" {
+		t.Fatalf("runtime = %+v", runtime)
+	}
+
+	if _, err := Push(context.Background(), client, RuntimeIdentity{Name: "builder-a"}, report); err == nil {
+		t.Fatal("a push without a secret was accepted")
+	}
+	if _, err := Push(context.Background(), client, RuntimeIdentity{Secret: "s3cret"}, report); err == nil {
+		t.Fatal("a push without a name was accepted")
+	}
+}
+
 func TestCommandExitStatuses(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := Main("nonsense", nil, &stdout, &stderr); code != ExitUsage {
@@ -552,7 +640,7 @@ func TestCommandExitStatuses(t *testing.T) {
 	// a throwaway root.
 	stdout.Reset()
 	stderr.Reset()
-	if code := runtimeCommand([]string{"doctor"}, &stdout, &stderr); code != ExitUsage {
+	if code := runtimeCommand([]string{"reconfigure"}, &stdout, &stderr); code != ExitUsage {
 		t.Fatalf("unimplemented subcommand exit = %d", code)
 	}
 	if code := runtimeCommand(nil, &stdout, &stderr); code != ExitUsage {
