@@ -508,9 +508,10 @@ What a maintainer sees, once `FLOWHUB_DISPATCH=1`:
    from a human one, and the trigger it names comes from the decision rather than
    from the model's own account of why it replied.
 
-Which deliveries become work is a pure function of the delivery and the recorded
-task (`internal/rules`), so it is unit tested without opencode, git or the
-network:
+Which deliveries become work is a pure function of the neutral event and the
+recorded task (`internal/rules`), so it is unit tested without opencode, git or
+the network. The event comes from the source adapter
+(`internal/source/youtrack`), which is also where the per-turn prompt lives:
 
 | Delivery | Action |
 | --- | --- |
@@ -559,14 +560,18 @@ outside this repository, in the opencode configuration
 (`~/.config/opencode/agents/devops.md` on this host). That file owns the model,
 the step budget and the durable part of the contract — untrusted issue text, only
 your own worktree, never push, never touch secrets, one reply with the marker.
-The per-turn prompt (`internal/rules/prompt.go`) restates the parts that must hold
-even if the agent file is changed. A routing entry may name its own `agent`
-instead, and that wins over `FLOWHUB_DISPATCH_AGENT`.
+The per-turn prompt (`internal/source/youtrack/prompt.go`, the source adapter)
+restates the parts that must hold even if the agent file is changed. A routing
+entry may name its own `agent` instead, and that wins over
+`FLOWHUB_DISPATCH_AGENT`.
 
 The session-level ruleset in `internal/opencode/phase.go` stays the first
 permission layer and the arbiter the second, in both phases. The execution phase
 is the only phase in which `edit` is granted, which is what keeps an analysis turn
-harmless even if the model decides to be helpful.
+harmless even if the model decides to be helpful. Which tools are allowed at all,
+which call counts as the reply and where a download may land come from the
+source's `ToolPolicy` (`internal/source/youtrack/tools.go`); the dispatcher only
+enforces them, so an adapter cannot widen the shell policy.
 
 ### Measured on this host
 
@@ -904,11 +909,16 @@ Layout:
 | `cmd/flowhub` | Wiring, flags, HTTP server, `/healthz`, graceful shutdown |
 | `internal/config` | Environment parsing, validation, masked reporting |
 | `internal/logging` | Application logger: stderr plus a size-rotated log file |
-| `internal/webhook` | Lenient payload model, payload schema report, the delivery pipeline, redaction |
+| `internal/event` | The neutral event IR every source decodes into and the core consumes |
+| `internal/source` | The event-source seam: `Request`, `Decoded`, `Source`, and the data-only tool policy |
+| `internal/source/youtrack` | The YouTrack adapter: payload model, payload schema report, neutral-event decoding, tool allowlist, per-turn prompt |
+| `internal/webhook` | The delivery pipeline: entry locks, body limits, source decode, replay window, idempotency, audit, redaction |
 | `internal/dedupe` | TTL idempotency cache |
 | `internal/store` | Audit record, non-blocking queue, daily JSONL writer, human readable payload log |
-| `internal/projectmap` | YouTrack project → repository routing table: strict loader, canonical paths, fail-closed validation |
+| `internal/projectmap` | YouTrack project → repository routing table: strict loader, canonical paths, fail-closed validation, runtime addressing |
+| `internal/rules` | Trigger policy over the neutral event: ignore/analyze/plan/execute, self-comment detection, turn budget, reply basis |
 | `internal/opencode` | opencode client, permission arbiter and the runner that drives one unattended turn |
+| `internal/dispatch` | The workers: intake loop, one queue and worker per runtime, worktree, session, registry, audit |
 | `internal/metrics` | Counters used by `/healthz` |
 | `config/config.example.json` | Committed template for the routing table |
 | `scripts/smoke.sh` | The end-to-end check behind `make smoke` |

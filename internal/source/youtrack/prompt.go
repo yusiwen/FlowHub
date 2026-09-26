@@ -1,47 +1,50 @@
-package rules
+package youtrack
 
 import (
 	"fmt"
 	"strings"
-)
 
-// PromptContext is the routing information the prompt needs.
-type PromptContext struct {
-	// Worktree is the directory the agent works in.
-	Worktree string
-	// AttachmentsDir is where downloaded attachments must be written, relative
-	// to the worktree.
-	AttachmentsDir string
-	// Repository is the human readable repository identity, for context only.
-	Repository string
-	// Author is the YouTrack login whose action triggered this turn.
-	Author string
-	// Basis is what caused the turn, as a short English clause the sign-off can
-	// translate ("the creation of this issue", `the comment "/opencode start"`).
-	// It comes from the decision, so the reply cannot claim a reason of its own.
-	Basis string
-}
+	"github.com/yusiwen/flowhub/internal/event"
+	"github.com/yusiwen/flowhub/internal/rules"
+)
 
 // Prompt writes the instruction for one turn.
 //
-// The contract has to be in the prompt, not only in the agent file: the marker is
-// what stops the agent's own reply from re-triggering FlowHub, and the untrusted
-// input warning is the only thing standing between an issue body and the agent's
-// tool use.
-func (p Policy) Prompt(action Action, d Delivery, ctx PromptContext) string {
-	p = p.Defaults()
+// It lives in the adapter because the text names YouTrack's own tools and carries
+// YouTrack's sign-off contract. The contract has to be in the prompt, not only in
+// the agent file: the marker is what stops the agent's own reply from
+// re-triggering FlowHub, and the untrusted-input warning is the only thing
+// standing between an issue body and the agent's tool use.
+func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptContext) string {
+	p := s.Policy()
 	attachments := ctx.AttachmentsDir
 	if attachments == "" {
-		attachments = ".flowhub/attachments"
+		attachments = DownloadPrefix
+	}
+	subject := e.Subject
+	d := struct {
+		IssueID     string
+		ProjectKey  string
+		Summary     string
+		Description string
+		CommentText string
+		Actor       string
+	}{
+		IssueID:     subject.Key,
+		ProjectKey:  subject.Project,
+		Summary:     subject.Title,
+		Description: subject.Body,
+		CommentText: e.Comment,
+		Actor:       e.Actor,
 	}
 
 	var b strings.Builder
 	switch action {
-	case ActionAnalyze:
+	case rules.ActionAnalyze:
 		fmt.Fprintf(&b, "Analyse YouTrack issue %s before any implementation work.\n", d.IssueID)
-	case ActionPlan:
+	case rules.ActionPlan:
 		fmt.Fprintf(&b, "Produce an implementation plan for YouTrack issue %s.\n", d.IssueID)
-	case ActionExecute:
+	case rules.ActionExecute:
 		fmt.Fprintf(&b, "Implement the agreed plan for YouTrack issue %s.\n", d.IssueID)
 	default:
 		return ""
@@ -87,17 +90,17 @@ func (p Policy) Prompt(action Action, d Delivery, ctx PromptContext) string {
 	b.WriteString("  Then read the file from there.\n")
 
 	switch action {
-	case ActionAnalyze:
+	case rules.ActionAnalyze:
 		b.WriteString("\n## This turn\n")
 		b.WriteString("This turn is READ-ONLY. Inspect the repository and the issue, but change nothing:\n")
 		b.WriteString("no file edits, no commits, no state changes in YouTrack.\n")
-	case ActionPlan:
+	case rules.ActionPlan:
 		b.WriteString("\n## This turn\n")
 		b.WriteString("This turn is READ-ONLY. Produce a concrete, ordered implementation plan: which files change, what the\n")
 		b.WriteString("risky parts are, and how the change will be verified. List every question that must be answered by a\n")
 		b.WriteString("human before implementation can start. If a plan already exists in this session, refine it instead of\n")
 		b.WriteString("starting over. Change nothing on disk.\n")
-	case ActionExecute:
+	case rules.ActionExecute:
 		b.WriteString("\n## This turn\n")
 		b.WriteString("Implement the plan in the working directory. You may edit files and commit locally on the task branch;\n")
 		b.WriteString("you must never push, and never touch another branch or the shared checkout. Run the project's tests or\n")
@@ -108,7 +111,7 @@ func (p Policy) Prompt(action Action, d Delivery, ctx PromptContext) string {
 	fmt.Fprintf(&b, "Post exactly one comment on issue %s with the `youtrack_add_issue_comment` tool.\n", d.IssueID)
 	b.WriteString("Write it for the maintainer reading the issue: what you found or changed, what you verified, and what\n")
 	b.WriteString("you need from them. Keep it short. Do not post any other comment.\n")
-	if action != ActionExecute {
+	if action != rules.ActionExecute {
 		// The agent is the only thing the maintainer talks to, so it has to name
 		// the exact command that starts the implementation; it comes from the
 		// policy rather than being written out here, so a configured trigger
@@ -131,10 +134,10 @@ func (p Policy) Prompt(action Action, d Delivery, ctx PromptContext) string {
 	b.WriteString("automatically by opencode and what triggered this turn. Use the trigger given here verbatim in\n")
 	b.WriteString("meaning — do not substitute your own explanation of why you replied:\n\n")
 	fmt.Fprintf(&b, "> This comment was generated automatically by opencode, from %s.\n", basis)
-	fmt.Fprintf(&b, "> %s\n", SelfMarker)
+	fmt.Fprintf(&b, "> %s\n", rules.SelfMarker)
 	b.WriteString("\nWrite that statement in the language of the issue (translate the sentence above; keep the code,\n")
 	b.WriteString("paths and identifiers inside it as they are). The example is English only because this prompt is.\n")
-	fmt.Fprintf(&b, "The final line of the comment must be `> %s`: a blockquote line whose only content is the marker.\n", SelfMarker)
+	fmt.Fprintf(&b, "The final line of the comment must be `> %s`: a blockquote line whose only content is the marker.\n", rules.SelfMarker)
 	b.WriteString("That marker lets the automation recognise its own replies; without it the reply is treated as a human\n")
 	b.WriteString("instruction and starts another turn.\n")
 	return b.String()

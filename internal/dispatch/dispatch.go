@@ -8,7 +8,6 @@ package dispatch
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,40 +17,22 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yusiwen/flowhub/internal/event"
 	"github.com/yusiwen/flowhub/internal/opencode"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
 	"github.com/yusiwen/flowhub/internal/runtimes"
+	"github.com/yusiwen/flowhub/internal/source"
 	"github.com/yusiwen/flowhub/internal/store"
-	"github.com/yusiwen/flowhub/internal/webhook"
 	"github.com/yusiwen/flowhub/internal/worktree"
 )
-
-// AllowedMCPTools are the tools the agent may call without asking. They are
-// listed in the session ruleset as well, because a request that never asks costs
-// nothing while one that asks waits for the next poll tick.
-//
-// Everything absent from this list stays gated: the ruleset asks and the arbiter
-// denies. The measured inventory includes trackers writers (`youtrack_update_issue`),
-// web crawlers and cross-session memory, none of which an unattended turn needs.
-var AllowedMCPTools = []string{
-	"youtrack_get_issue",
-	"youtrack_get_issue_comments",
-	"youtrack_search_issues",
-	"youtrack_get_project",
-	"youtrack_get_issue_fields_schema",
-	"youtrack_find_projects",
-	"youtrack_get_current_user",
-	"youtrack_add_issue_comment",
-}
 
 // Options configures a Dispatcher.
 type Options struct {
 	Client   *opencode.Client
 	Registry *registry.Registry
 	Projects *projectmap.Map
-	Rules    rules.Policy
 	Log      *slog.Logger
 	// Runtimes is the enrolled runtime inventory. When it is nil or empty the
 	// dispatcher falls back to Client, which is the environment-configured runtime
@@ -68,6 +49,9 @@ type Options struct {
 	// FirstResponse bounds how long a turn may take to produce its first assistant
 	// message before it is failed. Zero leaves the runner's own default.
 	FirstResponse time.Duration
+	// Source decodes deliveries and supplies this tracker's policy, prompt and tool
+	// allowlist. Required: the dispatcher names no vendor (ADR 0001).
+	Source source.Source
 	// QueueSize bounds the deliveries waiting for the worker.
 	QueueSize int
 	// PauseFile disables dispatch while it exists.
@@ -83,6 +67,9 @@ type Options struct {
 type Dispatcher struct {
 	opts Options
 	log  *slog.Logger
+	// policy is the trigger policy the source supplied, resolved once so every
+	// delivery and every prompt is judged by the same rules.
+	policy rules.Policy
 
 	// managers caches one worktree manager per base directory, and clients one
 	// opencode client per runtime. One worker per runtime touches them, so they are
@@ -131,6 +118,9 @@ func New(opts Options) (*Dispatcher, error) {
 	if opts.Projects == nil {
 		return nil, errors.New("dispatch: a routing table is required")
 	}
+	if opts.Source == nil {
+		return nil, errors.New("dispatch: an event source is required")
+	}
 	if opts.Log == nil {
 		opts.Log = slog.Default()
 	}
@@ -143,10 +133,17 @@ func New(opts Options) (*Dispatcher, error) {
 	if opts.AttachmentsDir == "" {
 		opts.AttachmentsDir = opencode.DefaultAttachmentPathPrefix
 	}
-	opts.Rules = opts.Rules.Defaults()
+	ruleset := opts.Source.Policy().Defaults()
+	if strings.TrimSpace(ruleset.Trigger) == "" {
+		// A dispatcher whose policy has no trigger is a silent no-op that looks
+		// healthy, so the missing trigger is a programming error rather than a
+		// configuration one: the adapter's defaults always supply it.
+		return nil, errors.New("dispatch: the event source supplied no trigger policy")
+	}
 
 	return &Dispatcher{
 		opts:      opts,
+		policy:    ruleset,
 		log:       opts.Log,
 		prepLocks: map[string]*sync.Mutex{},
 		managers:  map[string]*worktree.Manager{},
@@ -202,8 +199,8 @@ type routed struct {
 func (d *Dispatcher) Run(ctx context.Context) {
 	d.log.Info("dispatcher started",
 		"queue_size", d.opts.QueueSize, "deadline", d.opts.Deadline,
-		"agent", d.opts.Agent, "analyze_on_create", !d.opts.Rules.SkipAnalyzeOnCreate,
-		"trigger", d.opts.Rules.Trigger)
+		"agent", d.opts.Agent, "analyze_on_create", !d.policy.SkipAnalyzeOnCreate,
+		"trigger", d.policy.Trigger)
 	var workers sync.WaitGroup
 	defer workers.Wait()
 	for {
@@ -486,15 +483,22 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		return
 	}
 
-	payload, _, err := webhook.Parse([]byte(rec.RawBody))
-	if err != nil {
-		// A delivery that reached this point has already been parsed once; a
+	decoded, err := d.opts.Source.Parse(&source.Request{
+		Method: rec.Method, Path: rec.Path, Query: rec.Query,
+		RemoteIP: rec.RemoteIP, UserAgent: rec.UserAgent, Body: []byte(rec.RawBody),
+	})
+	if err != nil || decoded.Event == nil {
+		// A delivery that reached this point has already been decoded once; a
 		// failure here means the audit record was tampered with.
-		d.log.Error("cannot re-parse an accepted delivery", "issue", rec.IssueID, "error", err)
+		d.log.Error("cannot re-decode an accepted delivery", "issue", rec.IssueID, "error", err)
+		return
+	}
+	delivery := *decoded.Event
+	if err := delivery.Validate(); err != nil {
+		d.log.Error("the source produced an unusable event", "issue", rec.IssueID, "error", err)
 		return
 	}
 
-	delivery := describe(rec, payload)
 	task, known := d.opts.Registry.Get(rec.IssueID)
 	taskView := rules.TaskView{Known: known}
 	if known {
@@ -503,7 +507,7 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		taskView.LastReply = task.LastReply
 	}
 
-	decision := d.opts.Rules.Decide(delivery, taskView)
+	decision := d.policy.Decide(delivery, taskView)
 	if decision.Action == rules.ActionIgnore {
 		d.ignored.Add(1)
 		d.log.Info("delivery not dispatched",
@@ -739,35 +743,43 @@ func (d *Dispatcher) prepareLock(repo string) *sync.Mutex {
 }
 
 // runTurn delivers one prompt and records what came back.
-func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery rules.Delivery, task registry.Task, match projectmap.Match, decision rules.Decision, binding runtimeBinding) {
+func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery event.Event, task registry.Task, match projectmap.Match, decision rules.Decision, binding runtimeBinding) {
 	phase := opencode.PhaseAnalysis
 	if decision.Action == rules.ActionExecute {
 		phase = opencode.PhaseExecution
 	}
 
-	prompt := d.opts.Rules.Prompt(decision.Action, delivery, rules.PromptContext{
+	prompt := d.opts.Source.Prompt(decision.Action, &delivery, rules.PromptContext{
 		Worktree:       task.Worktree,
 		AttachmentsDir: d.opts.AttachmentsDir,
 		Repository:     match.Entry.Repo.Path,
 		Author:         rec.PrimaryActor,
 		// The sign-off states what the agent was reacting to; it comes from the
 		// decision, so the reply cannot invent a reason for itself.
-		Basis: d.opts.Rules.Basis(decision, delivery),
+		Basis: d.policy.Basis(decision, delivery),
 	})
 	if prompt == "" {
 		d.log.Error("no prompt was built for the action", "action", decision.Action, "issue", rec.IssueID)
 		return
 	}
 
+	// The tool policy is data owned by the source: which tools may run unattended,
+	// which call counts as the reply, and where a download may land. Shell policy
+	// stays here, because a source must not be able to widen it.
+	tools := d.opts.Source.Tools()
+
 	arbiter := opencode.NewAnalysisArbiter()
 	if phase == opencode.PhaseExecution {
 		arbiter = opencode.NewExecutionArbiter()
 	}
+	arbiter.AllowTools = toolSet(tools.Allowed)
+	arbiter.CurlHosts = append([]string(nil), tools.Download.Hosts...)
+	arbiter.CurlOutputPrefix = tools.Download.Prefix
 
 	// The ruleset is the first permission layer and its ORDER is load bearing:
 	// the session ruleset is an array evaluated last-match-wins, so the catch-all
 	// has to come first and the specific entries after it.
-	ruleset := sessionRuleset()
+	ruleset := sessionRuleset(tools.Allowed)
 
 	// The routing entry owns the agent when it names one: which agent runs is a
 	// permission decision (that agent's own rules and tools), so it belongs next
@@ -803,12 +815,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 
 	// Record the turn even when it failed: the audit is the only place the
 	// operator can see what happened.
-	replied := false
-	for _, call := range result.Tools {
-		if call.Name == "youtrack_add_issue_comment" && call.Status == "completed" {
-			replied = true
-		}
-	}
+	replied := anyToolCompleted(result.Tools, tools.Reply)
 	attrs := []any{
 		"issue", rec.IssueID, "action", decision.Action, "phase", phase, "runtime", binding.Name,
 		"session", result.SessionID, "finished", result.Finished, "timed_out", result.TimedOut,
@@ -834,7 +841,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 	if result.Finished && !replied {
 		d.log.Error("the turn finished without posting a comment; the issue has no reply",
 			"issue", rec.IssueID, "session", result.SessionID,
-			"hint", "check the youtrack_add_issue_comment call and the MCP server")
+			"hint", "check the "+strings.Join(tools.Reply, "/")+" call and the MCP server")
 	}
 
 	state := registry.StateAwaitingInput
@@ -883,7 +890,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ru
 // last-match-wins, so a trailing catch-all would override every specific entry
 // (measured: a trailing "*": ask made an allowed tool ask again). Everything the
 // specific entries do not permit still reaches the arbiter as an `ask`.
-func sessionRuleset() []opencode.PermissionRule {
+func sessionRuleset(allowedTools []string) []opencode.PermissionRule {
 	ruleset := []opencode.PermissionRule{
 		{Permission: "*", Pattern: "*", Action: "ask"},
 		{Permission: "read", Pattern: "*", Action: "allow"},
@@ -900,40 +907,39 @@ func sessionRuleset() []opencode.PermissionRule {
 		{Permission: "webfetch", Pattern: "*", Action: "deny"},
 		{Permission: "websearch", Pattern: "*", Action: "deny"},
 	}
-	for _, tool := range AllowedMCPTools {
+	for _, tool := range allowedTools {
 		ruleset = append(ruleset, opencode.PermissionRule{Permission: tool, Pattern: "*", Action: "allow"})
 	}
 	return ruleset
 }
 
-// describe turns an audit record plus its payload into the rules' input.
-func describe(rec *store.Record, payload *webhook.Payload) rules.Delivery {
-	delivery := rules.Delivery{
-		Event:       rec.Event,
-		IssueID:     rec.IssueID,
-		ProjectKey:  rec.ProjectKey,
-		Summary:     payload.Summary,
-		Description: payload.Description,
-		Actor:       rec.PrimaryActor,
-		States:      map[string]string{},
+// toolSet turns a source's allowlist into the arbiter's lookup map.
+func toolSet(tools []string) map[string]bool {
+	if len(tools) == 0 {
+		return nil
 	}
-	if len(payload.Comments) > 0 {
-		// The newest comment is the one that triggered a comment event.
-		delivery.CommentText = payload.Comments[len(payload.Comments)-1].Text
+	set := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		set[tool] = true
 	}
-	for _, field := range payload.ChangedFields {
-		if field.Name == "" {
+	return set
+}
+
+// anyToolCompleted reports whether the turn called one of the source's reply
+// tools successfully, which is what "the issue got an answer" means. The list is
+// the source's; the loop is the dispatcher's.
+func anyToolCompleted(calls []opencode.ToolCall, replyTools []string) bool {
+	for _, call := range calls {
+		if call.Status != "completed" {
 			continue
 		}
-		// The value is polymorphic: only the enum shape carries a name.
-		var enum struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(field.Value, &enum); err == nil && enum.Name != "" {
-			delivery.States[field.Name] = enum.Name
+		for _, reply := range replyTools {
+			if call.Name == reply {
+				return true
+			}
 		}
 	}
-	return delivery
+	return false
 }
 
 // shortCommit renders a commit id for a log line: long enough to be unambiguous in

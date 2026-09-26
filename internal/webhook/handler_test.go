@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/yusiwen/flowhub/internal/dedupe"
 	"github.com/yusiwen/flowhub/internal/metrics"
+	"github.com/yusiwen/flowhub/internal/rules"
+	"github.com/yusiwen/flowhub/internal/source/youtrack"
 	"github.com/yusiwen/flowhub/internal/store"
 )
 
@@ -53,6 +56,7 @@ type harness struct {
 func newHarness(t *testing.T, mutate func(*Options)) *harness {
 	t.Helper()
 	opts := Options{
+		Source:       youtrack.New(rules.Policy{}),
 		HookPath:     "/hooks/youtrack",
 		HookKey:      testKey,
 		TokenHeader:  "X-YouTrack-Token",
@@ -475,49 +479,25 @@ func TestCommentAddedFacts(t *testing.T) {
 	}
 }
 
-func TestIssueIDForm(t *testing.T) {
-	cases := map[string]string{
-		"2-123":  "database",
-		"SP-123": "readable",
-		"":       "",
-		"weird":  "unknown",
-	}
-	for id, want := range cases {
-		if got := IssueIDForm(id); got != want {
-			t.Errorf("IssueIDForm(%q) = %q, want %q", id, got, want)
-		}
-	}
-}
+// TestTheRecordKeepsTheSourceSpellingOfTheTimestamp pins a behaviour the source
+// seam could have changed silently: the audit record and the idempotency key carry
+// the timestamp exactly as the app sent it, rather than a re-rendered RFC 3339
+// form. The published app has been measured sending epoch milliseconds, so
+// re-rendering would change both the record's shape and the dedupe key of every
+// such delivery.
+func TestTheRecordKeepsTheSourceSpellingOfTheTimestamp(t *testing.T) {
+	h := newHarness(t, nil)
 
-func TestParseTimestampFormats(t *testing.T) {
-	if _, err := ParseTimestamp("2026-09-19T12:00:00.000Z"); err != nil {
-		t.Fatalf("RFC3339 with millis: %v", err)
+	rfc := freshTimestamp()
+	assertRejected(t, h.post(t, keyedPath(), testToken, issueUpdatedBody(rfc)), "")
+	if got := h.sink.last(t); got.PayloadTimestamp != rfc {
+		t.Fatalf("RFC 3339 timestamp recorded as %q, want the raw %q", got.PayloadTimestamp, rfc)
 	}
-	if _, err := ParseTimestamp("2026-09-19T12:00:00Z"); err != nil {
-		t.Fatalf("RFC3339: %v", err)
-	}
-	ms, err := ParseTimestamp("1732708800000")
-	if err != nil {
-		t.Fatalf("epoch millis: %v", err)
-	}
-	if ms.UnixMilli() != 1732708800000 {
-		t.Fatalf("epoch millis parsed as %d", ms.UnixMilli())
-	}
-	if _, err := ParseTimestamp("not-a-time"); err == nil {
-		t.Fatal("garbage timestamp must fail")
-	}
-}
 
-func TestKnownEventsCoverThePublishedApp(t *testing.T) {
-	want := []string{
-		"commentAdded", "commentDeleted", "commentUpdated",
-		"issueAttachmentAdded", "issueAttachmentDeleted",
-		"issueCreated", "issueDeleted", "issueUpdated",
-		"workItemAdded", "workItemDeleted", "workItemUpdated",
-	}
-	got := KnownEventNames()
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("known events = %v, want %v", got, want)
+	millis := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	assertRejected(t, h.post(t, keyedPath(), testToken, issueUpdatedBody(millis)), "")
+	if got := h.sink.last(t); got.PayloadTimestamp != millis {
+		t.Fatalf("epoch-millis timestamp recorded as %q, want the raw %q", got.PayloadTimestamp, millis)
 	}
 }
 

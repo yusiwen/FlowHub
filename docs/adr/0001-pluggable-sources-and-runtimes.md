@@ -1,7 +1,8 @@
 # ADR 0001 — Pluggable event sources and agent runtimes
 
-**Status:** Proposed, **partly implemented ahead of the plan** (2026-09-25). Most
-of migration step 5 landed first, because it does not depend on steps 1–4: the
+**Status:** Proposed, **partly implemented ahead of the plan** (2026-09-26).
+Migration **step 1 landed** (the source seam), then most of step 5, because step 5
+does not depend on steps 1–4: the
 projects file accepts `runtime`, `runtimes` and `runtime_policy` (per project, with
 a table-wide default of `spread`), the dispatcher ranks the eligible runtimes by the
 rules below and logs the numbers it chose by, startup validates the declared names
@@ -12,15 +13,39 @@ to attach to a same-named branch that is not its descendant), and
 `registry.Task.BaseCommit` records it once and never re-resolves it. **One queue and
 one worker per runtime** landed as well: an intake loop decides which runtime takes a
 delivery and hands it to that runtime's own queue, so different runtimes run turns in
-parallel while one runtime still runs them one at a time. Steps 1–4 are open too, so
-the v2 configuration format, the `source`/`agent`/`workspace` seams and the `remote`
+parallel while one runtime still runs them one at a time. Steps 2–4 are open, so
+the v2 configuration format, the `agent`/`workspace` seams and the `remote`
 provider do not exist yet — the addressing and the baseline were added to the
 *current* worktree manager and projects file, and move behind the `Workspace` seam
 when step 2 lands. One measured consequence of the local provider: a repository with
 no `origin` remote has no shared truth to pin, so `Resolve` answers from the local
 ref and **says so** (a warning on every task that creates its worktree), because the
 guarantee this section describes only exists once there is an origin.
-**Revision:** 7 — made the baseline an input: resolve the base ref to a commit
+
+Step 1 is in the tree: `internal/event` is the neutral IR, `internal/source` is the
+seam (`Request`, `Decoded`, `Source`, and the data-only `ToolPolicy`), and
+`internal/source/youtrack` owns everything YouTrack-shaped — the payload model it
+was moved into, the schema report, the tool allowlist, the reply-tool names, the
+download host and prefix, the per-turn prompt, and the workflow-state
+normalisation. `internal/rules` decides on `event.Event` and no longer knows a
+changed-field name; `internal/webhook` keeps the transport locks and the redaction
+and hands the pipeline to `Source.Parse`; `internal/dispatch` imports no vendor
+package (`go list -deps` shows no `internal/webhook` edge), takes its policy from
+`Source.Policy()` instead of a second `Policy` field, and gets the tool allowlist,
+the reply check and the download policy from `Source.Tools()`. The audit record is
+unchanged by design (the `envelope` + `source_facts` split is still deferred to the
+second source), which is why `Decoded` carries the source-shaped facts the record
+keeps. Two deviations from the letter of the step, both deliberate: the twelve
+existing rule/prompt test functions were **moved** to the adapter rather than
+rewritten, and four dispatch constructors gained a `Source` argument — no
+assertion was dropped, and the raw timestamp spelling the refactor could have
+silently re-rendered is now pinned by a new receiver test. The refactor was also
+verified live: a real TEST-30 delivery produced one analysis turn and its reply,
+and an echo of that reply was recognised as FlowHub's own and not dispatched.
+**Revision:** 8 — recorded step 1 as landed, with what it moved and the two
+deviations (tests moved rather than left in place; the dispatcher's second policy
+field removed rather than kept in step). Revision 7 — made the baseline an input:
+resolve the base ref to a commit
 through the origin once per task, pin it, require every host to produce exactly
 that commit, and refuse to attach to a same-named branch that is not its
 descendant. Worktrees are never synced between hosts; commits travel through the
@@ -38,8 +63,8 @@ delivery, cleanup ownership); revision 3 dropped the `locks` block; revision 2
 added the configuration format
 **Date:** 2026-09-21
 **Scope:** the shape of the seam between "an event happened somewhere" and "an
-agent works on it", including the configuration surface it needs. Nothing here is
-implemented; the configuration change is step 3 of the migration plan, and the
+agent works on it", including the configuration surface it needs. Step 1 of the
+migration plan is implemented; the configuration change (step 3) is not, and the
 audit record deliberately stays as it is.
 
 ## Context
@@ -226,7 +251,7 @@ type ToolPolicy struct {
 
 type Source interface {
     Name() string
-    Parse(req *Request) (*event.Event, error) // verify signature + decode
+    Parse(req *Request) (Decoded, error)      // verify signature + decode, plus the source's audit facts
     Policy() rules.Policy                     // trigger, start states, self markers, budget
     Tools() ToolPolicy
     Prompt(action rules.Action, e *event.Event, ctx rules.PromptContext) string
@@ -235,6 +260,12 @@ type Source interface {
 
 Decisions inside this section:
 
+* **`Parse` returns `Decoded`, not a bare event** (as implemented in step 1). The
+  receiver's audit record still carries source-shaped fields — the issue-id form,
+  the payload key set, the flat schema report, the comment ids — and those cannot
+  live on `event.Event` without making the IR a YouTrack union. `Decoded` is the
+  event plus those facts; the deferred `envelope` + `source_facts` split is what
+  eventually moves them into the record generically.
 * **The three entry locks stay in the receiver.** They are transport-level (URL
   key, header token, source-IP allowlist) and every source deserves the same
   ones. `Source.Parse` only verifies *source* signatures (for example a Gitea
@@ -833,7 +864,7 @@ staticcheck test test-race smoke` green. Behaviour must not change before step 3
 | Step | Content | Verification |
 | --- | --- | --- |
 | 0 | This ADR | reviewed and accepted |
-| 1 | Add `internal/event` and `internal/source`; move `webhook.Parse`, `describe`, `AllowedMCPTools`, the reply check and `rules.Prompt` behind a `youtrack` adapter; `dispatch` consumes only the IR. The config file is **not** touched in this step | Existing tests unchanged and green; `make smoke` unchanged; `dispatch` no longer imports `webhook` |
+| 1 | Add `internal/event` and `internal/source`; move `webhook.Parse`, `describe`, `AllowedMCPTools`, the reply check and `rules.Prompt` behind a `youtrack` adapter; `dispatch` consumes only the IR. The config file is **not** touched in this step. **Landed:** `internal/event` (the IR), `internal/source` (`Request`, `Decoded`, `Source`, `ToolPolicy`), `internal/source/youtrack` (payload model, schema report, tool allowlist, prompt, state normalisation); `internal/webhook` and `internal/dispatch` no longer name a vendor, and `dispatch` takes its policy from `Source.Policy()` rather than a second field | Existing tests unchanged and green; `make smoke` unchanged; `dispatch` no longer imports `webhook`. **Measured:** `gofmt -l` clean, `go vet` clean, `staticcheck` clean, `go test ./...` and `go test -race ./...` all 15 packages ok, `make smoke` PASSED; `go list -deps ./internal/dispatch/` has no `internal/webhook` edge. The twelve rule/prompt test functions were moved to `internal/source/youtrack` (no assertion dropped) and four dispatch constructors gained a `Source` argument; a new receiver test pins the raw timestamp spelling the refactor could have re-rendered. **Live:** one real `issueCreated` delivery for TEST-30 was accepted in 0.8 ms, chose `builder-tmp` under `spread`, ran one analysis turn (`replied=true`, 16.4 s, 4 permission requests), and the reply landed on the issue with the sign-off `> This comment was generated automatically by opencode, from the creation of this issue.` — the sentence `Policy.Basis` derives from the neutral event. A second delivery echoing that reply without the marker was audited and **not** dispatched (`reason="our own comment (repeats our previous reply)"`), so loop prevention survived the move |
 | 2 | Add `internal/agent` and `internal/workspace`; make `opencode` the runtime and today's `worktree` package the `localworktree` provider, with its local-filesystem checks moved behind it; `dispatch` imports neither vendor; wire `FLOWHUB_OPENCODE_USER`/`PASSWORD` | `go list -deps` shows both cuts; the live path is re-verified with one real webhook turn |
 | 3 | Config format v2 as specified above: `sources`, `runtime`, `(source, project)` entries, per-level policy precedence, and the v1 translation branch | A v1 file and an equivalent v2 file produce the same routing and the same effective policy; `-print-config` names the level each value came from; a v2 file with `youtrack_key` is refused with the replacement named in the error |
 | 4 | Gitea adapter as the acceptance test for the source seam (HMAC-SHA256 `X-Hub-Signature-256`, issue and PR text) | A real Gitea webhook drives one analysis turn; the core packages show no diff beyond registration |

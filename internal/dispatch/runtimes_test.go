@@ -17,6 +17,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
 	"github.com/yusiwen/flowhub/internal/runtimes"
+	"github.com/yusiwen/flowhub/internal/source/youtrack"
 )
 
 // TestRuntimeAgentNeverUsesTheProductName is a regression test for a live run:
@@ -151,10 +152,10 @@ func testDispatcherFor(t *testing.T, inventory *runtimes.Inventory, projects *pr
 		// A client is required by New even when every runtime is enrolled: it is the
 		// fallback address for a host that was never enrolled. Nothing here calls it.
 		Client:   opencode.New(opencode.Options{BaseURL: "http://127.0.0.1:1"}),
+		Source:   youtrack.New(rules.Policy{}),
 		Runtimes: inventory,
 		Registry: reg,
 		Projects: projects,
-		Rules:    rules.Policy{}.Defaults(),
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Agent:    "devops",
 		Deadline: time.Minute,

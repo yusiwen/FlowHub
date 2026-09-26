@@ -1,4 +1,4 @@
-package webhook
+package youtrack
 
 import "testing"
 
@@ -53,11 +53,7 @@ func FuzzParseAndSchema(f *testing.F) {
 			t.Fatalf("Schema rejected a body Parse accepted: %v", err)
 		}
 
-		// Redaction must never turn a path into something longer than the input
-		// plus the marker, and must never echo the key back.
-		handler := &Handler{opts: Options{HookKey: "0123456789abcdef"}}
-		if got := handler.redactPath("/hooks/youtrack/0123456789abcdef"); got != "/hooks/youtrack/***" {
-			t.Fatalf("redaction = %q", got)
-		}
+		// Redaction is the receiver's, not the adapter's: it is asserted in the
+		// webhook package, where the route shape it depends on lives.
 	})
 }

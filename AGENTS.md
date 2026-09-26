@@ -91,10 +91,13 @@ Nix flakes in a git repository only see files in the git index. New files must b
 cmd/flowhub/        CLI entry: wiring, flags, HTTP server, /healthz, shutdown, activation prober
 internal/config/    Environment parsing, validation, masked reporting
 internal/logging/   Application logger: stderr tee + size-rotated log file
-internal/webhook/   Lenient payload model, payload schema report, delivery pipeline
+internal/event/     the neutral event IR (Kind, Subject, Attachment, Event) every source decodes into
+internal/source/    the source seam: Request, Decoded, Source, ToolPolicy (data only)
+internal/source/youtrack/ the YouTrack adapter: payload model, schema report, neutral-event decoding, tools, prompt
+internal/webhook/   The delivery pipeline: entry locks, body limits, source decode, replay window, idempotency, audit, redaction
 internal/projectmap/ YouTrack project -> repository routing table (~/.config/flowhub/config.json)
 internal/opencode/  opencode client, permission arbiter, one-turn runner (make test-live)
-internal/rules/     trigger policy (ignore/analyze/plan/execute) and the per-turn prompt
+internal/rules/     trigger policy over the neutral event (ignore/analyze/plan/execute) and the reply basis
 internal/dispatch/  the worker: queue, routing, worktree, session, arbiter, registry
 internal/provision/ data-plane host prep: `flowhub runtime init [--check]`, `doctor --push`, `uninstall` (capability report, embedded artifacts, manifest, runtime identity, heartbeat)
 internal/runtimes/  control plane: runtime inventory, states, invites, secrets (hashes only), `/control/v1` admin API and the `invite`/`list`/`show`/`remove`/`rotate` CLI
@@ -214,7 +217,7 @@ documents. The rules below are load-bearing; do not relax them casually.
     blockquote that says opencode generated it and **what triggered the turn**,
     because a reader has to be able to tell an automated reply from a human one
     and judge whether the turn answered the right question. That basis comes from
-    `Policy.Basis(decision, delivery)` — never from the model, which will invent a
+    `Policy.Basis(decision, event)` — never from the model, which will invent a
     plausible reason when asked to explain itself. The marker stays the last line,
     inside the blockquote.
 11. **A subcommand runs before the receiver configuration is loaded.**
@@ -264,7 +267,7 @@ documents. The rules below are load-bearing; do not relax them casually.
 2. **Two log sinks, one queue** — `store.NewMulti` writes each delivery to the
    machine-readable JSONL audit and to the human-readable payload log on the same
    goroutine, so ordering matches and the request path stays I/O free.
-3. **`webhook.Schema` is the payload-analysis feature** — a flat sorted
+3. **`source/youtrack.Schema` is the payload-analysis feature** — a flat sorted
    `path: type` report with array elements merged, which is how the real payload
    is compared against the documented one (§5.2/§5.4 of the security document).
 4. **Idempotency is local** — the app sends no delivery id and never retries, so

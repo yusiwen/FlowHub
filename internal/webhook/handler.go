@@ -1,3 +1,12 @@
+// Package webhook implements the public YouTrack webhook entry point.
+//
+// It owns the transport: the three entry locks, the body limit, the replay
+// window, the local idempotency cache, the audit record and the redaction. What a
+// delivery *means* belongs to the event source (internal/source), which decodes
+// the body and supplies its own audit facts. The receiver is deliberately a pure
+// receiver: it never calls YouTrack, opencode or any other network service on the
+// request path, because the published Webhook Triggers app delivers synchronously
+// with a 5s timeout and no retry.
 package webhook
 
 import (
@@ -16,6 +25,7 @@ import (
 
 	"github.com/yusiwen/flowhub/internal/dedupe"
 	"github.com/yusiwen/flowhub/internal/metrics"
+	"github.com/yusiwen/flowhub/internal/source"
 	"github.com/yusiwen/flowhub/internal/store"
 )
 
@@ -88,6 +98,10 @@ type Options struct {
 	// audited. It is the phase-2 bridge to opencode and it must not block: the
 	// publisher waits for our response.
 	Dispatcher Dispatcher
+	// Source decodes accepted deliveries. It is the seam ADR 0001 added: the
+	// receiver owns the transport locks, and the adapter owns what a delivery from
+	// *its* tracker means. Required.
+	Source source.Source
 }
 
 // Dispatcher receives accepted deliveries for asynchronous work.
@@ -222,12 +236,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, keys, err := Parse(body)
+	decoded, err := h.opts.Source.Parse(&source.Request{
+		Method: rec.Method, Path: rec.Path, Query: rec.Query,
+		Headers: r.Header, RemoteIP: rec.RemoteIP, UserAgent: rec.UserAgent,
+		Body: body,
+	})
 	if err != nil {
 		h.respond(w, rec, ReasonInvalidJSON, http.StatusAccepted)
 		return
 	}
-	h.describe(rec, payload, keys, body)
+	h.describe(rec, decoded)
 
 	if !rec.KnownEvent {
 		h.respond(w, rec, ReasonUnknownEvent, http.StatusAccepted)
@@ -235,12 +253,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.opts.ReplayWindow > 0 {
-		ts, err := ParseTimestamp(payload.Timestamp)
-		if err != nil {
+		if decoded.Occurred.IsZero() {
+			// Only the adapter knows the timestamp formats, so an unparseable one
+			// arrives as a zero time rather than as an error.
 			h.respond(w, rec, ReasonUnparseableTimestamp, http.StatusAccepted)
 			return
 		}
-		skew := start.Sub(ts)
+		skew := start.Sub(decoded.Occurred)
 		skewMS := skew.Milliseconds()
 		rec.TimestampSkewMS = &skewMS
 		if skew < 0 {
@@ -252,7 +271,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	dedupeKey := DedupeKey(payload.Event, payload.ID, payload.Timestamp, rec.BodySHA256)
+	dedupeKey := DedupeKey(rec.Event, rec.IssueID, rec.PayloadTimestamp, rec.BodySHA256)
 	rec.DedupeKey = dedupeKey
 	if h.dd.CheckAndAdd(dedupeKey) {
 		h.respond(w, rec, ReasonDuplicate, http.StatusAccepted)
@@ -262,25 +281,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.respond(w, rec, "", http.StatusAccepted)
 }
 
-// describe fills the payload derived fields of the record. The schema report is
-// derived from the raw body so the real payload can be diffed against the
-// documented one without a second look at the wire.
-func (h *Handler) describe(rec *store.Record, payload *Payload, keys []string, body []byte) {
-	rec.Event = payload.Event
-	rec.KnownEvent = KnownEvent(payload.Event)
-	rec.IssueID = payload.ID
-	rec.IssueIDForm = IssueIDForm(payload.ID)
-	rec.ProjectKey = payload.ProjectKey()
-	rec.Summary = payload.Summary
-	rec.PrimaryActor = payload.PrimaryActor()
-	rec.ActorLogins = payload.ActorLogins()
-	rec.PayloadTimestamp = payload.Timestamp
-	rec.PayloadKeys = keys
-	rec.HasNumberInProject = payload.NumberInProject != nil
-	rec.ChangedFields = payload.ChangedFieldNames()
-	rec.CommentIDs = payload.CommentIDs()
-	// A schema error cannot happen here: Parse already validated the body.
-	rec.PayloadSchema, _ = Schema(body)
+// describe fills the record from what the source decoded.
+//
+// The neutral part of the record comes from the event; the rest is the source's
+// own audit material. ADR 0001 deliberately defers a generic audit schema until a
+// second source exists, so this is the one place that knows a YouTrack-shaped
+// field by name — and the shape it knows is the record's, unchanged.
+func (h *Handler) describe(rec *store.Record, decoded source.Decoded) {
+	e := decoded.Event
+	if e != nil {
+		rec.IssueID = e.Subject.Key
+		rec.ProjectKey = e.Subject.Project
+		rec.Summary = e.Subject.Title
+		rec.PrimaryActor = e.Actor
+	}
+	rec.Event = decoded.Name
+	rec.KnownEvent = decoded.Known
+	rec.IssueIDForm = decoded.IssueIDForm
+	rec.ActorLogins = decoded.ActorLogins
+	// The audit record keeps the source's own spelling of the timestamp: it is what
+	// makes a clock-skew or wire-format question answerable later, and it is part of
+	// the idempotency key.
+	rec.PayloadTimestamp = decoded.TimestampRaw
+	rec.PayloadKeys = decoded.PayloadKeys
+	rec.HasNumberInProject = decoded.NumberInProjectPresent
+	rec.ChangedFields = decoded.ChangedFields
+	rec.CommentIDs = decoded.CommentIDs
+	rec.PayloadSchema = decoded.PayloadSchema
 }
 
 // respond finalizes the record, hands it to the (non-blocking) audit queue and

@@ -1,10 +1,13 @@
-// Package webhook implements the public YouTrack webhook entry point.
+// Package youtrack is the YouTrack adapter: it decodes the Webhook Triggers
+// payload into internal/event, and owns the policy, the prompt and the tool
+// allowlist that are YouTrack's rather than FlowHub's.
 //
-// It is deliberately a pure receiver: it authenticates, validates, deduplicates
-// and persists. It never calls YouTrack, opencode or any other network service
-// on the request path, because the published Webhook Triggers app delivers
-// synchronously with a 5s timeout and no retry.
-package webhook
+// The payload model is lenient on purpose. The released app, its `main` branch and
+// the official documentation disagree about what a delivery contains (measured
+// 2026-09-21, youtrack-webhook-and-flowhub-security.md §5), so nothing is required
+// except `event`, unknown fields are ignored, and the polymorphic
+// `changedFields[].value` stays raw until the adapter decides what it is.
+package youtrack
 
 import (
 	"encoding/json"

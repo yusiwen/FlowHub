@@ -1,4 +1,4 @@
-package webhook
+package youtrack
 
 import (
 	"bytes"

@@ -40,6 +40,8 @@ import (
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
 	"github.com/yusiwen/flowhub/internal/runtimes"
+	"github.com/yusiwen/flowhub/internal/source"
+	"github.com/yusiwen/flowhub/internal/source/youtrack"
 	"github.com/yusiwen/flowhub/internal/store"
 	"github.com/yusiwen/flowhub/internal/webhook"
 )
@@ -102,6 +104,15 @@ func run() error {
 		return fmt.Errorf("refusing to start, project mapping %s:\n  - %s",
 			cfg.ProjectsFile, strings.Join(problems, "\n  - "))
 	}
+
+	// The event source is the seam ADR 0001 added: the receiver and the dispatcher
+	// both take the same adapter, and neither names a tracker.
+	src := source.Source(youtrack.New(rules.Policy{
+		Trigger:             cfg.Trigger,
+		StartStates:         cfg.StartStates,
+		SkipAnalyzeOnCreate: cfg.SkipAnalyzeOnCreate,
+		MaxTurns:            cfg.MaxTurns,
+	}))
 
 	// The runtime inventory is control-plane state: it lives with the audit trail
 	// and the task registry, and this process is its only writer. It is opened here,
@@ -213,7 +224,7 @@ func run() error {
 
 	// The dispatcher is built before the handler so that a delivery can never be
 	// accepted before there is something to hand it to.
-	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, logger)
+	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger)
 	if err != nil {
 		return err
 	}
@@ -227,7 +238,7 @@ func run() error {
 		return err
 	}
 
-	handler := webhook.New(webhookOptions(cfg, dispatcher), sink, cache, logger, stats)
+	handler := webhook.New(webhookOptions(cfg, dispatcher, src), sink, cache, logger, stats)
 
 	// The paths are registered without a method so that a wrong method is still
 	// audited (and answered with 405) instead of being swallowed by ServeMux.
@@ -308,8 +319,9 @@ func run() error {
 // Dispatch on a nil receiver. Measured: with FLOWHUB_DISPATCH off, every
 // delivery was answered with an empty reply because that panic happened after
 // the 202 was written.
-func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher) webhook.Options {
+func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src source.Source) webhook.Options {
 	opts := webhook.Options{
+		Source:         src,
 		HookPath:       cfg.HookPath,
 		HookKey:        cfg.HookKey,
 		TokenHeader:    cfg.TokenHeader,
@@ -453,7 +465,7 @@ func startControlAPI(ctx context.Context, cfg config.Config, inventory *runtimes
 //
 // The returned channel closes when the worker has stopped, so shutdown can wait
 // for an in-flight turn instead of killing the process under it.
-func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, logger *slog.Logger) (*dispatch.Dispatcher, <-chan struct{}, error) {
+func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger) (*dispatch.Dispatcher, <-chan struct{}, error) {
 	if !cfg.Dispatch {
 		return nil, nil, nil
 	}
@@ -485,12 +497,9 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 		Runtimes: inventory,
 		Registry: tasks,
 		Projects: projects,
-		Rules: rules.Policy{
-			Trigger:             cfg.Trigger,
-			StartStates:         cfg.StartStates,
-			SkipAnalyzeOnCreate: cfg.SkipAnalyzeOnCreate,
-			MaxTurns:            cfg.MaxTurns,
-		},
+		// One policy, owned by the source: what the dispatcher decides on and what
+		// the prompt tells the maintainer to type cannot drift apart.
+		Source:         src,
 		Log:            logger,
 		WorktreeBase:   cfg.WorktreeBase,
 		Agent:          cfg.DispatchAgent,

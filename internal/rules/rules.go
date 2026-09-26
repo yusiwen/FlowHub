@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/yusiwen/flowhub/internal/event"
 	"github.com/yusiwen/flowhub/internal/registry"
 )
 
@@ -49,23 +50,21 @@ var DefaultSelfMarkers = []string{
 // SelfMarker is the literal the prompt requires on the last line of every reply.
 const SelfMarker = "<!-- flowhub-auto -->"
 
-// DefaultStateFields are the changedFields names that carry the workflow state.
-// The measured payload repeats a custom field under its internal and its
-// localised name, so both spellings have to be listed.
-var DefaultStateFields = []string{"State", "状态"}
-
-// Delivery is the part of an audited delivery the rules need.
-type Delivery struct {
-	Event       string
-	IssueID     string
-	ProjectKey  string
-	Summary     string
-	Description string
-	CommentText string
-	Actor       string
-	// States maps a changed field name to the new value's internal name, for
-	// example {"State": "In Progress"}.
-	States map[string]string
+// PromptContext is the routing information a source's prompt needs.
+type PromptContext struct {
+	// Worktree is the directory the agent works in.
+	Worktree string
+	// AttachmentsDir is where downloaded attachments must be written, relative to
+	// the worktree.
+	AttachmentsDir string
+	// Repository is the human readable repository identity, for context only.
+	Repository string
+	// Author is the login whose action triggered this turn.
+	Author string
+	// Basis is what caused the turn, as a short English clause the sign-off can
+	// translate ("the creation of this issue", `the comment "/opencode start"`).
+	// It comes from the decision, so the reply cannot claim a reason of its own.
+	Basis string
 }
 
 // TaskView is what the registry already knows about the issue.
@@ -80,8 +79,6 @@ type TaskView struct {
 type Policy struct {
 	// Trigger is the comment phrase that means "start implementing".
 	Trigger string
-	// StateFields are the changedFields names that carry the workflow state.
-	StateFields []string
 	// StartStates are the state values that mean "start implementing".
 	StartStates []string
 	// SkipAnalyzeOnCreate turns off the automatic read-only analysis of a newly
@@ -101,9 +98,6 @@ type Policy struct {
 func (p Policy) Defaults() Policy {
 	if p.Trigger == "" {
 		p.Trigger = "/opencode start"
-	}
-	if len(p.StateFields) == 0 {
-		p.StateFields = append([]string(nil), DefaultStateFields...)
 	}
 	if len(p.StartStates) == 0 {
 		p.StartStates = []string{"In Progress"}
@@ -143,14 +137,14 @@ type Decision struct {
 // Order matters: our own comments are filtered first (the agent posts as the same
 // YouTrack user as the human, so identity cannot be used), then the turn budget,
 // then the explicit human triggers, and only then the automatic analysis.
-func (p Policy) Decide(d Delivery, task TaskView) Decision {
+func (p Policy) Decide(e event.Event, task TaskView) Decision {
 	p = p.Defaults()
 
 	if task.Plan == "" {
 		task.Plan = registry.PlanNone
 	}
-	if d.Event == "commentAdded" || d.Event == "commentUpdated" {
-		if self, why := p.isSelfComment(d.CommentText, task.LastReply); self {
+	if e.IsComment() {
+		if self, why := p.isSelfComment(e.Comment, task.LastReply); self {
 			return Decision{Action: ActionIgnore, Reason: "our own comment (" + why + ")"}
 		}
 	}
@@ -161,20 +155,20 @@ func (p Policy) Decide(d Delivery, task TaskView) Decision {
 		}
 	}
 
-	if d.Event == "commentAdded" || d.Event == "commentUpdated" {
+	if e.IsComment() {
 		switch {
-		case startPattern(p.Trigger).MatchString(d.CommentText):
+		case startPattern(p.Trigger).MatchString(e.Comment):
 			return p.startDecision(task, TriggerComment, "comment matched "+p.Trigger)
-		case analyzePattern().MatchString(d.CommentText):
+		case analyzePattern().MatchString(e.Comment):
 			return Decision{Action: ActionAnalyze, Trigger: TriggerComment, Reason: "comment asked for analysis"}
 		}
 	}
 
-	if value, field, ok := p.stateTransition(d); ok {
-		return p.startDecision(task, TriggerState, fmt.Sprintf("%s changed to %q", field, value))
+	if value, ok := p.stateTransition(e); ok {
+		return p.startDecision(task, TriggerState, fmt.Sprintf("%s changed to %q", e.StateField, value))
 	}
 
-	if d.Event == "issueCreated" && !p.SkipAnalyzeOnCreate {
+	if e.Kind == event.KindCreated && !p.SkipAnalyzeOnCreate {
 		return Decision{Action: ActionAnalyze, Trigger: TriggerCreated, Reason: "issue was created"}
 	}
 
@@ -191,21 +185,19 @@ func (p Policy) startDecision(task TaskView, trigger Trigger, reason string) Dec
 	return Decision{Action: ActionExecute, Trigger: trigger, Reason: reason + "; a plan exists"}
 }
 
-// stateTransition reports the first configured state field that moved into one of
-// the start states.
-func (p Policy) stateTransition(d Delivery) (value, field string, ok bool) {
-	for _, name := range p.StateFields {
-		moved, present := d.States[name]
-		if !present {
-			continue
-		}
-		for _, wanted := range p.StartStates {
-			if strings.EqualFold(strings.TrimSpace(moved), strings.TrimSpace(wanted)) {
-				return moved, name, true
-			}
+// stateTransition reports whether the event set a workflow state that means "start
+// implementing". The adapter has already normalised which field carried it and what
+// the value is; the policy only knows the values it acts on.
+func (p Policy) stateTransition(e event.Event) (value string, ok bool) {
+	if strings.TrimSpace(e.State) == "" {
+		return "", false
+	}
+	for _, wanted := range p.StartStates {
+		if strings.EqualFold(strings.TrimSpace(e.State), strings.TrimSpace(wanted)) {
+			return e.State, true
 		}
 	}
-	return "", "", false
+	return "", false
 }
 
 // isSelfComment recognises our own reply by content, because the agent posts as
@@ -264,27 +256,23 @@ func analyzePattern() *regexp.Regexp {
 // sign-off. It is derived from the delivery and the policy rather than asked of
 // the model: a model asked to explain its own reply writes something plausible
 // instead of something true.
-func (p Policy) Basis(decision Decision, d Delivery) string {
+func (p Policy) Basis(decision Decision, e event.Event) string {
 	p = p.Defaults()
 	switch decision.Trigger {
 	case TriggerCreated:
 		return "the creation of this issue"
 	case TriggerComment:
-		if text := firstLine(d.CommentText, 80); text != "" {
+		if text := firstLine(e.Comment, 80); text != "" {
 			return fmt.Sprintf("the comment %q", text)
 		}
 		return "a comment on this issue"
 	case TriggerState:
-		for _, name := range p.StateFields {
-			value, present := d.States[name]
-			if !present {
-				continue
+		if value, ok := p.stateTransition(e); ok {
+			field := e.StateField
+			if strings.TrimSpace(field) == "" {
+				field = "state"
 			}
-			for _, wanted := range p.StartStates {
-				if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(wanted)) {
-					return fmt.Sprintf("the state change of %s to %q", name, value)
-				}
-			}
+			return fmt.Sprintf("the state change of %s to %q", field, value)
 		}
 		return "a workflow state change"
 	default:

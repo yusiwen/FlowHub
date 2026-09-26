@@ -19,6 +19,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
+	"github.com/yusiwen/flowhub/internal/source/youtrack"
 	"github.com/yusiwen/flowhub/internal/store"
 )
 
@@ -221,9 +222,9 @@ func newTestDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.Server
 	fake.directory = repo
 	dispatcher, err := New(Options{
 		Client:   opencode.New(opencode.Options{BaseURL: server.URL, Timeout: 5 * time.Second}),
+		Source:   youtrack.New(rules.Policy{}),
 		Registry: reg,
 		Projects: projects,
-		Rules:    rules.Policy{}.Defaults(),
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Agent:    "flowhub-default-agent",
 		Deadline: 5 * time.Second,
@@ -422,8 +423,8 @@ func TestPauseFileStopsDispatchWithoutRestarting(t *testing.T) {
 	}
 	dispatcher, err := New(Options{
 		Client:   opencode.New(opencode.Options{BaseURL: server.URL}),
+		Source:   youtrack.New(rules.Policy{}),
 		Registry: reg, Projects: projects,
-		Rules: rules.Policy{}.Defaults(), Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		PauseFile: pause,
 	})
 	if err != nil {
@@ -713,10 +714,10 @@ func newScheduledDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.S
 	fake.directory = repo
 	dispatcher, err := New(Options{
 		Client:   opencode.New(opencode.Options{BaseURL: server.URL, Timeout: 5 * time.Second}),
+		Source:   youtrack.New(rules.Policy{}),
 		Runtimes: testInventory(t, server.URL, "builder-a", "builder-b"),
 		Registry: reg,
 		Projects: projects,
-		Rules:    rules.Policy{}.Defaults(),
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Agent:    "devops",
 		Deadline: 5 * time.Second,

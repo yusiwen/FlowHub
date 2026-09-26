@@ -16,6 +16,11 @@ turn inside a per-task git worktree. A second host can be prepared and enrolled 
 a named runtime (`flowhub runtime init` / `invite`, an inventory behind a control
 API), and a task is bound to the runtime that prepared its worktree for life.
 
+YouTrack is no longer hard-wired into the core: the receiver and the dispatcher
+both consume `internal/event` and `internal/source`, and `internal/source/youtrack`
+is the only package that knows what a YouTrack payload looks like or which tools
+the agent may call (ADR 0001 step 1).
+
 ## Where things live
 
 | Path | Responsibility |
@@ -23,9 +28,10 @@ API), and a task is bound to the runtime that prepared its worktree for life.
 | `cmd/flowhub/main.go` | Wiring, flags (`-version`, `-print-config`), HTTP server, `/healthz`, graceful shutdown, dedupe sweeper, and the activation prober that decides whether a host claiming a runtime name can actually run the work |
 | `internal/config/config.go` | Environment parsing, validation, `Warnings()`, masked `Report()` |
 | `internal/logging/` | Application logger: stderr tee plus a size-rotated log file (`flowhub.log`) |
-| `internal/webhook/payload.go` | Lenient YouTrack payload model, event classification, timestamp and issue-id parsing |
-| `internal/webhook/schema.go` | `Schema()`: flat sorted `path: type` report of a payload, array elements merged |
-| `internal/webhook/handler.go` | The delivery pipeline: three locks, body limits, JSON, replay window, idempotency, audit, 202 |
+| `internal/event/` | The neutral event IR (`event.go`): `Kind`, `Subject`, `Attachment`, `Event`, `Validate`. Data only — no I/O, no vendor names — so routing, the trigger policy, the audit decision and the reply check never learn which tracker a delivery came from (ADR 0001 step 1) |
+| `internal/source/` | The event-source seam (`source.go`): `Request` (one delivery as the receiver saw it), `Decoded` (the event plus the source's own audit facts), `Source` (name, parse, policy, tools, prompt), and the data-only `ToolPolicy`/`DownloadPolicy`. A source cannot reach around the receiver's entry locks or the dispatcher's shell policy |
+| `internal/source/youtrack/` | The YouTrack adapter: `payload.go` (lenient payload model, timestamp and issue-id parsing), `schema.go` (`Schema()`: flat sorted `path: type` report), `source.go` (payload → `event.Event`, including the workflow-state normalisation and the `Source` methods), `tools.go` (allowed MCP tools, reply tools, download host and prefix), `prompt.go` (ground rules, phase instructions, the reply sign-off contract) |
+| `internal/webhook/handler.go` | The delivery pipeline: three locks, body limits, source decode, replay window, idempotency, audit, 202. It owns the transport and the redaction, not the payload |
 | `internal/dedupe/dedupe.go` | TTL idempotency cache (`FLOWHUB_DEDUPE_TTL`) |
 | `internal/store/store.go` | `Record` (the audit schema) and the `Recorder` interface |
 | `internal/store/async.go` | Non-blocking audit queue; drops and counts instead of slowing the response |
@@ -36,12 +42,12 @@ API), and a task is bound to the runtime that prepared its worktree for life.
 | `internal/opencode/` | opencode client (`client.go`, `types.go`: health, agent registry, model catalogue, sessions, permissions), permission arbiter (`arbiter.go`), phase-aware policy (`phase.go`) and the one-turn runner (`runner.go`) |
 | `internal/worktree/` | One git worktree per task, branch `flowhub/<task key>`, `.flowhub/` scratch excluded through `info/exclude`; `Resolve` pins the base commit through the origin, `Prepare` produces exactly it (fetching on demand) and refuses to attach to a same-named branch that is not its descendant |
 | `internal/registry/` | Append-only task registry (`registry.jsonl`): issue → repository, runtime, worktree, **base commit**, session, state, plan state, turns, cost, last reply |
-| `internal/rules/` | Trigger policy (`rules.go`: ignore/analyze/plan/execute, trigger origin, `Basis`, self-comment detection, turn budget) and the per-turn prompt (`prompt.go`: ground rules, phase instructions, the reply sign-off contract) |
+| `internal/rules/` | Trigger policy (`rules.go`: ignore/analyze/plan/execute, trigger origin, `Basis`, self-comment detection, turn budget) over the neutral `event.Event`. The per-turn prompt text moved to the source adapter in ADR 0001 step 1 |
 | `internal/dispatch/` | The workers: an intake loop that decides the runtime, one queue and one worker per runtime, routing, worktree cache, phase arbiter, session reuse, registry update, audit log. `runtimes.go` is the addressing seam: the eligibility set a project declares, the `spread` / `first-healthy` ranking with its log line, the sticky binding, the in-flight counters, and the startup check of declared names against the inventory |
 | `internal/provision/` | Data-plane host preparation. `runner.go` is the host boundary (bounded commands, injected environment, identity), so the checks are tested without executing anything; `check.go` collects the capability report; `model.go` resolves each installed agent profile and the model it pins against the agent server's catalogue; `assets.go` embeds the agent definition and MCP snippet; `manifest.go` records what was installed (path, SHA-256, version); `install.go` plans and applies, refusing to overwrite a hand edit unless `--force`; `diff.go` renders the refusal; `register.go` enrols the host with a control plane, stores the runtime identity (`0600`) and pushes a fresh report (`doctor --push`); `command.go` routes `runtime init` / `doctor` / `uninstall` |
 | `internal/runtimes/` | The control plane's runtime inventory (ADR 0002 step 3): `inventory.go` holds the states (`pending`/`active`/`revoked`), invites and runtime secrets (SHA-256 only, never the value), the sticky runtime binding and the heartbeat that refreshes a host's report and pinned models; `admin.go` is the `/control/v1` listener and its client; `command.go` is the `invite`/`list`/`show`/`remove`/`rotate` CLI, which talks to the running service so a change needs no restart |
 | `internal/metrics/metrics.go` | Counters behind `/healthz` |
-| `docs/adr/` | Architecture decision records: `0001` the seam that would make event sources and agent runtimes pluggable (a v2 configuration format, addressed runtimes, a pinned base commit per task) — proposed, not implemented; `0002` how a data-plane host is installed and enrolled as a runtime — **steps 1–5 implemented** (capability report, artifacts + manifest, inventory + admin API + enrolment, `doctor --push`, activation check) |
+| `docs/adr/` | Architecture decision records: `0001` the seam that makes event sources and agent runtimes pluggable (a v2 configuration format, addressed runtimes, a pinned base commit per task) — **step 1 (the source seam) and step 5 (addressed runtimes and the pinned baseline) implemented**; `0002` how a data-plane host is installed and enrolled as a runtime — **steps 1–5 implemented** (capability report, artifacts + manifest, inventory + admin API + enrolment, `doctor --push`, activation check) |
 | `README.md` | Operator-facing documentation: config table, log formats, pipeline, jq recipes, verification checklist |
 
 Tests live next to the code (`*_test.go`). `go test ./...` and `go vet ./...` are
@@ -67,11 +73,12 @@ clean; `gofmt -l .` reports nothing.
   (machine readable, full raw body) and to the detail log (human readable). Both
   run on the single `store.Async` goroutine, so ordering matches and the request
   path still does zero file I/O.
-* **`webhook.Schema` is the payload-analysis feature.** It walks the raw body and
+* **`source/youtrack.Schema` is the payload-analysis feature.** It walks the raw body and
   emits a sorted `path: type` list with array elements merged, which is how the
   documented-vs-real payload differences (missing `numberInProject`, presence of
   `project.id`, polymorphic `changedFields[].value`) become visible from one real
-  delivery. It is computed in `Handler.describe`, so it lands in both logs.
+  delivery. It is computed by the adapter's `Parse` and copied into the record by
+  `Handler.describe`, so it lands in both logs.
 * **Redaction is centralised and positional.** `Handler.redactPath` and
   `Handler.redactQuery` are applied to the path and the query before either
   reaches the log or the audit record, and they work by *shape* (the segment
@@ -109,11 +116,13 @@ clean; `gofmt -l .` reports nothing.
   shell command. Rejections carry a reason so the model can adapt. The live check
   is `make test-live` (skipped unless `OPENCODE_LIVE=1`).
 * **The dispatcher is a pure decision plus a dumb worker.** `internal/rules.Decide`
-  turns (delivery, recorded task) into one of ignore/analyze/plan/execute with no
-  I/O, so the whole workflow is unit tested without opencode, git or a network.
+  turns (neutral event, recorded task) into one of ignore/analyze/plan/execute with
+  no I/O, so the whole workflow is unit tested without opencode, git or a network.
   `internal/dispatch` then does the I/O: route, worktree, session, prompt, arbiter,
-  registry. The prompt is built by `internal/rules.Prompt` so the wording of the
-  contract lives next to the decisions that depend on it.
+  registry. The prompt is built by the source adapter
+  (`internal/source/youtrack.Prompt`), because the text names the tracker's tools
+  and carries its sign-off contract; the phrase it tells the maintainer to type and
+  the phrase the policy matches come from the one `rules.Policy` the adapter owns.
 * **One worktree manager per base directory.** A routing entry may declare its own
   `worktrees` path, and a manager owns exactly one base, so `dispatch` caches
   managers by path. The manager fails closed: a worktree inside the repository, an
