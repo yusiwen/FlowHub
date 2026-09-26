@@ -95,28 +95,48 @@ func run() error {
 		fmt.Println(versionLine())
 		return nil
 	}
-	// Load the routing table before anything else touches the filesystem. A
+	// The compile-time source registry. A configuration file names sources, so a name
+	// this binary cannot build has to be refused by name at startup — with the list of
+	// what it knows — rather than surfacing later as a delivery that can never be
+	// decoded. Adding a source is one Register call plus its package.
+	sources := source.NewRegistry()
+	if err := sources.Register(youtrack.SourceName, func(policy rules.Policy) source.Source {
+		return youtrack.New(policy)
+	}); err != nil {
+		return err
+	}
+
+	// Load the configuration file before anything else touches the filesystem. A
 	// missing file is only a warning (phase 1 records without routing), but a file
 	// that exists and does not parse or validate must stop the start: a broken
 	// mapping is how an agent ends up in the wrong repository.
-	projects, projectsErr := projectmap.Load(cfg.ProjectsFile)
+	projects, projectsErr := projectmap.Load(cfg.ConfigFile)
 	if projectsErr != nil && !errors.Is(projectsErr, projectmap.ErrNotFound) {
 		return projectsErr
 	}
 	if problems := projects.Validate(); len(problems) > 0 {
-		return fmt.Errorf("refusing to start, project mapping %s:\n  - %s",
-			cfg.ProjectsFile, strings.Join(problems, "\n  - "))
+		return fmt.Errorf("refusing to start, configuration %s:\n  - %s",
+			cfg.ConfigFile, strings.Join(problems, "\n  - "))
+	}
+	if problems := projects.SourceProblems(sources.Names()); len(problems) > 0 {
+		return fmt.Errorf("refusing to start, configuration %s:\n  - %s",
+			cfg.ConfigFile, strings.Join(problems, "\n  - "))
+	}
+	if problems := projects.RuntimeProblems(); len(problems) > 0 {
+		return fmt.Errorf("refusing to start, configuration %s:\n  - %s",
+			cfg.ConfigFile, strings.Join(problems, "\n  - "))
 	}
 
 	// The source seam: the receiver and the dispatcher take the same adapter, and
-	// neither names a tracker. The other two seams (workspace, runtime) are wired
-	// where the logger exists, because a runtime adapter logs through it.
-	src := source.Source(youtrack.New(rules.Policy{
-		Trigger:             cfg.Trigger,
-		StartStates:         cfg.StartStates,
-		SkipAnalyzeOnCreate: cfg.SkipAnalyzeOnCreate,
-		MaxTurns:            cfg.MaxTurns,
-	}))
+	// neither names a tracker. Which adapter this receiver serves is configuration
+	// (`FLOWHUB_SOURCE`), and its trigger policy is resolved through the levels below,
+	// so the phrase the dispatcher matches can come from the file without the
+	// environment forgetting what the operator typed.
+	resolved := projects.Policy(cfg.Source, sourcePolicyDefaults(cfg))
+	src, err := sources.Build(cfg.Source, resolved.Policy)
+	if err != nil {
+		return err
+	}
 
 	// The runtime inventory is control-plane state: it lives with the audit trail
 	// and the task registry, and this process is its only writer. It is opened here,
@@ -130,11 +150,23 @@ func run() error {
 	if *printConfig {
 		fmt.Print(cfg.Report())
 		fmt.Print(projects.Report())
+		// Every effective value is printed with the level that supplied it, which is
+		// what makes a three-level file answerable: "why is the trigger this?" has to
+		// be a line in the report, not a hunt through the environment and the file.
+		for _, value := range projects.Provenance(sourcePolicyDefaults(cfg)) {
+			fmt.Printf("effective:          %s %s=%s (level: %s)\n", value.Scope, value.Field, value.Value, value.Level)
+		}
 		if errors.Is(projectsErr, projectmap.ErrNotFound) {
-			fmt.Printf("warning:            no project mapping file at %s\n", cfg.ProjectsFile)
+			fmt.Printf("warning:            no configuration file at %s\n", cfg.ConfigFile)
 		}
 		for _, problem := range projects.Validate() {
 			fmt.Printf("mapping_problem:    %s\n", problem)
+		}
+		for _, problem := range projects.SourceProblems(sources.Names()) {
+			fmt.Printf("source_problem:     %s\n", problem)
+		}
+		for _, problem := range projects.RuntimeProblems() {
+			fmt.Printf("runtime_problem:    %s\n", problem)
 		}
 		if cfg.Dispatch {
 			for _, problem := range workspace.ValidateEntries(localworktree.Validator{}, projects.WorkspaceEntries(cfg.WorktreeBase)) {
@@ -163,10 +195,13 @@ func run() error {
 	// with it (the workspace provider's own checks).
 	if cfg.Dispatch {
 		if errors.Is(projectsErr, projectmap.ErrNotFound) {
-			return fmt.Errorf("FLOWHUB_DISPATCH=1 but no project mapping exists at %s: every delivery would be refused", cfg.ProjectsFile)
+			return fmt.Errorf("FLOWHUB_DISPATCH=1 but no configuration file exists at %s: every delivery would be refused", cfg.ConfigFile)
 		}
 		if problems := workspace.ValidateEntries(localworktree.Validator{}, projects.WorkspaceEntries(cfg.WorktreeBase)); len(problems) > 0 {
 			return fmt.Errorf("refusing to start, dispatch is not possible:\n  - %s", strings.Join(problems, "\n  - "))
+		}
+		if problems := declaredAuthProblems(projects); len(problems) > 0 {
+			return fmt.Errorf("refusing to start, configuration %s:\n  - %s", cfg.ConfigFile, strings.Join(problems, "\n  - "))
 		}
 		if problems, _ := dispatch.RuntimeProblems(projects, inventory); len(problems) > 0 {
 			return fmt.Errorf("refusing to start, a project names a runtime that cannot take work:\n  - %s", strings.Join(problems, "\n  - "))
@@ -190,9 +225,9 @@ func run() error {
 
 	if errors.Is(projectsErr, projectmap.ErrNotFound) {
 		logger.Warn("no project mapping configured: deliveries are recorded but never routed",
-			"path", cfg.ProjectsFile, "hint", "copy config/config.example.json and set FLOWHUB_PROJECTS_FILE")
+			"path", cfg.ConfigFile, "hint", "copy config/config.example.json and set FLOWHUB_CONFIG_FILE")
 	} else {
-		logger.Info("project mapping loaded", "path", cfg.ProjectsFile, "mappings", projects.Len(), "routable", projects.Routable(), "keys", strings.Join(projects.Keys(), ","))
+		logger.Info("project mapping loaded", "path", cfg.ConfigFile, "mappings", projects.Len(), "routable", projects.Routable(), "keys", strings.Join(projects.Keys(), ","))
 	}
 
 	// Cancelled on SIGINT/SIGTERM and on a fatal serve error, so the dispatcher
@@ -343,6 +378,18 @@ func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src sour
 	return opts
 }
 
+// sourcePolicyDefaults is the outermost level of a source's trigger policy: the
+// environment. A `sources.<name>.policy` block in the configuration file overrides
+// whatever this names, and the adapter's own defaults fill the rest.
+func sourcePolicyDefaults(cfg config.Config) projectmap.PolicyDefaults {
+	return projectmap.PolicyDefaults{
+		Trigger:             cfg.Trigger,
+		StartStates:         cfg.StartStates,
+		SkipAnalyzeOnCreate: cfg.SkipAnalyzeOnCreate,
+		MaxTurns:            cfg.MaxTurns,
+	}
+}
+
 // newRuntimeFactory returns the constructor the dispatcher uses to build one
 // runtime adapter per host.
 //
@@ -354,18 +401,83 @@ func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src sour
 //
 // One HTTP request is bounded by the client, the turn by its own deadline; the
 // liveness probes bound themselves with a much shorter context.
-func newRuntimeFactory(cfg config.Config, logger *slog.Logger) func(name, url string) agent.Runtime {
+func newRuntimeFactory(cfg config.Config, projects *projectmap.Map, logger *slog.Logger) func(name, url string) agent.Runtime {
 	return func(name, url string) agent.Runtime {
+		// The environment pair is the outermost default; a `runtimes.<name>.auth`
+		// block overrides it by naming the variable that holds the password, which is
+		// how the file stays free of secrets.
+		user, password := cfg.OpenCodeUser, cfg.OpenCodePassword
+		if block, ok := projects.RuntimeBlock(name); ok && block.Auth != nil {
+			user = strings.TrimSpace(block.Auth.User)
+			password = os.Getenv(strings.TrimSpace(block.Auth.PasswordEnv))
+		}
 		return agentruntime.NewRuntime(
 			agentruntime.New(agentruntime.Options{
 				BaseURL:  url,
-				Username: cfg.OpenCodeUser,
-				Password: cfg.OpenCodePassword,
-				Timeout:  cfg.TaskDeadline,
+				Username: user,
+				Password: password,
+				Timeout:  runtimeDeadline(cfg, projects, name),
 			}),
 			agentruntime.RuntimeOptions{Name: name, Log: logger, FirstResponse: cfg.FirstResponse},
 		)
 	}
+}
+
+// runtimeDeadline resolves how long one turn on a host may run: the environment is
+// the outermost default and a `runtimes.<name>.deadline` block overrides it.
+func runtimeDeadline(cfg config.Config, projects *projectmap.Map, name string) time.Duration {
+	if block, ok := projects.RuntimeBlock(name); ok {
+		if deadline := strings.TrimSpace(block.Deadline); deadline != "" {
+			if parsed, err := time.ParseDuration(deadline); err == nil {
+				return parsed
+			}
+		}
+	}
+	return cfg.TaskDeadline
+}
+
+// declaredAuthProblems reports a `runtimes.<name>.auth` block whose password
+// variable is empty: the file names the variable, and a name that holds nothing is
+// half a credential pair, which fails every turn instead of refusing the start.
+func declaredAuthProblems(projects *projectmap.Map) []string {
+	var problems []string
+	for _, name := range projects.Runtimes() {
+		block, ok := projects.RuntimeBlock(name)
+		if !ok || block.Auth == nil {
+			continue
+		}
+		variable := strings.TrimSpace(block.Auth.PasswordEnv)
+		if strings.TrimSpace(os.Getenv(variable)) == "" {
+			problems = append(problems, fmt.Sprintf(
+				"runtimes.%s.auth.password_env names %s, which is empty: export it on this host, or remove the auth block", name, variable))
+		}
+	}
+	return problems
+}
+
+// declaredRuntimes renders the file's `runtimes` table for the dispatcher.
+//
+// A block answers two different questions and either may be absent. A block *with*
+// a URL declares a runtime that exists without being enrolled — the single-host case
+// FLOWHUB_OPENCODE_URL used to be the only way to express. A block *without* a URL
+// declares policy for a runtime the inventory enrols, which is where an enrolled
+// host's address comes from; dropping those blocks is how a `deadline` or `agent`
+// written in the file silently stopped applying (measured live on 2026-09-26, fixed
+// the same run). Both are passed through, and the dispatcher adds a declared runtime
+// as a candidate only when it has an address of its own.
+func declaredRuntimes(cfg config.Config, projects *projectmap.Map) []dispatch.DeclaredRuntime {
+	out := make([]dispatch.DeclaredRuntime, 0, len(projects.Runtimes()))
+	for _, name := range projects.Runtimes() {
+		block, _ := projects.RuntimeBlock(name)
+		out = append(out, dispatch.DeclaredRuntime{
+			Name:     name,
+			URL:      strings.TrimSpace(block.URL),
+			Agent:    strings.TrimSpace(block.Agent),
+			Model:    strings.TrimSpace(block.Model),
+			Deadline: runtimeDeadline(cfg, projects, name),
+		})
+	}
+	return out
 }
 
 // opencodeProber decides whether a host that just claimed a name is usable.
@@ -529,7 +641,7 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 	defaultRuntime := agentruntime.NewRuntime(client, agentruntime.RuntimeOptions{
 		Name: dispatch.DefaultRuntimeName, Log: logger, FirstResponse: cfg.FirstResponse,
 	})
-	factory := newRuntimeFactory(cfg, logger)
+	factory := newRuntimeFactory(cfg, projects, logger)
 	// Refuse to start when nothing can serve a turn: a dispatcher that accepts
 	// deliveries and then fails every one of them is worse than a refused start.
 	// With an inventory the rule becomes "at least one runtime answers", because
@@ -547,6 +659,7 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 		Runtimes:       inventory,
 		NewRuntime:     factory,
 		DefaultRuntime: defaultRuntime,
+		Declared:       declaredRuntimes(cfg, projects),
 		NewWorkspace: func(base string) (workspace.Workspace, error) {
 			// The co-located provider: FlowHub and the runtime share a filesystem, so
 			// a task's directory is a git worktree this process created.
@@ -645,7 +758,7 @@ func logStartup(logger *slog.Logger, cfg config.Config, projects *projectmap.Map
 		"data_dir", cfg.DataDir,
 		"log_file", cfg.ResolvedLogFile(),
 		"detail_log", cfg.DetailLog,
-		"projects_file", cfg.ProjectsFile,
+		"config_file", cfg.ConfigFile,
 		"project_mappings", projects.Len(),
 		"project_routable", projects.Routable(),
 		"wildcard_listen_acknowledged", cfg.AllowWildcardListen,
@@ -740,7 +853,7 @@ func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.C
 			"queue_depth":               sink.QueueDepth(),
 			"queue_capacity":            cfg.QueueSize,
 			"dedupe_keys":               cache.Len(),
-			"projects":                  map[string]any{"file": cfg.ProjectsFile, "mappings": projects.Len(), "routable": projects.Routable(), "keys": projects.Keys()},
+			"projects":                  map[string]any{"file": cfg.ConfigFile, "mappings": projects.Len(), "routable": projects.Routable(), "keys": projects.Keys()},
 			"dispatch":                  dispatchState,
 			"runtimes":                  runtimeHealth(inventory),
 			"control_api":               controlAPIHealth(cfg),

@@ -1,29 +1,70 @@
 {
-  "_comment": "FlowHub routing table: which local repository each YouTrack project drives.",
-  "_comment_usage": "Copy to ~/.config/flowhub/config.json ($XDG_CONFIG_HOME/flowhub/config.json when set) and replace every placeholder below; that is the default path, and FLOWHUB_PROJECTS_FILE overrides it. This file in the repository is NOT loaded by default.",
-  "_comment_why": "This mapping cannot be read from YouTrack: the webhook payload carries only {key, name, shortName}, and YouTrack exposes no REST field or endpoint for the VCS-integration repository URL. Routing is therefore declared here, and an unmapped project is refused rather than guessed.",
-  "_comment_matching": "youtrack_key is matched against the payload's project.key, case-insensitively. If a payload carries no project object, the prefix of the issue ID (TEST-11 -> TEST) is used as a fallback. A project key that is present but unmapped is a hard miss.",
-  "_comment_startup": "Validation runs before any file is created: every path must exist, look like a git work tree, and match repo.remote. A problem stops the process. Leave 'remote' empty to skip only the remote comparison. A *disabled* entry is skipped entirely, which is why the placeholder below is disabled.",
+  "_comment": "FlowHub configuration, version 2: which event sources exist, what starting work means for each, which agent runtimes are declared, and which local repository each (source, project) pair drives.",
+  "_comment_usage": "Copy to ~/.config/flowhub/config.json ($XDG_CONFIG_HOME/flowhub/config.json when set) and replace every placeholder below; that is the default path, and FLOWHUB_CONFIG_FILE overrides it (FLOWHUB_PROJECTS_FILE still works). This file in the repository is NOT loaded by default.",
+  "_comment_version": "Version 1 was the original routing table: `projects[].youtrack_key`, one global key index, every source fact in the environment. A file with no `version` key is still read, translated, and reported as `1 (translated; migrate the file to version 2)`. A version 2 file that uses a version 1 spelling is refused with the replacement named.",
+  "_comment_secrets": "No secret belongs in this file. Locks and key material stay in the environment — FLOWHUB_YOUTRACK_HOOK_KEY, FLOWHUB_YOUTRACK_TOKEN, FLOWHUB_YOUTRACK_ALLOWED_SOURCES (the unsuffixed names still work for YouTrack) — so this file stays safe to copy, diff, back up and review. A runtime's credentials are named by the variable that holds them (see auth below), never written out.",
+  "_comment_startup": "Validation runs before any file is created, and a problem stops the process: an unknown version, an unknown field, a source this binary cannot build, a runtime block that cannot be honoured, a duplicate (source, project), a missing or relative repo.path, a malformed agent or model reference. The *filesystem* checks — does the repository exist, is it a git work tree, is its origin the declared one, does the checkout directory sit outside it — belong to the workspace provider and run in the same gate.",
+  "_comment_report": "`flowhub -print-config` prints each effective value with the level that supplied it (`effective: sources.youtrack trigger=... (level: FLOWHUB_TRIGGER)`), which is how a three-level file stays answerable.",
+
+  "version": 2,
+
+  "sources": {
+    "_comment": "Keyed by the adapter's own name. `enabled` defaults to true, and a source the file never mentions is enabled: the hook key is the lock, and a record-only receiver should not need the file at all. `policy` holds what starting work means for this tracker; every field is optional and the environment is the outermost default. `prompt_file` is parsed but refused as not implemented yet — the adapter's built-in prompt is used, and a declared file that silently did nothing would be worse.",
+    "youtrack": {
+      "enabled": true,
+      "policy": {
+        "_comment": "trigger must match the whole first line (it is anchored). start_states are the workflow states that mean the same thing. max_turns is the runaway guard. self_markers identify FlowHub's own replies when the marker inside the text is lost. FLOWHUB_TRIGGER / FLOWHUB_START_STATES / FLOWHUB_SKIP_ANALYZE_ON_CREATE / FLOWHUB_MAX_TURNS are the same values at the outermost level; whatever this block names wins.",
+        "trigger": "/opencode start",
+        "start_states": ["In Progress"],
+        "skip_analyze_on_create": false,
+        "max_turns": 8
+      },
+      "_comment_authors": "Optional source-level author allowlist (tracker logins, case-insensitive), inherited by every project of this source. A project may narrow it further; a project without its own list allows everyone this source allows.",
+      "authors": []
+    }
+  },
+
+  "runtimes": {
+    "_comment": "Keyed by the enrolled runtime's name. This table is policy, not enrolment: the control-plane inventory (ADR 0002, `flowhub runtime invite` / `init`) records which hosts were prepared and verified, their state and the models they reported, while this says what to ask of them. A name that appears only here is a local runtime — usable without enrolment, which is the single-host case FLOWHUB_OPENCODE_URL used to be the only way to express.",
+    "local": {
+      "_comment_url": "Where the host's agent server listens. Omit it and the runtime is only usable if the inventory enrols it. FLOWHUB_OPENCODE_URL is the outermost default.",
+      "url": "http://127.0.0.1:4096",
+      "_comment_auth": "HTTP Basic Auth, which is what makes a runtime reachable across a network instead of only over loopback. The secret stays in the environment and this block only names the variable; an empty variable, or a user without a password_env (or the reverse), refuses the start. FLOWHUB_OPENCODE_USER/PASSWORD are the outermost default.",
+      "auth": { "user": "opencode", "password_env": "FLOWHUB_LOCAL_OPENCODE_PASSWORD" },
+      "_comment_agent": "The agent profile inside that product. Never the product name: asking opencode for an agent called \"opencode\" makes its server fall back to its own default agent, which is a looser one.",
+      "agent": "devops",
+      "_comment_model": "Optional. Pinning it here wins over the model the host reported at enrolment; leave it empty to use what the host reported, and a project entry can still override both.",
+      "model": "deepseek/deepseek-v4-flash",
+      "_comment_deadline": "One turn's budget on this host. FLOWHUB_TASK_DEADLINE is the outermost default.",
+      "deadline": "15m",
+      "_comment_max_concurrent": "Only 1 is accepted. A session belongs to one runtime and a prompt sent to a busy session is silently swallowed, so raising this needs per-task locking that does not exist yet.",
+      "max_concurrent": 1
+    }
+  },
+
+  "runtime_policy": "spread",
 
   "projects": [
     {
-      "_comment": "One entry per repository. Several YouTrack projects may share a repository through also_keys.",
-      "youtrack_key": "REPLACE_WITH_YOUTRACK_PROJECT_KEY",
-      "also_keys": [],
+      "_comment": "One entry per (source, project) pair. The same project key in two sources is two entries; the same key twice in one source is refused. `also` lets several tracker projects share one repository. `runtime`/`runtimes` is an eligibility set, not a preference list; `runtime_policy` decides how a new task picks within it. A task that is already bound to a runtime stays there for life.",
+      "source": "youtrack",
+      "project": "REPLACE_WITH_YOUTRACK_PROJECT_KEY",
+      "also": [],
+
       "repo": {
-        "_comment": "path must be absolute and is canonicalised on load (symlinks resolved), because opencode treats /tmp and /private/tmp as different projects. remote is compared against .git/config so that a typo cannot route work into the wrong clone.",
+        "_comment": "path is the local clone the workspace provider prepares tasks from: absolute, canonicalised on load (symlinks resolved), because the runtime treats /tmp and /private/tmp as different projects. remote is compared against .git/config so a typo cannot route work into the wrong clone. default_branch is resolved through the origin to a commit when a task is created, and that commit is pinned for the task's life.",
         "path": "/absolute/path/to/your/repo",
         "remote": "git@your-git-host:owner/repo.git",
         "default_branch": "main"
       },
-      "_comment_worktrees": "Base directory for the one-git-worktree-per-task isolation. Must be absolute and outside repo.path. Created on demand, so it does not have to exist yet. Required once dispatch is on (FLOWHUB_DISPATCH=1), unless the global FLOWHUB_WORKTREE_BASE provides a fallback.",
+      "_comment_worktrees": "Base directory for the one-checkout-per-task isolation. Absolute, outside repo.path, created on demand. Required once dispatch is on (FLOWHUB_DISPATCH=1) unless FLOWHUB_WORKTREE_BASE provides the fallback.",
       "worktrees": "/absolute/path/to/flowhub-worktrees",
-      "_comment_agent": "Passed to opencode when the task session is created; it wins over FLOWHUB_DISPATCH_AGENT. Leave model empty to use the agent's own default.",
+
+      "_comment_overrides": "agent and model override the runtime block for this project only; authors is a per-project allowlist; enabled defaults to true, and a disabled entry is never matched and not validated.",
+      "runtime": "local",
       "agent": "devops",
       "model": "deepseek/deepseek-v4-flash",
-      "_comment_authors": "Optional per-project author allowlist (YouTrack logins, case-insensitive). Empty means every actor the routing matches; a non-empty list gets no work from anyone it does not name. issueDeleted carries no actor, so a project with an allowlist can never act on one.",
       "authors": ["your-youtrack-login"],
-      "_comment_enabled": "enabled defaults to true. A disabled entry is never matched and is not validated, so it may point at a checkout this host does not have.",
       "enabled": false
     }
   ]

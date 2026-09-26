@@ -156,14 +156,33 @@ func Parse(body []byte) (*Payload, []string, error) {
 }
 
 // ProjectKey returns the best available project identifier.
+// ProjectKey returns the project the payload names, falling back to the issue ID's
+// prefix.
+//
+// The fallback lives here rather than in the router on purpose: splitting `TEST-12`
+// on its last dash is YouTrack's own convention, and the router refuses to guess.
+// An adapter that knows the convention answers for itself, and every measured
+// delivery carried the project object, so the fallback should stay unused.
 func (p *Payload) ProjectKey() string {
-	if p.Project == nil {
+	if p.Project != nil {
+		if p.Project.Key != "" {
+			return p.Project.Key
+		}
+		if p.Project.ShortName != "" {
+			return p.Project.ShortName
+		}
+	}
+	return issueIDPrefix(p.ID)
+}
+
+// issueIDPrefix returns the project part of a readable issue ID ("TEST-11" ->
+// "TEST"), or "" when the ID has no such prefix.
+func issueIDPrefix(issueID string) string {
+	index := strings.LastIndex(issueID, "-")
+	if index <= 0 {
 		return ""
 	}
-	if p.Project.Key != "" {
-		return p.Project.Key
-	}
-	return p.Project.ShortName
+	return issueID[:index]
 }
 
 // PrimaryActor returns the login most relevant to this event, with no

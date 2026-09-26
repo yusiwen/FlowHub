@@ -64,8 +64,8 @@ func TestLoadResolvesTheProjectsFile(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	want := filepath.Join(home, ".config", "flowhub", "config.json")
-	if cfg.ProjectsFile != want {
-		t.Fatalf("ProjectsFile = %q, want %q", cfg.ProjectsFile, want)
+	if cfg.ConfigFile != want {
+		t.Fatalf("ProjectsFile = %q, want %q", cfg.ConfigFile, want)
 	}
 
 	t.Setenv("XDG_CONFIG_HOME", "/xdg-config")
@@ -73,8 +73,8 @@ func TestLoadResolvesTheProjectsFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if want := filepath.Join("/xdg-config", "flowhub", "config.json"); cfg.ProjectsFile != want {
-		t.Fatalf("ProjectsFile = %q, want %q", cfg.ProjectsFile, want)
+	if want := filepath.Join("/xdg-config", "flowhub", "config.json"); cfg.ConfigFile != want {
+		t.Fatalf("ProjectsFile = %q, want %q", cfg.ConfigFile, want)
 	}
 
 	// An explicit value wins, with "~" expanded.
@@ -83,7 +83,7 @@ func TestLoadResolvesTheProjectsFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if want := filepath.Join(home, "custom.json"); cfg.ProjectsFile != want {
-		t.Fatalf("ProjectsFile = %q, want %q", cfg.ProjectsFile, want)
+	if want := filepath.Join(home, "custom.json"); cfg.ConfigFile != want {
+		t.Fatalf("ProjectsFile = %q, want %q", cfg.ConfigFile, want)
 	}
 }

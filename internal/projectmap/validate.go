@@ -41,7 +41,7 @@ func (m *Map) Validate() []string {
 }
 
 func (e *Entry) validate() []string {
-	label := e.YouTrackKey
+	label := e.Label()
 	var problems []string
 
 	if strings.TrimSpace(e.Repo.Path) == "" {
@@ -86,7 +86,7 @@ func (m *Map) WorkspaceEntries(fallbackBase string) []workspace.Entry {
 			base = canonicalize(fallbackBase)
 		}
 		entries = append(entries, workspace.Entry{
-			Label:         entry.YouTrackKey,
+			Label:         entry.Label(),
 			Repo:          entry.Repo.Path,
 			Remote:        entry.Repo.Remote,
 			DefaultBranch: entry.Repo.DefaultBranch,
@@ -103,14 +103,15 @@ func (m *Map) Report() string {
 	if m != nil && m.Path() != "" {
 		source = m.Path()
 	}
-	fmt.Fprintf(&b, "projects_file:      %s\n", source)
+	fmt.Fprintf(&b, "config_file:        %s\n", source)
+	fmt.Fprintf(&b, "config_format:      %s\n", m.FormatNote())
 
 	if m == nil || m.Len() == 0 {
 		fmt.Fprintf(&b, "projects:           <none> — deliveries are recorded but never routed\n")
 		return b.String()
 	}
 
-	fmt.Fprintf(&b, "runtime_policy:     %s\n", m.Policy())
+	fmt.Fprintf(&b, "runtime_policy:     %s\n", m.SelectionPolicy())
 	fmt.Fprintf(&b, "projects:           %d mapping(s)", m.Len())
 	if routable := m.Routable(); routable != m.Len() {
 		fmt.Fprintf(&b, ", %d routable", routable)
@@ -121,7 +122,14 @@ func (m *Map) Report() string {
 		if !entry.IsEnabled() {
 			state = " [disabled]"
 		}
-		fmt.Fprintf(&b, "  %-14s -> %s%s\n", strings.Join(entry.Keys(), ","), entry.Repo.Path, state)
+		aliases := ""
+		if keys := entry.Keys(); len(keys) > 1 {
+			// Several tracker projects may share one repository. Showing the primary
+			// key as the label and the rest as aliases keeps the source qualification
+			// on the entry rather than on every key.
+			aliases = " (also: " + strings.Join(keys[1:], ", ") + ")"
+		}
+		fmt.Fprintf(&b, "  %-14s -> %s%s%s\n", entry.Label(), entry.Repo.Path, aliases, state)
 		if entry.Repo.Remote != "" {
 			fmt.Fprintf(&b, "  %-14s    remote %s\n", "", entry.Repo.Remote)
 		}

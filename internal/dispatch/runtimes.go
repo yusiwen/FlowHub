@@ -183,9 +183,21 @@ func (d *Dispatcher) runtimeCandidates(entry *projectmap.Entry) []runtimeBinding
 	return out
 }
 
-// allRuntimes is every runtime the process could use: the active enrolled ones by
-// name, then the environment-configured default.
+// allRuntimes is every runtime the process could use, in a deterministic order:
+// the active enrolled ones by name, then the ones the configuration file declares
+// that enrolment does not already cover, then the environment-configured default
+// when nothing else exists.
+//
+// Three sources of truth, each answering a different question: enrolment says which
+// hosts were prepared and verified (and where they are now), the file says what
+// policy to ask of a host, and the environment is the outermost default for a
+// single-host deployment.
 func (d *Dispatcher) allRuntimes() []runtimeBinding {
+	declared := make(map[string]DeclaredRuntime, len(d.opts.Declared))
+	for _, runtime := range d.opts.Declared {
+		declared[runtime.Name] = runtime
+	}
+
 	var out []runtimeBinding
 	if d.opts.Runtimes != nil {
 		active := d.opts.Runtimes.Active()
@@ -198,15 +210,42 @@ func (d *Dispatcher) allRuntimes() []runtimeBinding {
 			if url == "" {
 				continue
 			}
+			// Enrolment answers where the host is; the file answers what to ask of it.
+			policy := declared[runtime.Name]
 			out = append(out, runtimeBinding{
 				Name:         runtime.Name,
 				AgentProfile: runtime.AgentProfile,
 				URL:          url,
 				Runtime:      d.runtimeFor(runtime.Name, url),
 				Models:       runtime.Models,
+				Declared:     policy,
 			})
 		}
 	}
+
+	names := make([]string, 0, len(d.opts.Declared))
+	for _, runtime := range d.opts.Declared {
+		names = append(names, runtime.Name)
+	}
+	sort.Strings(names)
+	enrolled := map[string]bool{}
+	for _, binding := range out {
+		enrolled[binding.Name] = true
+	}
+	for _, name := range names {
+		runtime := declared[name]
+		if enrolled[name] || strings.TrimSpace(runtime.URL) == "" {
+			continue
+		}
+		out = append(out, runtimeBinding{
+			Name:         runtime.Name,
+			AgentProfile: runtime.Agent,
+			URL:          runtime.URL,
+			Runtime:      d.runtimeFor(runtime.Name, runtime.URL),
+			Declared:     runtime,
+		})
+	}
+
 	if len(out) == 0 && d.opts.DefaultRuntime != nil {
 		out = append(out, runtimeBinding{
 			Name: DefaultRuntimeName,
@@ -214,6 +253,7 @@ func (d *Dispatcher) allRuntimes() []runtimeBinding {
 			// process-wide default is the honest answer here.
 			AgentProfile: d.opts.Agent,
 			Runtime:      d.opts.DefaultRuntime,
+			Declared:     declared[DefaultRuntimeName],
 		})
 	}
 	return out
@@ -233,7 +273,22 @@ type runtimeBinding struct {
 	// Models is what the runtime reported its agent profiles pin, keyed by profile
 	// name. Empty for the environment-configured runtime, which never enrolled.
 	Models map[string]string
+	// Declared is the configuration file's policy for this host, when the file names
+	// it. Enrolment reports facts; this decides what to ask.
+	Declared DeclaredRuntime
 }
+
+// deadline is how long one turn on this runtime may run: the file's per-runtime
+// value, then the process default.
+func (b runtimeBinding) deadline(fallback time.Duration) time.Duration {
+	if b.Declared.Deadline > 0 {
+		return b.Declared.Deadline
+	}
+	return fallback
+}
+
+// declaredModel is the model the configuration file pins for this host, if any.
+func (b runtimeBinding) declaredModel() string { return strings.TrimSpace(b.Declared.Model) }
 
 // modelFor resolves the model a turn on this runtime should pin for the given
 // agent profile. The runtime reports these at enrolment, so this is the model the
@@ -335,7 +390,7 @@ func RuntimeProblems(projects *projectmap.Map, inventory *runtimes.Inventory) (p
 			if inventory == nil {
 				warnings = append(warnings, fmt.Sprintf(
 					"%s names runtime %s, but this process has no runtime inventory; set FLOWHUB_ADMIN_ADDR and enrol it",
-					entry.YouTrackKey, name))
+					entry.Label(), name))
 				continue
 			}
 			runtime, ok := inventory.Get(name)
@@ -343,15 +398,15 @@ func RuntimeProblems(projects *projectmap.Map, inventory *runtimes.Inventory) (p
 			case !ok:
 				warnings = append(warnings, fmt.Sprintf(
 					"%s names runtime %s, which is not enrolled yet; run `flowhub runtime invite %s` and then `flowhub runtime init` on that host",
-					entry.YouTrackKey, name, name))
+					entry.Label(), name, name))
 			case runtime.State == runtimes.StateRevoked:
 				problems = append(problems, fmt.Sprintf(
 					"%s names runtime %s, which was revoked; remove it from the project's runtime set or enrol the host again",
-					entry.YouTrackKey, name))
+					entry.Label(), name))
 			case runtime.State != runtimes.StateActive:
 				warnings = append(warnings, fmt.Sprintf(
 					"%s names runtime %s, which is %s and cannot take work yet",
-					entry.YouTrackKey, name, runtime.State))
+					entry.Label(), name, runtime.State))
 			}
 		}
 	}

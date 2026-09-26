@@ -66,7 +66,7 @@ func TestLoadParsesEntriesAndAliases(t *testing.T) {
 	if m.Len() != 1 {
 		t.Fatalf("len = %d, want 1", m.Len())
 	}
-	entry, ok := m.Resolve("TEST")
+	entry, ok := m.Resolve("youtrack", "TEST")
 	if !ok {
 		t.Fatal("TEST did not resolve")
 	}
@@ -160,7 +160,7 @@ func TestLoadRejectsStructuralMistakes(t *testing.T) {
 		},
 		"malformed json": {
 			body: `{"projects": [`,
-			want: "parse projects file",
+			want: "parse configuration file",
 		},
 	}
 	for name, tc := range cases {
@@ -177,9 +177,9 @@ func TestLoadRejectsStructuralMistakes(t *testing.T) {
 	}
 }
 
-func TestMatchPrefersProjectKeyAndFallsBackToIssuePrefix(t *testing.T) {
+func TestMatchUsesTheSourceAndTheProjectKeyOnly(t *testing.T) {
 	repo := writeRepo(t, filepath.Join(t.TempDir(), "repo"), "")
-	path := writeFile(t, filepath.Join(t.TempDir(), "projects.json"), `{
+	path := writeFile(t, filepath.Join(t.TempDir(), "config.json"), `{
 	  "projects": [{"youtrack_key": "TEST", "repo": {"path": "`+repo+`"}}]
 	}`)
 	m, err := Load(path)
@@ -187,32 +187,29 @@ func TestMatchPrefersProjectKeyAndFallsBackToIssuePrefix(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	match, ok := m.Match("TEST", "TEST-12")
-	if !ok || match.Via != ViaProjectKey || match.Key != "TEST" {
-		t.Fatalf("match = %+v ok=%t, want project.key", match, ok)
+	match, ok := m.Match("youtrack", "TEST")
+	if !ok || match.Key != "TEST" || match.Source != "youtrack" {
+		t.Fatalf("match = %+v ok=%t, want youtrack:TEST", match, ok)
 	}
 
-	// A payload without a project object must still route, via the issue prefix.
-	match, ok = m.Match("", "TEST-12")
-	if !ok || match.Via != ViaIssueIDPrefix || match.Key != "TEST" {
-		t.Fatalf("match = %+v ok=%t, want issue_id_prefix", match, ok)
+	// Matching is case-insensitive on both halves: a key typo must not silently
+	// disable routing.
+	if _, ok := m.Match("YouTrack", "test"); !ok {
+		t.Fatal("a differently cased source and key did not match")
 	}
 
-	// Matching is case-insensitive: a key typo must not silently disable routing.
-	if _, ok := m.Match("test", ""); !ok {
-		t.Fatal("lower-case key did not match")
-	}
-
-	// An unknown project key must NOT silently fall back to a known prefix: a
-	// payload that names a different project is a different project, so this is a
-	// hard miss rather than a routing guess.
-	if match, ok := m.Match("OTHER", "TEST-12"); ok {
-		t.Fatalf("unknown project key fell back to the issue prefix: %+v", match)
-	}
-	for _, issue := range []string{"NOPE-1", "no-dash", ""} {
-		if _, ok := m.Match("", issue); ok {
-			t.Fatalf("Match(\"\", %q) matched, want no match", issue)
+	// The router no longer guesses from the issue ID. Splitting `TEST-12` on its last
+	// dash is a YouTrack convention, and the adapter that knows the convention fills
+	// the subject's project itself; the router refusing here is what keeps a
+	// convention out of the routing layer.
+	for _, project := range []string{"", "OTHER", "TEST-12"} {
+		if match, ok := m.Match("youtrack", project); ok {
+			t.Fatalf("Match(youtrack, %q) matched %+v, want a miss", project, match)
 		}
+	}
+	// A different source is a different index, even for the same project key.
+	if _, ok := m.Match("gitea", "TEST"); ok {
+		t.Fatal("a project key matched in a source that does not declare it")
 	}
 }
 
@@ -225,7 +222,7 @@ func TestMatchSkipsDisabledEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if _, ok := m.Match("TEST", "TEST-1"); ok {
+	if _, ok := m.Match("youtrack", "TEST"); ok {
 		t.Fatal("a disabled entry must never match")
 	}
 	// A disabled entry is not validated: it may point at a checkout this host
@@ -246,33 +243,33 @@ func TestValidateReportsValueProblems(t *testing.T) {
 		want  string
 	}{
 		"no repo path": {
-			entry: Entry{YouTrackKey: "A"},
+			entry: Entry{Source: "youtrack", Project: "A"},
 			want:  "repo.path is not configured",
 		},
 		"bad agent name": {
-			entry: Entry{YouTrackKey: "B", Repo: Repo{Path: repo}, Agent: "dev ops/../x"},
+			entry: Entry{Source: "youtrack", Project: "B", Repo: Repo{Path: repo}, Agent: "dev ops/../x"},
 			want:  "not a valid agent name",
 		},
 		"bare model name": {
-			entry: Entry{YouTrackKey: "C", Repo: Repo{Path: repo}, Model: "gpt-5"},
+			entry: Entry{Source: "youtrack", Project: "C", Repo: Repo{Path: repo}, Model: "gpt-5"},
 			want:  "must be spelled provider/model-id",
 		},
 		"model without a name": {
-			entry: Entry{YouTrackKey: "D", Repo: Repo{Path: repo}, Model: "deepseek/"},
+			entry: Entry{Source: "youtrack", Project: "D", Repo: Repo{Path: repo}, Model: "deepseek/"},
 			want:  "must be spelled provider/model-id",
 		},
 		"provider qualified model": {
-			entry: Entry{YouTrackKey: "E", Repo: Repo{Path: repo}, Model: "deepseek/deepseek-v4-flash"},
+			entry: Entry{Source: "youtrack", Project: "E", Repo: Repo{Path: repo}, Model: "deepseek/deepseek-v4-flash"},
 			want:  "",
 		},
 		"ok": {
-			entry: Entry{YouTrackKey: "F", Repo: Repo{Path: repo, Remote: "git@example.cn:me/app.git"}, Agent: "devops"},
+			entry: Entry{Source: "youtrack", Project: "F", Repo: Repo{Path: repo, Remote: "git@example.cn:me/app.git"}, Agent: "devops"},
 			want:  "",
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			m := &Map{byKey: map[string]*Entry{}, entries: []*Entry{&tc.entry}}
+			m := &Map{byIndex: map[string]*Entry{}, entries: []*Entry{&tc.entry}}
 			problems := m.Validate()
 			if tc.want == "" {
 				if len(problems) != 0 {
@@ -312,13 +309,13 @@ func TestWorkspaceEntriesResolvesTheFallbackBase(t *testing.T) {
 	// Load canonicalizes every path it is given (the runtime keys sessions by the
 	// literal string, so /tmp and /private/tmp must not both appear), so compare
 	// against the canonicalized form rather than the string the test built.
-	if entries[0].Label != "TEST" || entries[0].Base != canonicalize(filepath.Join(base, "fallback")) {
+	if entries[0].Label != "youtrack:TEST" || entries[0].Base != canonicalize(filepath.Join(base, "fallback")) {
 		t.Errorf("entry 0 = %+v, want TEST with the fallback base", entries[0])
 	}
 	if entries[0].Remote != "git@example.cn:me/one.git" || entries[0].DefaultBranch != "main" {
 		t.Errorf("entry 0 lost the repository identity: %+v", entries[0])
 	}
-	if entries[1].Label != "OTHER" || entries[1].Base != canonicalize(filepath.Join(base, "wt-two")) {
+	if entries[1].Label != "youtrack:OTHER" || entries[1].Base != canonicalize(filepath.Join(base, "wt-two")) {
 		t.Errorf("entry 1 = %+v, want OTHER with its own worktrees directory", entries[1])
 	}
 
@@ -349,22 +346,6 @@ func TestCanonicalizeResolvesSymlinks(t *testing.T) {
 	}
 }
 
-func TestIssueIDPrefix(t *testing.T) {
-	cases := map[string]string{
-		"TEST-11": "TEST",
-		"TEST-1":  "TEST",
-		"2-123":   "2",
-		"no-dash": "no",
-		"":        "",
-		"-odd":    "",
-	}
-	for id, want := range cases {
-		if got := IssueIDPrefix(id); got != want {
-			t.Errorf("IssueIDPrefix(%q) = %q, want %q", id, got, want)
-		}
-	}
-}
-
 func TestReportRendersTheTable(t *testing.T) {
 	repo := writeRepo(t, filepath.Join(t.TempDir(), "repo"), "git@example.cn:me/app.git")
 	worktrees := filepath.Join(t.TempDir(), "wt")
@@ -381,9 +362,10 @@ func TestReportRendersTheTable(t *testing.T) {
 	}
 	report := m.Report()
 	for _, want := range []string{
-		"projects_file:      " + path,
+		"config_file:        " + path,
 		"projects:           2 mapping(s)",
-		"TEST,DEV",
+		"youtrack:TEST",
+		"also: DEV",
 		"remote git@example.cn:me/app.git",
 		"branch main",
 		"agent=devops authors=yusiwen",
@@ -423,10 +405,10 @@ func TestKeysAndRoutableExcludeDisabledEntries(t *testing.T) {
 	if got, want := m.Routable(), 1; got != want {
 		t.Fatalf("Routable() = %d, want %d", got, want)
 	}
-	if got := strings.Join(m.Keys(), ","); got != "DEV,LIVE" {
+	if got := strings.Join(m.Keys(), ","); got != "youtrack:DEV,youtrack:LIVE" {
 		t.Fatalf("Keys() = %q, want the enabled keys only", got)
 	}
-	if _, ok := m.Match("PLACEHOLDER", "PLACEHOLDER-1"); ok {
+	if _, ok := m.Match("youtrack", "PLACEHOLDER"); ok {
 		t.Fatal("a disabled entry matched")
 	}
 	// The disabled entry still needs no valid path, so validation passes.
@@ -455,13 +437,13 @@ func TestRuntimeAddressingIsParsedAndResolved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if projects.Policy() != PolicyFirstHealthy {
-		t.Fatalf("table policy = %q", projects.Policy())
+	if projects.SelectionPolicy() != PolicyFirstHealthy {
+		t.Fatalf("table policy = %q", projects.SelectionPolicy())
 	}
 
 	byKey := map[string]*Entry{}
 	for _, entry := range projects.Entries() {
-		byKey[entry.YouTrackKey] = entry
+		byKey[entry.Project] = entry
 	}
 	if got := byKey["A"].RuntimeSet(); len(got) != 1 || got[0] != "builder-a" {
 		t.Fatalf("A runtimes = %v", got)
@@ -498,8 +480,8 @@ func TestRuntimeAddressingDefaultsToSpread(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if projects.Policy() != PolicySpread {
-		t.Fatalf("table policy = %q, want spread", projects.Policy())
+	if projects.SelectionPolicy() != PolicySpread {
+		t.Fatalf("table policy = %q, want spread", projects.SelectionPolicy())
 	}
 	if entry := projects.Entries()[0]; entry.Policy() != PolicySpread || len(entry.RuntimeSet()) != 0 {
 		t.Fatalf("entry = %+v, want the default policy and no declared runtimes", entry)

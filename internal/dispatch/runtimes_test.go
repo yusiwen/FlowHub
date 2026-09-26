@@ -374,3 +374,86 @@ func TestRuntimeProblemsSeparatesTyposFromNotYetEnrolled(t *testing.T) {
 		t.Fatalf("problems=%v warnings=%v, want a disabled entry to be ignored", problems, warnings)
 	}
 }
+
+// TestDeclaredPolicyAppliesToAnEnrolledRuntime is a regression test for a live bug:
+// a `runtimes.<name>` block that carries policy but no URL is how an *enrolled* host
+// gets its agent, model and deadline from the configuration file, and the first
+// version of the wiring dropped those blocks — so the file's `deadline: 20m` never
+// reached the turn and the process default was used instead.
+func TestDeclaredPolicyAppliesToAnEnrolledRuntime(t *testing.T) {
+	inventory := testInventory(t, "http://127.0.0.1:1", "builder-a")
+	reg, err := registry.Open(filepath.Join(t.TempDir(), "registry.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	projects := testProjects(t, `,"runtimes":["builder-a"]`)
+	dispatcher, err := New(Options{
+		NewRuntime:     runtimeFactory(time.Second),
+		DefaultRuntime: newTestRuntime(DefaultRuntimeName, "http://127.0.0.1:1", time.Second),
+		NewWorkspace:   testWorkspaces,
+		Source:         youtrack.New(rules.Policy{}),
+		Runtimes:       inventory,
+		Registry:       reg,
+		Projects:       projects,
+		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Declared: []DeclaredRuntime{{
+			// No URL: the inventory is where this host's address comes from.
+			Name: "builder-a", Agent: "declared-agent", Model: "deepseek/declared", Deadline: 20 * time.Minute,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	binding, ok := dispatcher.bindingFor("builder-a")
+	if !ok {
+		t.Fatal("the enrolled runtime is not a candidate")
+	}
+	if binding.URL != "http://127.0.0.1:1" {
+		t.Fatalf("URL = %q, want the enrolled address", binding.URL)
+	}
+	if got := binding.deadline(time.Minute); got != 20*time.Minute {
+		t.Fatalf("deadline = %s, want the file's 20m", got)
+	}
+	if got := binding.declaredModel(); got != "deepseek/declared" {
+		t.Fatalf("declared model = %q", got)
+	}
+	if got := runtimeAgent(projects.Entries()[0], binding, "env-agent"); got != "devops" {
+		t.Fatalf("agent = %q, want the profile the host attested at enrolment", got)
+	}
+	// A project's own agent still wins over both, and a runtime that was never
+	// enrolled has nothing attested, so the file supplies both values.
+	entry := projects.Entries()[0]
+	entry.Agent = "project-agent"
+	if got := runtimeAgent(entry, binding, "env-agent"); got != "project-agent" {
+		t.Fatalf("agent = %q, want the project's override", got)
+	}
+	entry.Agent = ""
+
+	standalone, err := New(Options{
+		NewRuntime:     runtimeFactory(time.Second),
+		DefaultRuntime: newTestRuntime(DefaultRuntimeName, "http://127.0.0.1:1", time.Second),
+		NewWorkspace:   testWorkspaces,
+		Source:         youtrack.New(rules.Policy{}),
+		Runtimes:       testInventory(t, "http://127.0.0.1:1"),
+		Registry:       reg,
+		Projects:       projects,
+		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Declared: []DeclaredRuntime{{
+			Name: "only-declared", URL: "http://127.0.0.1:9", Agent: "declared-agent", Model: "deepseek/declared",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sole, ok := standalone.bindingFor("only-declared")
+	if !ok {
+		t.Fatal("a declared runtime with its own address is not a candidate")
+	}
+	if sole.AgentProfile != "declared-agent" || sole.declaredModel() != "deepseek/declared" {
+		t.Fatalf("declared runtime = %+v, want the file's agent and model", sole)
+	}
+	if got := runtimeAgent(nil, sole, "env-agent"); got != "declared-agent" {
+		t.Fatalf("agent = %q, want the file's profile when nothing was enrolled", got)
+	}
+}

@@ -240,7 +240,12 @@ Flags: `-version`, `-print-config`.
 | `FLOWHUB_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `FLOWHUB_LOG_FORMAT` | `text` | `text` or `json` |
 | `FLOWHUB_SHUTDOWN_TIMEOUT` | `10s` | Graceful drain budget on `SIGINT`/`SIGTERM` |
-| `FLOWHUB_PROJECTS_FILE` | `~/.config/flowhub/config.json` | Routing table: YouTrack project → local repository. `$XDG_CONFIG_HOME/flowhub/config.json` when that is set. A leading `~` is expanded, and the path is made absolute at startup. A missing file only warns; a file that exists but fails validation stops startup |
+| `FLOWHUB_CONFIG_FILE` | `~/.config/flowhub/config.json` | The configuration file: sources, runtimes, and the `(source, project)` → local repository table. `$XDG_CONFIG_HOME/flowhub/config.json` when that is set. A leading `~` is expanded, and the path is made absolute at startup. A missing file only warns (the receiver still records); a file that exists but fails validation stops startup |
+| `FLOWHUB_PROJECTS_FILE` | *(alias)* | The old name of `FLOWHUB_CONFIG_FILE`, still read. The file is no longer only a routing table, so the new spelling is preferred; setting both uses `FLOWHUB_CONFIG_FILE` |
+| `FLOWHUB_SOURCE` | `youtrack` | Which registered event source this receiver serves. It selects the adapter that decodes deliveries and the `sources.<name>` block that supplies the trigger policy |
+| `FLOWHUB_YOUTRACK_HOOK_KEY` | *(unset)* | Lock 1 (URL key) for the YouTrack source. `FLOWHUB_HOOK_KEY` is the same variable under its old name; a second source gets its own, which is why the locks are per source |
+| `FLOWHUB_YOUTRACK_TOKEN` | *(unset)* | Lock 2 (header token) for YouTrack. `FLOWHUB_TOKEN` is the alias |
+| `FLOWHUB_YOUTRACK_ALLOWED_SOURCES` | *(unset)* | Lock 3 (source IP allowlist) for YouTrack. `FLOWHUB_ALLOWED_SOURCES` is the alias |
 
 The dispatcher (`opencode-devops-orchestration-design.md` §12) is off until it is
 switched on explicitly:
@@ -303,9 +308,29 @@ cp config/config.example.json ~/.config/flowhub/config.json   # then edit it
 
 ```json
 {
+  "version": 2,
+
+  "sources": {
+    "youtrack": {
+      "enabled": true,
+      "policy": {
+        "trigger": "/opencode start",
+        "start_states": ["In Progress"],
+        "max_turns": 8
+      }
+    }
+  },
+
+  "runtimes": {
+    "builder-a": { "url": "https://builder-a.lan:4096", "agent": "devops", "deadline": "15m" },
+    "builder-b": { "url": "https://builder-b.lan:4096", "agent": "devops" }
+  },
+
   "projects": [
     {
-      "youtrack_key": "BEAP_BE",
+      "source": "youtrack",
+      "project": "BEAP_BE",
+      "also": ["BEAP"],
       "repo": {
         "path": "/Users/yusiwen/git/work/pipechina/beap-be",
         "remote": "git@git.yusiwen.cn:Pipechina-CJPT/beap-be.git",
@@ -319,6 +344,42 @@ cp config/config.example.json ~/.config/flowhub/config.json   # then edit it
   ]
 }
 ```
+
+The file has three parts and one rule: **no secret is ever written in it.** Locks
+and key material stay in the environment (`FLOWHUB_YOUTRACK_HOOK_KEY`,
+`FLOWHUB_YOUTRACK_TOKEN`, `FLOWHUB_YOUTRACK_ALLOWED_SOURCES`), and a runtime's
+password is named by the variable that holds it (`"auth": {"user": "opencode",
+"password_env": "FLOWHUB_BUILDER_A_PASSWORD"}`), so the file stays safe to copy,
+diff, back up and review.
+
+**Version 1 files still load.** A file with no `version` key can only have meant
+YouTrack, so it is translated on read and reported as
+`config_format: 1 (translated; migrate the file to version 2)`. What version 2 adds
+is the mechanical thing version 1 could not express: the entry names its tracker in
+a *field* (`source` + `project`) instead of in the field's *name*
+(`youtrack_key`), and the index is per source — so a YouTrack `TEST` and a Gitea
+`TEST` are two projects. A version 2 file that still writes `youtrack_key` is
+refused with the replacement named in the error.
+
+**Three levels, and the report says which one won.** Outermost is the environment
+(`FLOWHUB_TRIGGER`, `FLOWHUB_START_STATES`, `FLOWHUB_SKIP_ANALYZE_ON_CREATE`,
+`FLOWHUB_MAX_TURNS`, `FLOWHUB_OPENCODE_URL`, `FLOWHUB_DISPATCH_AGENT`,
+`FLOWHUB_TASK_DEADLINE`, `FLOWHUB_OPENCODE_USER`/`PASSWORD`), then the file's
+`sources.<name>` and `runtimes.<name>` blocks, then the project entry for the values
+a project may override (`agent`, `model`, `authors`, `runtime`/`runtimes`,
+`enabled`). `-print-config` prints each effective value with its level:
+
+```
+effective:          sources.youtrack trigger="/opencode start" (level: FLOWHUB_TRIGGER)
+effective:          runtimes.builder-a deadline=20m (level: runtimes.builder-a)
+effective:          projects[youtrack:TEST] model=deepseek/v4 (level: projects[youtrack:TEST])
+```
+
+Two limits are deliberate and refused rather than ignored:
+`sources.<name>.prompt_file` is not implemented yet (the adapter's built-in prompt
+is used), and `runtimes.<name>.max_concurrent` accepts only `1` — a session belongs
+to one runtime and a prompt sent to a busy session is silently swallowed, so raising
+it needs per-task locking that does not exist yet.
 
 ### Which host runs the work
 
@@ -388,29 +449,41 @@ even though YouTrack knows the answer. Measured evidence:
 
 | Rule | Behaviour |
 | --- | --- |
-| Primary key | `youtrack_key` is matched against the payload's `project.key`, **case-insensitively** |
-| Aliases | `also_keys` lets several YouTrack projects share one repository |
-| Fallback | Only when a payload carries **no** project object: the issue-ID prefix (`BEAP_BE-12` → `BEAP_BE`) |
-| Unmapped project key | **Hard miss.** A payload that names a project you did not map is never routed via the prefix — that would be exactly the guess this layer exists to prevent |
+| Index | `(source, project)`, both matched **case-insensitively**. The same project key in two sources is two entries; the same key twice in one source is refused (aliases included) |
+| Aliases | `also` lets several tracker projects share one repository |
+| Project key | Taken from the event's subject, which the adapter fills — including the YouTrack convention that a payload with no project object falls back to the issue ID's prefix (`BEAP_BE-12` → `BEAP_BE`). **The router itself never guesses**: a delivery with no project, or with one this file does not map, is a hard miss |
 | `enabled: false` | Never matched, and not validated (it may point at a checkout this host does not have) |
-| `runtime` / `runtimes` | The eligibility set for a new task. A name that is not a runtime name (`^[a-z0-9][a-z0-9._-]{0,62}$`) is refused when the table is loaded, because it could never be enrolled |
-| `runtime_policy` | `spread` or `first-healthy`, per project or for the whole table; anything else is refused at load |
+| `runtime` / `runtimes` | The eligibility set for a new task. A name that is not a runtime name (`^[a-z0-9][a-z0-9._-]{0,62}$`) is refused when the file is loaded, because it could never be enrolled |
+| `runtime_policy` | `spread` or `first-healthy`, per project or for the whole file; anything else is refused at load |
+| `sources.<name>` | `enabled`, the trigger `policy`, an author allowlist a project may narrow, and `prompt_file` (refused until implemented) |
+| `runtimes.<name>` | `url`, `auth` (a username plus the *name* of the variable holding the password), `agent`, `model`, `deadline`, `max_concurrent` (only `1`) |
 
 ### Startup validation (fail-closed)
 
 A mapping file that exists must be correct, so these all **stop the process**
 before any file is created:
 
-* `repo.path` missing, not a directory, or not a git work tree;
-* `repo.path` not matching `repo.remote` — compared against `.git/config`, so a
-  typo cannot route work into the wrong clone (leave `remote` empty to skip only
-  this check);
-* a relative path anywhere (it would depend on the caller's working directory);
-* `worktrees` inside `repo.path` or equal to it;
-* a duplicate key, or an `agent` name that is not a plain identifier;
+* an unknown `version`, or any unknown JSON member — a typo in a field name is an
+  error, not a no-op;
+* a version 2 file that uses a version 1 spelling (`youtrack_key`, `also_keys`),
+  refused with the replacement named;
+* a `source` this binary cannot build (the error lists the adapters it knows), or a
+  `sources.<name>.prompt_file`, which is not implemented yet;
+* a `runtimes.<name>` block that cannot be honoured: a URL that is not http(s), a
+  `max_concurrent` other than `1`, an unparsable `deadline`, a user without a
+  `password_env` (or the reverse), or a `password_env` naming an empty variable;
+* a duplicate `(source, project)`, or an `agent` name that is not a plain
+  identifier, or a `model` that is not spelled `provider/model-id`;
+* `repo.path` missing, relative, not a directory, or not a git work tree — checked
+  by the **workspace provider** (`localworktree.Validator`), because it is a fact of
+  the host that will prepare the checkout rather than of the file;
+* `repo.path` not matching `repo.remote` — compared against `.git/config`, so a typo
+  cannot route work into the wrong clone (leave `remote` empty to skip only this
+  check);
+* `worktrees` inside `repo.path` or equal to it, or neither `worktrees` nor
+  `FLOWHUB_WORKTREE_BASE` set while dispatch is on;
 * `runtime_policy` that is neither `spread` nor `first-healthy`, or a runtime name
-  that could never be enrolled (see above);
-* any unknown JSON member (a typo in a field name is an error, not a no-op).
+  that could never be enrolled (see above).
 
 Keys whose name starts with `_` are documentation and are ignored, which is how
 the example carries its explanations in a format without comments.
@@ -917,7 +990,7 @@ Layout:
 | `internal/webhook` | The delivery pipeline: entry locks, body limits, source decode, replay window, idempotency, audit, redaction |
 | `internal/dedupe` | TTL idempotency cache |
 | `internal/store` | Audit record, non-blocking queue, daily JSONL writer, human readable payload log |
-| `internal/projectmap` | YouTrack project → repository routing table: strict loader, canonical paths, fail-closed validation, runtime addressing |
+| `internal/projectmap` | The configuration file: v1/v2 loader with the v1 translation, `sources`/`runtimes`/`projects`, the `(source, project)` index, per-level policy precedence with provenance, canonical paths, fail-closed validation, runtime addressing |
 | `internal/rules` | Trigger policy over the neutral event: ignore/analyze/plan/execute, self-comment detection, turn budget, reply basis |
 | `internal/agent` | The runtime seam: `Runtime`, the neutral `Turn`/`Result`, the turn phase and the download policy |
 | `internal/agent/opencode` | opencode client, permission arbiter, session ruleset and the runner that drives one unattended turn |
@@ -925,7 +998,7 @@ Layout:
 | `internal/workspace/localworktree` | The co-located provider: one git worktree per task, baseline pinned through the origin |
 | `internal/dispatch` | The workers: intake loop, one queue and worker per runtime, worktree, session, registry, audit |
 | `internal/metrics` | Counters used by `/healthz` |
-| `config/config.example.json` | Committed template for the routing table |
+| `config/config.example.json` | Committed version 2 template for the configuration file |
 | `scripts/smoke.sh` | The end-to-end check behind `make smoke` |
 
 `AGENTS.md` records the project invariants that contributors and coding agents

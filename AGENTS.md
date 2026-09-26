@@ -95,7 +95,7 @@ internal/event/     the neutral event IR (Kind, Subject, Attachment, Event) ever
 internal/source/    the source seam: Request, Decoded, Source, ToolPolicy (data only)
 internal/source/youtrack/ the YouTrack adapter: payload model, schema report, neutral-event decoding, tools, prompt
 internal/webhook/   The delivery pipeline: entry locks, body limits, source decode, replay window, idempotency, audit, redaction
-internal/projectmap/ YouTrack project -> repository routing table (~/.config/flowhub/config.json)
+internal/projectmap/ the configuration file (v1/v2, sources, runtimes, (source, project) index, provenance) (~/.config/flowhub/config.json)
 internal/agent/       the runtime seam: Runtime, Turn/Result, Phase, Downloads, model references
 internal/agent/opencode/  the opencode implementation: client, arbiter, session ruleset, one-turn runner
 internal/workspace/   the workspace seam: Workspace, Handle, Base, Validator
@@ -164,12 +164,18 @@ documents. The rules below are load-bearing; do not relax them casually.
    relaxing the check: either bind a specific address or set the flag for a real
    container. `Problems()` is deliberately separate from `validate()` so
    `-print-config` keeps working while a start is refused.
-7. **Routing never guesses a repository.** The mapping from `project.key` to a
+7. **Routing never guesses a repository.** The mapping from `(source, project)` to a
    local checkout lives in `~/.config/flowhub/config.json` (template:
-   `config/config.example.json`); `FLOWHUB_PROJECTS_FILE` overrides it and a
-   leading `~` is expanded. An unmapped project is refused, and a project key
-   that *is* present but unmapped must **not** fall back to the issue-ID
-   prefix. Startup validates every path, git work tree and `origin` before any
+   `config/config.example.json`); `FLOWHUB_CONFIG_FILE` overrides it
+   (`FLOWHUB_PROJECTS_FILE` is the old name and still works) and a
+   leading `~` is expanded. An unmapped project is refused, and the **router never
+   derives a project from an issue ID**: splitting `TEST-12` on its last dash is a
+   YouTrack convention, so the adapter that knows it fills the subject's project
+   while the router stays free of conventions. The index is `(source, project)`, the
+   file's version is explicit (a version 1 file is translated on read and reported
+   as such), every unknown field is an error, and each effective value is printed
+   with the level that supplied it. Startup validates the file, every path,
+   git work tree and `origin` before any
    file is created, and refuses otherwise. Do not add a "use the only configured
    repository" fallback: silently editing the wrong repository is the worst
    failure this project can have. Startup also refuses to dispatch when an entry

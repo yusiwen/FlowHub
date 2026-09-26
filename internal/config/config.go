@@ -56,8 +56,12 @@ const (
 	// that never starts otherwise occupies the only worker until the deadline.
 	DefaultFirstResponse = 90 * time.Second
 	DefaultMaxTurns      = 8
-	DefaultTrigger       = "/opencode start"
-	DefaultStartState    = "In Progress"
+	// DefaultSourceName is the source a process serves when FLOWHUB_SOURCE is unset.
+	// It matches the only adapter this binary registers today.
+	DefaultSourceName = "youtrack"
+
+	DefaultTrigger    = "/opencode start"
+	DefaultStartState = "In Progress"
 
 	// DefaultAdminAddr is the control API listener. It is not started unless
 	// the address is set: an always-on control surface would either be
@@ -144,13 +148,21 @@ type Config struct {
 	// DetailLogMaxBodyBytes caps how much of a body is pretty printed there.
 	DetailLogMaxBodyBytes int
 
-	// ProjectsFile is the YouTrack project to repository routing table. A missing
+	// ConfigFile is the FlowHub configuration file: which sources exist, what
+	// starting work means for each, which runtimes are declared, and the
+	// project -> repository table. A missing
 	// file only warns (phase 1 records without routing); a file that exists but
 	// does not parse or validate is a startup error.
 	//
 	// Load resolves it to an absolute path, so the logs, the loader and
 	// -print-config always name the file that was actually read.
-	ProjectsFile string
+	ConfigFile string
+
+	// Source names the event source this receiver serves, e.g. "youtrack". It selects
+	// which registered adapter decodes deliveries and which `sources.<name>` block
+	// supplies the trigger policy, so a process handling Gitea and one handling
+	// YouTrack differ by this variable and not by a rebuild.
+	Source string
 
 	// LogLevel is one of debug, info, warn, error.
 	LogLevel string
@@ -248,16 +260,20 @@ type Config struct {
 // Load reads the configuration from the environment and validates it.
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:         env("FLOWHUB_ADDR", DefaultAddr),
-		HookPath:     env("FLOWHUB_HOOK_PATH", DefaultHookPath),
-		HookKey:      os.Getenv("FLOWHUB_HOOK_KEY"),
-		TokenHeader:  env("FLOWHUB_TOKEN_HEADER", DefaultTokenHeader),
-		Token:        os.Getenv("FLOWHUB_TOKEN"),
-		DataDir:      env("FLOWHUB_DATA_DIR", DefaultDataDir),
-		LogFile:      env("FLOWHUB_LOG_FILE", ""),
-		ProjectsFile: env("FLOWHUB_PROJECTS_FILE", DefaultProjectsFile()),
-		LogLevel:     env("FLOWHUB_LOG_LEVEL", DefaultLogLevel),
-		LogFormat:    env("FLOWHUB_LOG_FORMAT", DefaultLogFormat),
+		Addr:     env("FLOWHUB_ADDR", DefaultAddr),
+		HookPath: env("FLOWHUB_HOOK_PATH", DefaultHookPath),
+		// Locks are per source: a process serving two trackers must not share one URL
+		// key. The unsuffixed names stay accepted as aliases for the default source, so
+		// an existing deployment keeps working unchanged.
+		HookKey:     firstEnv("", "FLOWHUB_"+strings.ToUpper(DefaultSourceName)+"_HOOK_KEY", "FLOWHUB_HOOK_KEY"),
+		TokenHeader: env("FLOWHUB_TOKEN_HEADER", DefaultTokenHeader),
+		Token:       firstEnv("", "FLOWHUB_"+strings.ToUpper(DefaultSourceName)+"_TOKEN", "FLOWHUB_TOKEN"),
+		DataDir:     env("FLOWHUB_DATA_DIR", DefaultDataDir),
+		LogFile:     env("FLOWHUB_LOG_FILE", ""),
+		ConfigFile:  firstEnv(DefaultProjectsFile(), "FLOWHUB_CONFIG_FILE", "FLOWHUB_PROJECTS_FILE"),
+		Source:      env("FLOWHUB_SOURCE", DefaultSourceName),
+		LogLevel:    env("FLOWHUB_LOG_LEVEL", DefaultLogLevel),
+		LogFormat:   env("FLOWHUB_LOG_FORMAT", DefaultLogFormat),
 	}
 
 	var err error
@@ -294,7 +310,7 @@ func Load() (Config, error) {
 	if cfg.DetailLogMaxBodyBytes, err = envInt("FLOWHUB_DETAIL_MAX_BODY_BYTES", DefaultDetailMaxBody); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_DETAIL_MAX_BODY_BYTES: %w", err)
 	}
-	if cfg.AllowedSources, err = ParseSources(os.Getenv("FLOWHUB_ALLOWED_SOURCES")); err != nil {
+	if cfg.AllowedSources, err = ParseSources(firstEnv("", "FLOWHUB_"+strings.ToUpper(DefaultSourceName)+"_ALLOWED_SOURCES", "FLOWHUB_ALLOWED_SOURCES")); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_ALLOWED_SOURCES: %w", err)
 	}
 
@@ -331,7 +347,7 @@ func Load() (Config, error) {
 	if cfg.TaskMaxCost, err = envFloat("FLOWHUB_TASK_MAX_COST", 0); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_TASK_MAX_COST: %w", err)
 	}
-	cfg.ProjectsFile = ResolveProjectsFile(cfg.ProjectsFile)
+	cfg.ConfigFile = ResolveProjectsFile(cfg.ConfigFile)
 
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
@@ -765,6 +781,21 @@ func formatCost(cost float64) string {
 		return "<disabled>"
 	}
 	return "$" + strconv.FormatFloat(cost, 'f', -1, 64)
+}
+
+// firstEnv returns the first environment variable that is set, or the fallback.
+//
+// It exists for the one rename this format introduces: the file is no longer only a
+// routing table, so FLOWHUB_CONFIG_FILE is the preferred spelling while
+// FLOWHUB_PROJECTS_FILE keeps working. An upgrade must not silently stop a live
+// receiver because an operator's existing variable stopped being read.
+func firstEnv(fallback string, names ...string) string {
+	for _, name := range names {
+		if value, ok := os.LookupEnv(name); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return fallback
 }
 
 // splitList parses a comma separated list, dropping empty items.

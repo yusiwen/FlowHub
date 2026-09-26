@@ -7,12 +7,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yusiwen/flowhub/internal/config"
 	"github.com/yusiwen/flowhub/internal/dispatch"
+	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/rules"
 	"github.com/yusiwen/flowhub/internal/runtimes"
 	"github.com/yusiwen/flowhub/internal/source/youtrack"
@@ -236,7 +239,7 @@ func TestAgentCallsCarryTheConfiguredCredentials(t *testing.T) {
 	}
 
 	// The runtime the dispatcher builds for each host.
-	runtime := newRuntimeFactory(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))("builder-a", server.URL)
+	runtime := newRuntimeFactory(cfg, emptyProjects(t), slog.New(slog.NewTextHandler(io.Discard, nil)))("builder-a", server.URL)
 	if _, err := runtime.Health(context.Background()); err != nil {
 		t.Fatalf("Health: %v", err)
 	}
@@ -259,4 +262,20 @@ func TestAgentCallsCarryTheConfiguredCredentials(t *testing.T) {
 			t.Fatalf("credentials = %q, want flowhub:hunter2", credentials)
 		}
 	}
+}
+
+// emptyProjects is a loaded-but-declares-nothing project map, for the tests that
+// exercise a wiring path which only needs the type.
+func emptyProjects(t *testing.T) *projectmap.Map {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	body := `{"version": 2, "projects": [{"source": "youtrack", "project": "TEST", "repo": {"path": "/tmp/test"}}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+	return projects
 }

@@ -50,8 +50,13 @@ type Options struct {
 	// product to build one.
 	NewRuntime func(name, url string) agent.Runtime
 	// DefaultRuntime is the runtime configured purely through the environment,
-	// used when the inventory names none. Nil means "only enrolled runtimes".
+	// used when nothing else names one. Nil means "only enrolled or declared
+	// runtimes".
 	DefaultRuntime agent.Runtime
+	// Declared are the runtimes the configuration file declares. A declared name that
+	// is not enrolled is still usable: it is the single-host case, and it is what
+	// FLOWHUB_OPENCODE_URL used to be the only way to express.
+	Declared []DeclaredRuntime
 	// NewWorkspace builds the workspace provider for one checkout base directory.
 	// Injected for the same reason as NewRuntime: which provider produces a task's
 	// directory is a deployment decision, not a routing one.
@@ -79,6 +84,23 @@ type Options struct {
 	// MaxCostPerTask stops a task whose accumulated cost passes this value.
 	// Zero disables the check.
 	MaxCostPerTask float64
+}
+
+// DeclaredRuntime is a runtime the configuration file declares: where it is, and the
+// policy to ask of it. Enrolment is a separate record (the control-plane inventory):
+// it answers "has this host been prepared and verified, and is it up", while this
+// answers "what should the dispatcher ask of it".
+type DeclaredRuntime struct {
+	Name string
+	URL  string
+	// Agent is the runtime's agent profile; empty falls back to the project and then
+	// to the process default.
+	Agent string
+	// Model pins the model for this host; empty falls back to what the host reported
+	// at enrolment.
+	Model string
+	// Deadline bounds one turn on this host; zero falls back to the process default.
+	Deadline time.Duration
 }
 
 // Dispatcher consumes accepted deliveries.
@@ -366,13 +388,13 @@ func (d *Dispatcher) routeOne(ctx context.Context, rec *store.Record) (routed, b
 		return routed{record: rec, binding: binding}, true
 	}
 
-	match, ok := d.opts.Projects.Match(rec.ProjectKey, rec.IssueID)
+	match, ok := d.opts.Projects.Match(d.opts.Source.Name(), rec.ProjectKey)
 	if !ok {
 		// Fail closed, and fail here rather than in the worker: an unroutable project
 		// must not take up a runtime's queue slot.
 		d.ignored.Add(1)
-		d.log.Warn("no repository is mapped for this project; delivery ignored",
-			"issue", rec.IssueID, "project", rec.ProjectKey)
+		d.log.Warn("no repository is mapped for this project in this source; delivery ignored",
+			"issue", rec.IssueID, "source", d.opts.Source.Name(), "project", rec.ProjectKey)
 		return routed{}, false
 	}
 	binding, err := d.pickRuntime(ctx, task, match.Entry)
@@ -540,13 +562,13 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		return
 	}
 
-	match, ok := d.opts.Projects.Match(rec.ProjectKey, rec.IssueID)
+	match, ok := d.opts.Projects.Match(d.opts.Source.Name(), rec.ProjectKey)
 	if !ok {
 		// Fail closed. Guessing a repository is the one mistake this design
 		// refuses to make.
 		d.ignored.Add(1)
-		d.log.Warn("no repository is mapped for this project; delivery ignored",
-			"issue", rec.IssueID, "project", rec.ProjectKey)
+		d.log.Warn("no repository is mapped for this project in this source; delivery ignored",
+			"issue", rec.IssueID, "source", d.opts.Source.Name(), "project", rec.ProjectKey)
 		return
 	}
 	if !authorAllowed(match.Entry.Authors, rec.PrimaryActor) {
@@ -614,14 +636,14 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 		return task, nil
 	}
 	if entry.Repo.DefaultBranch == "" {
-		return registry.Task{}, fmt.Errorf("project %s has no default_branch configured, so no worktree can be based on it", entry.YouTrackKey)
+		return registry.Task{}, fmt.Errorf("project %s has no default_branch configured, so no worktree can be based on it", entry.Label())
 	}
 	base := strings.TrimSpace(entry.Worktrees)
 	if base == "" {
 		base = strings.TrimSpace(d.opts.WorktreeBase)
 	}
 	if base == "" {
-		return registry.Task{}, fmt.Errorf("project %s declares no worktrees directory and no fallback is configured", entry.YouTrackKey)
+		return registry.Task{}, fmt.Errorf("project %s declares no worktrees directory and no fallback is configured", entry.Label())
 	}
 	spaces, err := d.workspaceFor(base)
 	if err != nil {
@@ -686,8 +708,18 @@ func runtimeAgent(entry *projectmap.Entry, binding runtimeBinding, fallback stri
 			return agent
 		}
 	}
+	// An enrolled host's attested profile beats the configuration file, because
+	// enrolment is the verification: the host reported which profiles exist on it,
+	// and `init --check` confirmed the one it claimed. A name the operator writes in
+	// the file for such a host would be unverified, and an unverified name makes the
+	// product fall back to its own default agent — a looser one. The file's value is
+	// therefore used only for a runtime that was never enrolled, or one that reported
+	// no profile at all.
 	if profile := strings.TrimSpace(binding.AgentProfile); profile != "" {
 		return profile
+	}
+	if declared := strings.TrimSpace(binding.Declared.Agent); declared != "" {
+		return declared
 	}
 	return fallback
 }
@@ -778,9 +810,15 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	// before the profile was installed answers with the old model id, so without
 	// pinning, the check passes and every turn dies on a model its provider dropped.
 	// That happened on 2026-09-25. The routing entry still wins when it names one.
+	// Same order as the agent, for the same reason: the model a host reported for a
+	// profile is the one the capability check verified against the provider's
+	// catalogue, so the file's pin applies only where there is no attestation.
 	model := strings.TrimSpace(match.Entry.Model)
 	if model == "" {
 		model = binding.modelFor(agentName)
+	}
+	if model == "" {
+		model = binding.declaredModel()
 	}
 
 	defer d.enterTurn(binding.Name)()
@@ -799,7 +837,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 			Prefix: tools.Download.Prefix,
 		},
 		Metadata: map[string]any{"task_key": rec.IssueID, "action": string(decision.Action)},
-		Deadline: d.opts.Deadline,
+		Deadline: binding.deadline(d.opts.Deadline),
 	})
 
 	// Record the turn even when it failed: the audit is the only place the
