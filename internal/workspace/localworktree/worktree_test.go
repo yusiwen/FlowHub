@@ -141,14 +141,12 @@ func TestPrepareRejectsUnsafeRequests(t *testing.T) {
 		req  workspace.Request
 		want string
 	}{
-		"no repo":             {workspace.Request{TaskKey: "T-1", DefaultBranch: "main"}, "Repo is required"},
-		"relative repo":       {workspace.Request{Repo: "relative/repo", TaskKey: "T-1", DefaultBranch: "main"}, "must be absolute"},
-		"not a git repo":      {workspace.Request{Repo: t.TempDir(), TaskKey: "T-1", DefaultBranch: "main"}, "not a git work tree"},
-		"no task key":         {workspace.Request{Repo: repo, DefaultBranch: "main"}, "TaskKey is required"},
-		"task key with slash": {workspace.Request{Repo: repo, TaskKey: "a/b", DefaultBranch: "main"}, "not a safe path"},
-		"task key with space": {workspace.Request{Repo: repo, TaskKey: "a b", DefaultBranch: "main"}, "not a safe path"},
-		"no default branch":   {workspace.Request{Repo: repo, TaskKey: "T-1"}, "DefaultBranch is required"},
-		"missing branch":      {workspace.Request{Repo: repo, TaskKey: "T-1", DefaultBranch: "nope"}, "does not exist"},
+		"no repo":           {workspace.Request{TaskKey: "T-1", DefaultBranch: "main"}, "Repo is required"},
+		"relative repo":     {workspace.Request{Repo: "relative/repo", TaskKey: "T-1", DefaultBranch: "main"}, "must be absolute"},
+		"not a git repo":    {workspace.Request{Repo: t.TempDir(), TaskKey: "T-1", DefaultBranch: "main"}, "not a git work tree"},
+		"no task key":       {workspace.Request{Repo: repo, DefaultBranch: "main"}, "TaskKey is required"},
+		"no default branch": {workspace.Request{Repo: repo, TaskKey: "T-1"}, "DefaultBranch is required"},
+		"missing branch":    {workspace.Request{Repo: repo, TaskKey: "T-1", DefaultBranch: "nope"}, "does not exist"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

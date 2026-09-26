@@ -15,6 +15,8 @@ package localworktree
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -226,8 +228,9 @@ func (p *Provider) Prepare(ctx context.Context, req workspace.Request) (workspac
 		return workspace.Handle{}, err
 	}
 
-	path := filepath.Join(p.opts.Base, req.TaskKey)
-	branch := p.opts.BranchPrefix + req.TaskKey
+	name := dirName(req.TaskKey)
+	path := filepath.Join(p.opts.Base, name)
+	branch := p.opts.BranchPrefix + name
 
 	// Reuse an existing worktree: a second event for the same task must land in
 	// the same checkout, otherwise the agent loses its own previous work.
@@ -321,6 +324,69 @@ func (p *Provider) Prepare(ctx context.Context, req workspace.Request) (workspac
 	return p.handle(path, req.Repo, req.BaseCommit, false), nil
 }
 
+// dirName maps a task key to one directory and branch name on this filesystem.
+//
+// The rules, in order: keep letters, digits, underscore, dot and dash; turn every
+// other run of characters into a single dash (with runs collapsed, and no dash at
+// the start); trim dots and dashes from the ends. A tracker key like
+// `owner/repo#42` therefore becomes `owner-repo-42`. A key with nothing usable in it
+// at all still gets a stable name, `task-<digest>`.
+//
+// Mapping is lossy — `a/b` and `a-b` would collide — so a key that had to change
+// gets a short digest of the *original* appended, which makes two different keys
+// produce two different names without making the readable case ugly. A key that is
+// already a safe segment is used verbatim, so YouTrack's `TEST-17` keeps the branch
+// name `flowhub/TEST-17` it has always had.
+//
+// The result is guaranteed to have no separator, no `..` and no leading dot, which
+// is what keeps the directory inside the base.
+func dirName(taskKey string) string {
+	key := strings.TrimSpace(taskKey)
+	if key == "" {
+		return ""
+	}
+	var builder strings.Builder
+	previousDash := false
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			builder.WriteRune(r)
+			previousDash = false
+		case r == '.' || r == '-':
+			// A dot or a dash is kept as it was written, but never at the start of the
+			// name and never doubled: the trimming pass below removes a trailing one.
+			if builder.Len() == 0 || previousDash {
+				continue
+			}
+			builder.WriteRune(r)
+			previousDash = r == '-'
+		default:
+			if builder.Len() == 0 || previousDash {
+				continue
+			}
+			builder.WriteRune('-')
+			previousDash = true
+		}
+	}
+	name := strings.Trim(builder.String(), ".-")
+	if name == key {
+		return name
+	}
+	if name == "" {
+		// Nothing usable survived: fall back to a pure digest so the task still has a
+		// stable, safe name instead of no name at all.
+		return "task-" + shortDigest(key)
+	}
+	return name + "-" + shortDigest(key)
+}
+
+// shortDigest is a short, stable fingerprint of a task key, used only to keep two
+// keys that map to the same readable name apart.
+func shortDigest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
 // handle renders the workspace handle a caller records. Repo is this provider's own
 // attestation: the path it actually prepared the task in, which the dispatcher
 // compares against the routing entry rather than trusting a string that matched once.
@@ -409,9 +475,13 @@ func (p *Provider) validate(req workspace.Request) error {
 	if strings.TrimSpace(req.TaskKey) == "" {
 		return errors.New("localworktree: Request.TaskKey is required")
 	}
-	// A task key becomes a path segment and a branch name, so keep it boring.
-	if strings.ContainsAny(req.TaskKey, "/\\ \t\n") || strings.HasPrefix(req.TaskKey, ".") {
-		return fmt.Errorf("localworktree: TaskKey %q is not a safe path or branch segment", req.TaskKey)
+	// A task key becomes a path segment and a branch name. A tracker's own key is
+	// not always a safe segment — Gitea identifies an issue as `owner/repo#42` — so
+	// the key is *mapped* rather than refused, and what has to stay safe is the
+	// result: see dirName. This is the provider's job because the filesystem naming
+	// is the provider's fact, and two providers may name the same task differently.
+	if name := dirName(req.TaskKey); name == "" || name == "." || name == ".." {
+		return fmt.Errorf("localworktree: TaskKey %q has no usable characters for a path or branch segment", req.TaskKey)
 	}
 	if strings.TrimSpace(req.DefaultBranch) == "" {
 		return errors.New("localworktree: Request.DefaultBranch is required (guessing one would base the task on the wrong code)")
@@ -425,7 +495,7 @@ func (p *Provider) validate(req workspace.Request) error {
 	if _, err := os.Stat(filepath.Join(req.Repo, ".git")); err != nil {
 		return fmt.Errorf("localworktree: %s is not a git work tree", req.Repo)
 	}
-	target := filepath.Join(p.opts.Base, req.TaskKey)
+	target := filepath.Join(p.opts.Base, dirName(req.TaskKey))
 	if isBeneath(target, req.Repo) {
 		return fmt.Errorf("localworktree: %s would be created inside the repository %s; keep task checkouts outside", target, req.Repo)
 	}

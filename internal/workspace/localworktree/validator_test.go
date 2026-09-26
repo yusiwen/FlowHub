@@ -227,3 +227,85 @@ func ExampleValidator() {
 	fmt.Println(problems[0])
 	// Output: TEST: repo.path is not configured, so there is no repository to prepare a task in
 }
+
+// TestDirNameMapsATrackerKeyToASafeName pins the provider-owned mapping the Gitea
+// source needs: a key like `owner/repo#42` is not a usable path or branch segment,
+// so the provider maps it instead of refusing it. Two properties matter — a key that
+// is already safe must be unchanged (YouTrack's `TEST-17` keeps the branch name it
+// always had), and two different keys must never map to one name.
+func TestDirNameMapsATrackerKeyToASafeName(t *testing.T) {
+	cases := map[string]string{
+		"TEST-17":         "TEST-17",
+		"test-17":         "test-17",
+		"owner/repo#42":   "owner-repo-42-" + shortDigest("owner/repo#42"),
+		"a b":             "a-b-" + shortDigest("a b"),
+		"  spaced  ":      "spaced",
+		"a.b":             "a.b",
+		"trailing.":       "trailing-" + shortDigest("trailing."),
+		"../escape":       "escape-" + shortDigest("../escape"),
+		"..":              "task-" + shortDigest(".."),
+		".":               "task-" + shortDigest("."),
+		"///":             "task-" + shortDigest("///"),
+		"":                "",
+		"with--double":    "with-double-" + shortDigest("with--double"),
+		"ends-with-dash-": "ends-with-dash-" + shortDigest("ends-with-dash-"),
+	}
+	for key, want := range cases {
+		if got := dirName(key); got != want {
+			t.Errorf("dirName(%q) = %q, want %q", key, got, want)
+		}
+	}
+
+	// The names must be safe: no separator, no leading dot, no doubled dash.
+	for _, key := range []string{"owner/repo#42", "a/b", "a b", "../x", "a//b", "café/naïve"} {
+		name := dirName(key)
+		if name == "" {
+			continue
+		}
+		if strings.ContainsAny(name, "/\\ \t\n") || strings.HasPrefix(name, ".") || strings.Contains(name, "..") {
+			t.Errorf("dirName(%q) = %q, which is not a safe path segment", key, name)
+		}
+	}
+
+	// Distinctness: keys that collapse to the same readable text keep distinct names,
+	// which is the whole reason the digest is appended.
+	if dirName("a/b") == dirName("a-b") {
+		t.Fatalf("`a/b` and `a-b` both map to %q", dirName("a/b"))
+	}
+	if dirName("owner/repo#42") == dirName("owner-repo-42") {
+		t.Fatalf("the sanitised and the literal spelling collide: %q", dirName("owner/repo#42"))
+	}
+}
+
+// TestPrepareAcceptsATrackerKeyWithASeparator is the end-to-end half: a key the
+// provider has to map still produces a worktree, on a branch whose name is the
+// mapped one.
+func TestPrepareAcceptsATrackerKeyWithASeparator(t *testing.T) {
+	repo := testRepo(t)
+	provider := newProvider(t, filepath.Join(t.TempDir(), "worktrees"))
+
+	const key = "owner/repo#42"
+	handle, err := provider.Prepare(context.Background(), workspace.Request{
+		Repo: repo, TaskKey: key, DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("Prepare with a tracker key: %v", err)
+	}
+	want := DefaultBranchPrefix + dirName(key)
+	if branch := gitIn(t, handle.Path, "rev-parse", "--abbrev-ref", "HEAD"); branch != want {
+		t.Fatalf("branch = %q, want %q", branch, want)
+	}
+	if filepath.Base(handle.Path) != dirName(key) {
+		t.Fatalf("directory = %q, want %q", filepath.Base(handle.Path), dirName(key))
+	}
+	// Idempotent for the same key: a retried delivery must find the same checkout.
+	again, err := provider.Prepare(context.Background(), workspace.Request{
+		Repo: repo, TaskKey: key, DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("second Prepare: %v", err)
+	}
+	if !again.Reused || again.Path != handle.Path {
+		t.Fatalf("second Prepare = %+v, want the same workspace reused", again)
+	}
+}
