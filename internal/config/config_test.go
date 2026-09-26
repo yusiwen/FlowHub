@@ -108,6 +108,48 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	}
 }
 
+// TestOpenCodeCredentialsMustBeSetTogether covers ADR 0001 step 2's new variables:
+// Basic Auth is what lets the dispatcher reach a runtime that is not on loopback, and
+// half a credential pair fails every turn instead of refusing the start.
+func TestOpenCodeCredentialsMustBeSetTogether(t *testing.T) {
+	t.Setenv("FLOWHUB_OPENCODE_USER", "flowhub")
+	if _, err := Load(); err == nil {
+		t.Fatal("a username without a password was accepted")
+	}
+
+	t.Setenv("FLOWHUB_OPENCODE_USER", "")
+	t.Setenv("FLOWHUB_OPENCODE_PASSWORD", "hunter2")
+	if _, err := Load(); err == nil {
+		t.Fatal("a password without a username was accepted")
+	}
+
+	t.Setenv("FLOWHUB_OPENCODE_USER", "flowhub")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OpenCodeUser != "flowhub" || cfg.OpenCodePassword != "hunter2" {
+		t.Fatalf("credentials = %q/%q", cfg.OpenCodeUser, cfg.OpenCodePassword)
+	}
+}
+
+// TestReportMasksTheAgentCredentials: `-print-config` is a document that gets pasted
+// into tickets, so the password may only appear as a fingerprint while the username
+// (which is not a secret) stays readable.
+func TestReportMasksTheAgentCredentials(t *testing.T) {
+	cfg := Config{OpenCodeUser: "flowhub", OpenCodePassword: "hunter2"}
+	report := cfg.Report()
+	if strings.Contains(report, "hunter2") {
+		t.Fatalf("the report leaked the agent password:\n%s", report)
+	}
+	if !strings.Contains(report, "flowhub") {
+		t.Fatalf("the report does not name the authenticated user:\n%s", report)
+	}
+	if !strings.Contains(report, "opencode_auth:") {
+		t.Fatalf("the report says nothing about agent authentication:\n%s", report)
+	}
+}
+
 func TestWarningsNameEveryDisabledLock(t *testing.T) {
 	cfg := Config{
 		Addr:            "0.0.0.0:8080",

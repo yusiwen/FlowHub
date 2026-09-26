@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/yusiwen/flowhub/internal/agent"
 )
 
 // Phase is the lifecycle position of a turn. The same session runs the analysis
@@ -16,14 +18,17 @@ import (
 // This only works because the gated permission is set to "ask" in the ruleset.
 // "allow" bypasses the arbiter entirely and "deny" removes the tool, so both would
 // make a phase decision impossible.
-type Phase string
+//
+// It is an alias for the neutral agent.Phase: which phase a turn is in is a fact
+// about the work, not about this product. The policy that acts on it stays here.
+type Phase = agent.Phase
 
 const (
 	// PhaseAnalysis is read-only: the agent may inspect the issue and the
 	// repository and must post its findings.
-	PhaseAnalysis Phase = "analysis"
+	PhaseAnalysis = agent.PhaseAnalysis
 	// PhaseExecution may modify the task worktree.
-	PhaseExecution Phase = "execution"
+	PhaseExecution = agent.PhaseExecution
 )
 
 // DefaultCurlHosts is the YouTrack host whose signed attachment URLs the agent is

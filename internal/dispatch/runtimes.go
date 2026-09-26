@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yusiwen/flowhub/internal/opencode"
+	"github.com/yusiwen/flowhub/internal/agent"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/runtimes"
@@ -202,25 +202,24 @@ func (d *Dispatcher) allRuntimes() []runtimeBinding {
 				Name:         runtime.Name,
 				AgentProfile: runtime.AgentProfile,
 				URL:          url,
-				Client:       d.clientFor(runtime.Name, url),
+				Runtime:      d.runtimeFor(runtime.Name, url),
 				Models:       runtime.Models,
 			})
 		}
 	}
-	if len(out) == 0 && d.opts.Client != nil {
+	if len(out) == 0 && d.opts.DefaultRuntime != nil {
 		out = append(out, runtimeBinding{
 			Name: DefaultRuntimeName,
 			// The environment-configured runtime has no enrolled profile, so the
 			// process-wide default is the honest answer here.
 			AgentProfile: d.opts.Agent,
-			URL:          d.opts.Client.BaseURL(),
-			Client:       d.opts.Client,
+			Runtime:      d.opts.DefaultRuntime,
 		})
 	}
 	return out
 }
 
-// runtimeBinding is a runtime together with the client that talks to it.
+// runtimeBinding is a runtime together with the adapter that talks to it.
 type runtimeBinding struct {
 	Name string
 	// AgentProfile is the name inside the agent product (e.g. "devops"). It is
@@ -228,7 +227,9 @@ type runtimeBinding struct {
 	// server fall back to its own default agent, which is a looser one.
 	AgentProfile string
 	URL          string
-	Client       *opencode.Client
+	// Runtime is the adapter, injected by the control plane: the dispatcher names
+	// no agent product (ADR 0001).
+	Runtime agent.Runtime
 	// Models is what the runtime reported its agent profiles pin, keyed by profile
 	// name. Empty for the environment-configured runtime, which never enrolled.
 	Models map[string]string
@@ -252,17 +253,26 @@ func (d *Dispatcher) bindingFor(name string) (runtimeBinding, bool) {
 	return runtimeBinding{}, false
 }
 
-// clientFor caches one client per runtime: they are stateless, but a client per
-// call would build a new connection pool every turn.
-func (d *Dispatcher) clientFor(name, url string) *opencode.Client {
+// cachedRuntime is one host's adapter together with the address it was built for.
+// The address is kept so that re-enrolling a name at a new address takes effect
+// without a restart, which is the whole point of the control API applying its
+// mutations to the running process.
+type cachedRuntime struct {
+	URL     string
+	Runtime agent.Runtime
+}
+
+// runtimeFor returns the adapter for one host, building it on first use and
+// rebuilding it when the host's address changes.
+func (d *Dispatcher) runtimeFor(name, url string) agent.Runtime {
 	d.cacheMu.Lock()
 	defer d.cacheMu.Unlock()
-	if client, ok := d.clients[name]; ok && client.BaseURL() == url {
-		return client
+	if cached, ok := d.runtimes[name]; ok && cached.URL == url {
+		return cached.Runtime
 	}
-	client := opencode.New(opencode.Options{BaseURL: url, Timeout: d.opts.Deadline})
-	d.clients[name] = client
-	return client
+	built := d.opts.NewRuntime(name, url)
+	d.runtimes[name] = cachedRuntime{URL: url, Runtime: built}
+	return built
 }
 
 // probe asks a runtime whether it is alive, with a short bound: a candidate that
@@ -270,7 +280,7 @@ func (d *Dispatcher) clientFor(name, url string) *opencode.Client {
 func (d *Dispatcher) probe(ctx context.Context, binding runtimeBinding) error {
 	probeCtx, cancel := context.WithTimeout(ctx, runtimeProbeTimeout)
 	defer cancel()
-	if _, err := binding.Client.Health(probeCtx); err != nil {
+	if _, err := binding.Runtime.Health(probeCtx); err != nil {
 		return err
 	}
 	return nil

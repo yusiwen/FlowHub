@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yusiwen/flowhub/internal/opencode"
+	agentruntime "github.com/yusiwen/flowhub/internal/agent/opencode"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
@@ -37,7 +37,7 @@ type fakeOpencode struct {
 	directory string
 	// messages accumulates one completed assistant message per prompt, which is
 	// what makes a second turn on the same session observable.
-	messages []opencode.Message
+	messages []agentruntime.Message
 
 	// askPermission makes the fake raise one bash permission request before
 	// finishing, to exercise the arbiter path.
@@ -45,11 +45,11 @@ type fakeOpencode struct {
 	// postComment controls whether the turn "posts" its reply.
 	postComment bool
 	// ruleset records what the session was created with.
-	ruleset []opencode.PermissionRule
+	ruleset []agentruntime.PermissionRule
 	// sessionBody and promptBody keep the whole request so an entry's agent and
 	// model override can be asserted.
-	sessionBody opencode.CreateSessionRequest
-	promptBody  opencode.PromptRequest
+	sessionBody agentruntime.CreateSessionRequest
+	promptBody  agentruntime.PromptRequest
 	// silentFinish completes the message with tools only and no text, which is what a
 	// turn that ends without a final message looks like.
 	silentFinish bool
@@ -83,16 +83,16 @@ func (f *fakeOpencode) start() *httptest.Server {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.sessions++
-		var body opencode.CreateSessionRequest
+		var body agentruntime.CreateSessionRequest
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.ruleset = body.Permission
 		f.sessionBody = body
-		writeJSON(w, opencode.Session{ID: "ses_fake", Directory: f.directory})
+		writeJSON(w, agentruntime.Session{ID: "ses_fake", Directory: f.directory})
 	})
 	handler.HandleFunc("/session/ses_fake/prompt_async", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		var body opencode.PromptRequest
+		var body agentruntime.PromptRequest
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.promptBody = body
 		if len(body.Parts) > 0 {
@@ -101,22 +101,22 @@ func (f *fakeOpencode) start() *httptest.Server {
 		if len(f.prompts) > 1 {
 			f.continued++
 		}
-		parts := []opencode.Part{}
+		parts := []agentruntime.Part{}
 		if f.askPermission {
-			parts = append(parts, opencode.Part{
+			parts = append(parts, agentruntime.Part{
 				Type: "tool", Tool: "bash",
-				State: &opencode.ToolState{Status: "completed", Output: "ok"},
+				State: &agentruntime.ToolState{Status: "completed", Output: "ok"},
 			})
 		}
 		if f.postComment {
-			parts = append(parts, opencode.Part{
+			parts = append(parts, agentruntime.Part{
 				Type: "tool", Tool: "youtrack_add_issue_comment",
-				State: &opencode.ToolState{Status: "completed"},
+				State: &agentruntime.ToolState{Status: "completed"},
 			})
 			f.toolCalls = append(f.toolCalls, "youtrack_add_issue_comment")
 		}
 		if !f.silentFinish {
-			parts = append(parts, opencode.Part{Type: "text", Text: "analysis done"})
+			parts = append(parts, agentruntime.Part{Type: "text", Text: "analysis done"})
 		}
 		if f.hold != nil {
 			// Block here, with the prompt recorded and no assistant message yet, so the
@@ -129,11 +129,11 @@ func (f *fakeOpencode) start() *httptest.Server {
 		}
 		id := len(f.messages)
 		f.messages = append(f.messages,
-			opencode.Message{Info: opencode.MessageInfo{ID: "u", Role: "user", Time: opencode.MessageTime{Created: int64(id)}}},
-			opencode.Message{Info: opencode.MessageInfo{
+			agentruntime.Message{Info: agentruntime.MessageInfo{ID: "u", Role: "user", Time: agentruntime.MessageTime{Created: int64(id)}}},
+			agentruntime.Message{Info: agentruntime.MessageInfo{
 				ID: "a", Role: "assistant", Finish: "stop", Cost: 0.004,
-				Tokens: opencode.Tokens{Input: 100, Output: 20},
-				Time:   opencode.MessageTime{Created: int64(id), Completed: int64(id) + 1},
+				Tokens: agentruntime.Tokens{Input: 100, Output: 20},
+				Time:   agentruntime.MessageTime{Created: int64(id), Completed: int64(id) + 1},
 			}, Parts: parts})
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -143,12 +143,12 @@ func (f *fakeOpencode) start() *httptest.Server {
 		writeJSON(w, f.messages)
 	})
 	handler.HandleFunc("/session/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]opencode.Status{"ses_fake": {Type: "idle"}})
+		writeJSON(w, map[string]agentruntime.Status{"ses_fake": {Type: "idle"}})
 	})
 	handler.HandleFunc("/permission", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		writeJSON(w, []opencode.PermissionRequest{})
+		writeJSON(w, []agentruntime.PermissionRequest{})
 	})
 	return httptest.NewServer(handler)
 }
@@ -221,13 +221,15 @@ func newTestDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.Server
 
 	fake.directory = repo
 	dispatcher, err := New(Options{
-		Client:   opencode.New(opencode.Options{BaseURL: server.URL, Timeout: 5 * time.Second}),
-		Source:   youtrack.New(rules.Policy{}),
-		Registry: reg,
-		Projects: projects,
-		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Agent:    "flowhub-default-agent",
-		Deadline: 5 * time.Second,
+		NewRuntime:     runtimeFactory(5 * time.Second),
+		DefaultRuntime: newTestRuntime(DefaultRuntimeName, server.URL, 5*time.Second),
+		NewWorkspace:   testWorkspaces,
+		Source:         youtrack.New(rules.Policy{}),
+		Registry:       reg,
+		Projects:       projects,
+		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agent:          "flowhub-default-agent",
+		Deadline:       5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -422,9 +424,11 @@ func TestPauseFileStopsDispatchWithoutRestarting(t *testing.T) {
 		t.Fatal(err)
 	}
 	dispatcher, err := New(Options{
-		Client:   opencode.New(opencode.Options{BaseURL: server.URL}),
-		Source:   youtrack.New(rules.Policy{}),
-		Registry: reg, Projects: projects,
+		NewRuntime:     runtimeFactory(time.Second),
+		DefaultRuntime: newTestRuntime(DefaultRuntimeName, server.URL, time.Second),
+		NewWorkspace:   testWorkspaces,
+		Source:         youtrack.New(rules.Policy{}),
+		Registry:       reg, Projects: projects,
 		PauseFile: pause,
 	})
 	if err != nil {
@@ -569,41 +573,6 @@ func TestNoActorNeverPassesAnAuthorAllowlist(t *testing.T) {
 	}
 }
 
-func TestProblemsReportsEntriesThatCannotBeDispatched(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.json")
-	body := `{"projects":[` +
-		`{"youtrack_key":"A","repo":{"path":"/tmp/a"}},` +
-		`{"youtrack_key":"B","repo":{"path":"/tmp/b","default_branch":"main"},"worktrees":"/tmp/wt"},` +
-		`{"youtrack_key":"C","repo":{"path":"/tmp/c"},"enabled":false}` +
-		`]}`
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	projects, err := projectmap.Load(path)
-	if err != nil {
-		t.Fatalf("projectmap.Load: %v", err)
-	}
-
-	problems := Problems(projects, "")
-	if len(problems) != 2 {
-		t.Fatalf("problems = %v, want the missing branch and the missing worktrees directory", problems)
-	}
-	if !strings.Contains(problems[0], "A") || !strings.Contains(problems[0], "default_branch") {
-		t.Fatalf("first problem = %q", problems[0])
-	}
-	if !strings.Contains(problems[1], "worktrees directory") {
-		t.Fatalf("second problem = %q", problems[1])
-	}
-
-	// A fallback base makes the entry above dispatchable again.
-	if got := Problems(projects, "/tmp/fallback"); len(got) != 1 {
-		t.Fatalf("problems with a fallback base = %v, want only the missing branch", got)
-	}
-	if got := Problems(nil, ""); got != nil {
-		t.Fatalf("Problems(nil) = %v, want nil", got)
-	}
-}
-
 // TestTaskRecordsThePinnedBaseline covers ADR 0001 step 5's registry contract: the
 // commit a task starts from is resolved once, at creation, and recorded next to the
 // task so a later turn — and a human reading the registry — can see where it began.
@@ -713,14 +682,16 @@ func newScheduledDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.S
 	}
 	fake.directory = repo
 	dispatcher, err := New(Options{
-		Client:   opencode.New(opencode.Options{BaseURL: server.URL, Timeout: 5 * time.Second}),
-		Source:   youtrack.New(rules.Policy{}),
-		Runtimes: testInventory(t, server.URL, "builder-a", "builder-b"),
-		Registry: reg,
-		Projects: projects,
-		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Agent:    "devops",
-		Deadline: 5 * time.Second,
+		NewRuntime:     runtimeFactory(5 * time.Second),
+		DefaultRuntime: newTestRuntime(DefaultRuntimeName, server.URL, 5*time.Second),
+		NewWorkspace:   testWorkspaces,
+		Source:         youtrack.New(rules.Policy{}),
+		Runtimes:       testInventory(t, server.URL, "builder-a", "builder-b"),
+		Registry:       reg,
+		Projects:       projects,
+		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agent:          "devops",
+		Deadline:       5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

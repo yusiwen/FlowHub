@@ -12,13 +12,37 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yusiwen/flowhub/internal/opencode"
+	"github.com/yusiwen/flowhub/internal/agent"
+	agentruntime "github.com/yusiwen/flowhub/internal/agent/opencode"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
 	"github.com/yusiwen/flowhub/internal/runtimes"
 	"github.com/yusiwen/flowhub/internal/source/youtrack"
+	"github.com/yusiwen/flowhub/internal/workspace"
+	"github.com/yusiwen/flowhub/internal/workspace/localworktree"
 )
+
+// newTestRuntime builds the real runtime adapter for one host, the way `main` wires
+// it. These tests deliberately drive the real adapter against a fake server rather
+// than a stub runtime: the seam is only proven by driving it.
+func newTestRuntime(name, url string, timeout time.Duration) agent.Runtime {
+	return agentruntime.NewRuntime(
+		agentruntime.New(agentruntime.Options{BaseURL: url, Timeout: timeout}),
+		agentruntime.RuntimeOptions{Name: name},
+	)
+}
+
+// runtimeFactory returns the runtime constructor a dispatcher option needs.
+func runtimeFactory(timeout time.Duration) func(name, url string) agent.Runtime {
+	return func(name, url string) agent.Runtime { return newTestRuntime(name, url, timeout) }
+}
+
+// testWorkspaces is the workspace constructor a dispatcher option needs: the
+// co-located provider, which is what a single-host deployment uses.
+func testWorkspaces(base string) (workspace.Workspace, error) {
+	return localworktree.New(localworktree.Options{Base: base})
+}
 
 // TestRuntimeAgentNeverUsesTheProductName is a regression test for a live run:
 // the enrolled runtime reported agent "opencode" (the product), which was passed
@@ -149,16 +173,18 @@ func testProjects(t *testing.T, extra string) *projectmap.Map {
 func testDispatcherFor(t *testing.T, inventory *runtimes.Inventory, projects *projectmap.Map, reg *registry.Registry) *Dispatcher {
 	t.Helper()
 	dispatcher, err := New(Options{
-		// A client is required by New even when every runtime is enrolled: it is the
-		// fallback address for a host that was never enrolled. Nothing here calls it.
-		Client:   opencode.New(opencode.Options{BaseURL: "http://127.0.0.1:1"}),
-		Source:   youtrack.New(rules.Policy{}),
-		Runtimes: inventory,
-		Registry: reg,
-		Projects: projects,
-		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Agent:    "devops",
-		Deadline: time.Minute,
+		// A default runtime is required by New even when every runtime is enrolled: it
+		// is the fallback for a host that was never enrolled. Nothing here calls it.
+		NewRuntime:     runtimeFactory(time.Second),
+		DefaultRuntime: newTestRuntime(DefaultRuntimeName, "http://127.0.0.1:1", time.Second),
+		NewWorkspace:   testWorkspaces,
+		Source:         youtrack.New(rules.Policy{}),
+		Runtimes:       inventory,
+		Registry:       reg,
+		Projects:       projects,
+		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agent:          "devops",
+		Deadline:       time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

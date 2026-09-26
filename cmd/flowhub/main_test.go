@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -198,5 +199,64 @@ func TestProberNeedsOnlyLivenessWhenNoProfileIsClaimed(t *testing.T) {
 		Name: "builder-a", Advertise: server.URL, Agent: "opencode",
 	}); err != nil {
 		t.Fatalf("a host with no claimed profile was refused: %v", err)
+	}
+}
+
+// TestAgentCallsCarryTheConfiguredCredentials covers the wiring ADR 0001 step 2
+// adds: `FLOWHUB_OPENCODE_USER`/`PASSWORD` have to reach *both* client builders —
+// the runtime factory the dispatcher uses for every turn, and the activation prober
+// that decides whether a host may take work. If only one of them sent the
+// credentials, a remote runtime would enrol and then fail every turn.
+func TestAgentCallsCarryTheConfiguredCredentials(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, password, ok := r.BasicAuth()
+		if ok {
+			seen = append(seen, user+":"+password)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/global/health":
+			_, _ = w.Write([]byte(`{"healthy":true,"version":"1.18.31"}`))
+		case "/agent":
+			_, _ = w.Write([]byte(`[{"name":"devops","mode":"primary"}]`))
+		case "/provider":
+			_, _ = w.Write([]byte(`{"all":[{"id":"deepseek","models":{"deepseek-flash":{}}}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.Config{
+		OpenCodeURL:      server.URL,
+		OpenCodeUser:     "flowhub",
+		OpenCodePassword: "hunter2",
+		TaskDeadline:     time.Minute,
+	}
+
+	// The runtime the dispatcher builds for each host.
+	runtime := newRuntimeFactory(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))("builder-a", server.URL)
+	if _, err := runtime.Health(context.Background()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+
+	// The prober that decides whether the host can take work at all, with a claimed
+	// profile and model so it reads the agent registry and the model catalogue too:
+	// every path to a remote server has to carry the credentials.
+	if err := (opencodeProber{cfg: cfg, timeout: 2 * time.Second}).Probe(context.Background(), runtimes.Claim{
+		Name: "builder-a", Advertise: server.URL, AgentProfile: "devops",
+		Models: map[string]string{"devops": "deepseek/deepseek-flash"},
+	}); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+
+	if len(seen) < 4 {
+		t.Fatalf("only %d request(s) carried credentials, want every path to send them", len(seen))
+	}
+	for _, credentials := range seen {
+		if credentials != "flowhub:hunter2" {
+			t.Fatalf("credentials = %q, want flowhub:hunter2", credentials)
+		}
 	}
 }

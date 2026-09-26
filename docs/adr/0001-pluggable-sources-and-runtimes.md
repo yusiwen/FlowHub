@@ -1,23 +1,23 @@
 # ADR 0001 — Pluggable event sources and agent runtimes
 
 **Status:** Proposed, **partly implemented ahead of the plan** (2026-09-26).
-Migration **step 1 landed** (the source seam), then most of step 5, because step 5
-does not depend on steps 1–4: the
+Migration **steps 1 and 2 landed** (the source seam, then the runtime and workspace
+seams), then most of step 5, because step 5 does not depend on steps 1–4: the
 projects file accepts `runtime`, `runtimes` and `runtime_policy` (per project, with
 a table-wide default of `spread`), the dispatcher ranks the eligible runtimes by the
 rules below and logs the numbers it chose by, startup validates the declared names
 against the inventory, `/healthz` reports the in-flight counters, and the baseline
-is pinned — `worktree.Manager.Resolve` asks the **origin** for the commit, `Prepare`
-produces exactly it (fetching it when a stale clone has never seen it, and refusing
-to attach to a same-named branch that is not its descendant), and
+is pinned — `localworktree.Provider.Resolve` asks the **origin** for the commit,
+`Prepare` produces exactly it (fetching it when a stale clone has never seen it, and
+refusing to attach to a same-named branch that is not its descendant), and
 `registry.Task.BaseCommit` records it once and never re-resolves it. **One queue and
 one worker per runtime** landed as well: an intake loop decides which runtime takes a
 delivery and hands it to that runtime's own queue, so different runtimes run turns in
-parallel while one runtime still runs them one at a time. Steps 2–4 are open, so
-the v2 configuration format, the `agent`/`workspace` seams and the `remote`
-provider do not exist yet — the addressing and the baseline were added to the
-*current* worktree manager and projects file, and move behind the `Workspace` seam
-when step 2 lands. One measured consequence of the local provider: a repository with
+parallel while one runtime still runs them one at a time. Steps 3–4 are open, so
+the v2 configuration format and a second source do not exist yet — the addressing and
+the baseline now live behind the `Workspace` seam, where the `remote` provider
+(step 6) will answer the same interface. One measured consequence of the local
+provider: a repository with
 no `origin` remote has no shared truth to pin, so `Resolve` answers from the local
 ref and **says so** (a warning on every task that creates its worktree), because the
 guarantee this section describes only exists once there is an origin.
@@ -42,8 +42,51 @@ assertion was dropped, and the raw timestamp spelling the refactor could have
 silently re-rendered is now pinned by a new receiver test. The refactor was also
 verified live: a real TEST-30 delivery produced one analysis turn and its reply,
 and an echo of that reply was recognised as FlowHub's own and not dispatched.
-**Revision:** 8 — recorded step 1 as landed, with what it moved and the two
-deviations (tests moved rather than left in place; the dispatcher's second policy
+
+Step 2 is in the tree as well, which is what makes the topology claim real:
+`internal/agent` holds the runtime seam (`Runtime{Name, Health, Run}`, the neutral
+`Turn`/`Result`/`ToolCall`/`PermissionDecision`/`Tokens`, `Phase`, the attachment
+`Downloads` policy, and the `provider/model-id` spelling the configuration also
+validates against); `internal/agent/opencode` is the opencode implementation of it,
+with `runtime.go` as the thin adapter and the session ruleset and shell policy moved
+in from `dispatch`; `internal/workspace` holds the workspace seam
+(`Entry`/`Request`/`Handle`/`Base`, `Workspace{Resolve, Prepare, Check, Remove}`, and
+`Validator`/`ValidateEntries`); `internal/workspace/localworktree` is the co-located
+provider, and the filesystem checks that used to live in `projectmap` now live in its
+`Validator`. `internal/dispatch` imports the seams and neither implementation —
+`go list -deps ./internal/dispatch/` shows no `internal/agent/opencode` and no
+`internal/workspace/localworktree` edge — because `main` injects a runtime factory, a
+default runtime and a workspace factory. `FLOWHUB_OPENCODE_USER`/`PASSWORD` are wired
+into both client builders (the runtime factory and the activation prober), which is
+what makes a runtime that is not on loopback usable at all.
+
+Four deviations from the sketch, all deliberate:
+
+* **`Turn` carries the source's tool allowlist, not a ruleset.** The sketch had
+  `Ruleset []PermissionRule`; a `PermissionRule` is opencode's spelling, so passing
+  one would have kept a product type in the dispatcher. The runtime builds the
+  ruleset from `Turn.AllowedTools` and the phase, which is also what makes "which
+  permissions a session starts with" genuinely the runtime's.
+* **`Resolve` is on the interface.** The sketch lists only `Prepare`/`Check`/`Remove`,
+  but step 5's pinned baseline landed before this seam existed and the baseline is a
+  workspace fact — the origin may not even be reachable from the control plane. The
+  `Handle` in the sketch already carries `BaseCommit`, so this closes the loop rather
+  than adding a new idea.
+* **Entry validation stays a startup gate.** The filesystem checks moved behind the
+  provider as `Validator` instead of disappearing: invariant 7 ("routing never guesses
+  a repository") must keep refusing at startup, before any file exists. Two refusal
+  *messages* changed wording (they now name the provider's own vocabulary) while the
+  set of refusals is unchanged.
+* **Two places still name the product on purpose.** `main` wires it; and
+  `internal/provision` plus this binary's activation prober install and verify
+  opencode's own files and read its agent registry and model catalogue. A
+  runtime-neutral capability check would need a speculative interface for those two
+  endpoints, so step 2 leaves them product-specific and says so.
+
+**Revision:** 9 — recorded step 2 as landed: the `agent` and `workspace` seams, the
+`localworktree` provider owning the local checks, the credentials wiring, and the four
+deviations above. Revision 8 — recorded step 1 as landed, with what it moved and the
+two deviations (tests moved rather than left in place; the dispatcher's second policy
 field removed rather than kept in step). Revision 7 — made the baseline an input:
 resolve the base ref to a commit
 through the origin once per task, pin it, require every host to produce exactly
@@ -287,10 +330,12 @@ Decisions inside this section:
 
 ```go
 type Turn struct {
-    Directory, Prompt, Agent, Model, SessionID string
-    Ruleset []PermissionRule
-    Metadata map[string]any
-    Deadline time.Duration
+    Directory, Prompt, Agent, Model, Title, SessionID string
+    Phase        Phase      // analysis | execution
+    AllowedTools []string   // the source's allowlist; the runtime builds its own ruleset
+    Downloads    Downloads  // the source's attachment policy, enforced by the runtime
+    Metadata     map[string]any
+    Deadline     time.Duration
 }
 
 type Result struct {
@@ -306,7 +351,7 @@ type Result struct {
 
 type Runtime interface {
     Name() string
-    Health(ctx context.Context) (Version string, err error)
+    Health(ctx context.Context) (version string, err error)
     Run(ctx context.Context, turn Turn) (Result, error)
 }
 ```
@@ -314,7 +359,10 @@ type Runtime interface {
 `opencode.Runner` already matches this shape; the adapter is a thin wrapper.
 `sessionRuleset()` moves out of `dispatch` into the runtime, because "which
 permissions the session starts with" is a runtime property, while "which tools a
-source needs" is the source's.
+source needs" is the source's. As implemented, `Phase` and `Downloads` travel on the
+`Turn` and the ruleset is *not* one of its fields: a ruleset is this product's
+spelling, and building it in the dispatcher would have kept a product type in the
+core.
 
 ### Deployment topology: FlowHub is a control plane
 
@@ -324,10 +372,10 @@ assume otherwise, and all four are about the *workspace*, not about the protocol
 
 | Assumption today | Where | Whose fact it really is |
 | --- | --- | --- |
-| `repo.path` exists, is a git work tree, and its `origin` matches `repo.remote` | `internal/projectmap/validate.go` | the runtime host |
-| the worktrees base exists and sits outside the repository | `internal/projectmap/validate.go`, `dispatch.Problems` | the runtime host |
-| `git worktree add` runs as a child process | `internal/worktree/worktree.go` | the runtime host |
-| the registry stores a *local* absolute path as the task's directory | `internal/registry` | the runtime host |
+| `repo.path` exists, is a git work tree, and its `origin` matches `repo.remote` | was `internal/projectmap/validate.go`; now `localworktree.Validator` | the runtime host |
+| the worktrees base exists and sits outside the repository | was `internal/projectmap/validate.go` + `dispatch.Problems`; now `localworktree.Validator` | the runtime host |
+| `git worktree add` runs as a child process | `internal/workspace/localworktree` | the runtime host |
+| the registry stores a *local* absolute path as the task's directory | `internal/registry` (the path is already treated as opaque) | the runtime host |
 
 Everything else is already transport-safe, which is why this is a seam and not a
 rewrite: `?directory=` is an opaque HTTP query parameter that FlowHub never reads
@@ -340,13 +388,25 @@ gap to close before the link leaves loopback.
 ```go
 package workspace
 
-// Request describes the workspace a task needs, in terms the provider can act on
-// without knowing anything about events or prompts.
+// Entry is the part of a routing entry a provider can verify before anything is
+// created. Plain data: the configuration layer builds it, so the seam never learns
+// a configuration format.
+type Entry struct {
+    Label         string
+    Repo          string // local path, or the remote URL for a provider that clones
+    Remote        string // the repository identity the entry declares
+    DefaultBranch string
+    Base          string // checkout root, the process-wide fallback already applied
+}
+
+// Request describes the workspace one task needs.
 type Request struct {
-    TaskKey string // stable, human readable: "TEST-17"
-    Remote  string // the repository identity, e.g. git@host:owner/repo.git
-    BaseRef string // the branch to start from
-    Base    string // provider specific root, from configuration
+    TaskKey       string // stable, human readable: "TEST-17"
+    Repo          string
+    Remote        string
+    DefaultBranch string
+    BaseRef       string // the branch to start from
+    BaseCommit    string // pinned by Resolve; every host must produce exactly this
 }
 
 // Handle is what FlowHub keeps in the registry and hands to the runtime. Path is
@@ -357,22 +417,39 @@ type Handle struct {
     Path       string // as the runtime spells it
     Repo       string // the provider's attestation of which repository it used
     BaseCommit string // pinned at creation; every host must produce exactly this
+    Reused     bool
 }
 
 type Workspace interface {
     Name() string
+    // Resolve reports the commit BaseRef points at as the shared origin sees it, so
+    // that every host pins the same baseline. Step 5 landed before this seam existed
+    // and the baseline is a workspace fact — the origin may not even be reachable
+    // from the control plane — so it belongs here.
+    Resolve(ctx context.Context, req Request) (Base, error)
     Prepare(ctx context.Context, req Request) (Handle, error)
     // Check reports drift: the workspace is gone, or it no longer belongs to the
     // repository the task was created against.
     Check(ctx context.Context, h Handle) error
     Remove(ctx context.Context, h Handle) error
 }
+
+// Validator is what a provider implements when it can check an entry before any
+// provider instance exists — startup refuses a bad entry before a directory is
+// created, so the check cannot depend on a constructed base.
+type Validator interface {
+    Validate(entry Entry) []string
+}
+
+func ValidateEntries(v Validator, entries []Entry) []string
 ```
 
 * `localworktree` is today's `internal/worktree`, renamed and behind the
   interface. It keeps the `git worktree` strategy, because on a host with a
   persistent clone that is still the cheapest isolation: one object store, one
-  directory and branch per task, milliseconds to create.
+  directory and branch per task, milliseconds to create. It is also the `Validator`
+  that owns the checks `projectmap` used to run — the repository exists, is a git
+  work tree, has the declared origin, and the checkout root sits outside it.
 * `remote` is a later provider. It does **not** mean FlowHub holds SSH keys to the
   runtime host: that would make FlowHub a remote executor, which this design
   avoids. It means the runtime side runs a small helper that FlowHub calls over
@@ -823,10 +900,13 @@ drops v1 support — after this host's file has been migrated.
 ### What `dispatch` looks like afterwards
 
 It keeps: the queue, the pause file, the routing lookup, the cost and turn
-budgets, the worktree hand-off, the registry update and the audit log. It loses:
+budgets, the workspace hand-off, the registry update and the audit log. It loses:
 `webhook.Parse`, `describe`, `AllowedMCPTools`, the reply-tool name, the session
-ruleset and every `opencode.*` type. Its inputs become `(*store.Record,
-*event.Event, source.Source, agent.Runtime)`.
+ruleset and every `opencode.*` type — all of which is now true, in the sense that
+matters: `go list -deps ./internal/dispatch/` reaches `internal/agent` and
+`internal/workspace` and neither implementation. Its inputs are `(*store.Record,
+*event.Event, source.Source, agent.Runtime)` plus the injected workspace provider,
+with `main` as the only place that names a product.
 
 ### Consequences
 
@@ -865,7 +945,7 @@ staticcheck test test-race smoke` green. Behaviour must not change before step 3
 | --- | --- | --- |
 | 0 | This ADR | reviewed and accepted |
 | 1 | Add `internal/event` and `internal/source`; move `webhook.Parse`, `describe`, `AllowedMCPTools`, the reply check and `rules.Prompt` behind a `youtrack` adapter; `dispatch` consumes only the IR. The config file is **not** touched in this step. **Landed:** `internal/event` (the IR), `internal/source` (`Request`, `Decoded`, `Source`, `ToolPolicy`), `internal/source/youtrack` (payload model, schema report, tool allowlist, prompt, state normalisation); `internal/webhook` and `internal/dispatch` no longer name a vendor, and `dispatch` takes its policy from `Source.Policy()` rather than a second field | Existing tests unchanged and green; `make smoke` unchanged; `dispatch` no longer imports `webhook`. **Measured:** `gofmt -l` clean, `go vet` clean, `staticcheck` clean, `go test ./...` and `go test -race ./...` all 15 packages ok, `make smoke` PASSED; `go list -deps ./internal/dispatch/` has no `internal/webhook` edge. The twelve rule/prompt test functions were moved to `internal/source/youtrack` (no assertion dropped) and four dispatch constructors gained a `Source` argument; a new receiver test pins the raw timestamp spelling the refactor could have re-rendered. **Live:** one real `issueCreated` delivery for TEST-30 was accepted in 0.8 ms, chose `builder-tmp` under `spread`, ran one analysis turn (`replied=true`, 16.4 s, 4 permission requests), and the reply landed on the issue with the sign-off `> This comment was generated automatically by opencode, from the creation of this issue.` — the sentence `Policy.Basis` derives from the neutral event. A second delivery echoing that reply without the marker was audited and **not** dispatched (`reason="our own comment (repeats our previous reply)"`), so loop prevention survived the move |
-| 2 | Add `internal/agent` and `internal/workspace`; make `opencode` the runtime and today's `worktree` package the `localworktree` provider, with its local-filesystem checks moved behind it; `dispatch` imports neither vendor; wire `FLOWHUB_OPENCODE_USER`/`PASSWORD` | `go list -deps` shows both cuts; the live path is re-verified with one real webhook turn |
+| 2 | Add `internal/agent` and `internal/workspace`; make `opencode` the runtime and today's `worktree` package the `localworktree` provider, with its local-filesystem checks moved behind it; `dispatch` imports neither vendor; wire `FLOWHUB_OPENCODE_USER`/`PASSWORD`. **Landed:** `internal/agent` (`Runtime`, `Turn`/`Result`/`Phase`/`Downloads`, the model spelling), `internal/agent/opencode` (`git mv` of `internal/opencode` plus `runtime.go`, which owns the session ruleset and the phase policy), `internal/workspace` (`Workspace`, `Entry`/`Request`/`Handle`/`Base`, `Validator`), `internal/workspace/localworktree` (`git mv` of `internal/worktree`, now also the `Validator` that owns the filesystem checks `projectmap` used to run); `dispatch` takes injected runtime and workspace factories; both client builders send the configured Basic Auth | `go list -deps` shows both cuts; the live path is re-verified with one real webhook turn. **Measured:** `go list -deps ./internal/dispatch/` has no `internal/agent/opencode` and no `internal/workspace/localworktree` edge while listing `internal/agent` and `internal/workspace`; the implementations are imported only by `cmd/flowhub` (and by `internal/provision` for the product's own host tooling); `gofmt`/`go vet`/`staticcheck` clean, all 15 packages green under `go test` and `go test -race`, `make smoke` PASSED. Live after the refactor: a real `issueCreated` delivery for TEST-31 was accepted in 1 ms, chose `builder-b` under `spread`, resolved its baseline through the provider (`source=local` — the origin-less scratch repository, said out loud), prepared the worktree through `localworktree`, ran one analysis turn (`replied=true`, 14.3 s, 2 permissions answered by the adapter's own arbiter) and posted the reply with the same sign-off; the registry row carries the provider's attested worktree path and the pinned commit |
 | 3 | Config format v2 as specified above: `sources`, `runtime`, `(source, project)` entries, per-level policy precedence, and the v1 translation branch | A v1 file and an equivalent v2 file produce the same routing and the same effective policy; `-print-config` names the level each value came from; a v2 file with `youtrack_key` is refused with the replacement named in the error |
 | 4 | Gitea adapter as the acceptance test for the source seam (HMAC-SHA256 `X-Hub-Signature-256`, issue and PR text) | A real Gitea webhook drives one analysis turn; the core packages show no diff beyond registration |
 | 5 | Addressed runtimes **and a pinned baseline**: `runtimes.<name>`, `projects[].runtime`/`runtimes` + `runtime_policy`, `Workspace.Resolve`, `Request.BaseCommit`, `registry.Task.{Runtime,BaseCommit}`, one queue and worker per runtime, per-runtime startup probing, set validation. **Landed: the addressing and its policy, the deterministic ranking and its log line, set validation, the per-runtime counters and queues, the pinned baseline (resolved through the origin, fetched on demand, descendant-checked, recorded), and one intake loop plus one queue and worker per runtime. `max_concurrent` stays 1 pending per-task locking** | Two runtimes configured: with `spread`, two consecutive tasks land on different hosts and the log says why; **both report the same `base_commit`** even when one clone is deliberately stale; with `first-healthy`, both land on the first; stopping one host makes the next task use the other and leaves bound tasks refused with that reason; an existing `flowhub/<key>` branch that is not a descendant of `base_commit` is refused |

@@ -96,9 +96,12 @@ internal/source/    the source seam: Request, Decoded, Source, ToolPolicy (data 
 internal/source/youtrack/ the YouTrack adapter: payload model, schema report, neutral-event decoding, tools, prompt
 internal/webhook/   The delivery pipeline: entry locks, body limits, source decode, replay window, idempotency, audit, redaction
 internal/projectmap/ YouTrack project -> repository routing table (~/.config/flowhub/config.json)
-internal/opencode/  opencode client, permission arbiter, one-turn runner (make test-live)
+internal/agent/       the runtime seam: Runtime, Turn/Result, Phase, Downloads, model references
+internal/agent/opencode/  the opencode implementation: client, arbiter, session ruleset, one-turn runner
+internal/workspace/   the workspace seam: Workspace, Handle, Base, Validator
+internal/workspace/localworktree/  one git worktree per task, baseline pinned through the origin
 internal/rules/     trigger policy over the neutral event (ignore/analyze/plan/execute) and the reply basis
-internal/dispatch/  the worker: queue, routing, worktree, session, arbiter, registry
+internal/dispatch/  the worker: intake loop, one queue+worker per runtime, routing, workspace hand-off, session, registry, audit
 internal/provision/ data-plane host prep: `flowhub runtime init [--check]`, `doctor --push`, `uninstall` (capability report, embedded artifacts, manifest, runtime identity, heartbeat)
 internal/runtimes/  control plane: runtime inventory, states, invites, secrets (hashes only), `/control/v1` admin API and the `invite`/`list`/`show`/`remove`/`rotate` CLI
 internal/dedupe/    TTL idempotency cache
@@ -106,6 +109,13 @@ internal/store/     Audit record, non-blocking queue, JSONL audit, payload log
 internal/metrics/   Counters behind /healthz
 scripts/smoke.sh    End-to-end check driven by `make smoke`
 ```
+
+The dispatcher imports `internal/agent` and `internal/workspace` but neither
+implementation: `go list -deps ./internal/dispatch/` shows no
+`internal/agent/opencode` and no `internal/workspace/localworktree` edge. Which
+runtime and which provider exist is `main`'s decision, and `internal/dispatch`'s own
+tests wire the real adapter against a fake server, which is what proves the seam
+(ADR 0001 step 2).
 
 ## The delivery pipeline
 
@@ -166,7 +176,7 @@ documents. The rules below are load-bearing; do not relax them casually.
    has no `default_branch` or no `worktrees` directory and no
    `FLOWHUB_WORKTREE_BASE` fallback, because such an entry can only fail one
    issue at a time.
-8. **An unattended turn needs two permission layers.** `internal/opencode` passes
+8. **An unattended turn needs two permission layers.** `internal/agent/opencode` passes
    a session ruleset at session creation — a short allowlist over a catch-all
    `ask`, which must come **first** because the ruleset is an array evaluated
    last-match-wins — and then answers the `ask` requests with the arbiter. `edit`
@@ -190,7 +200,7 @@ documents. The rules below are load-bearing; do not relax them casually.
    request the server keeps listing must not stop a finished turn from completing.
 9. **One task, one worktree, one session.** `internal/registry` is the
    append-only record of that binding (`<DataDir>/registry.jsonl`) and
-   `internal/worktree` creates the checkout. The base commit is **pinned through
+   `internal/workspace/localworktree` creates the checkout. The base commit is **pinned through
    the origin** once per task and recorded (`base_commit`), never re-resolved: two
    hosts whose clones were fetched at different times must start a project's tasks
    from the same commit. `Prepare` produces exactly that commit (fetching it only
@@ -242,6 +252,19 @@ documents. The rules below are load-bearing; do not relax them casually.
     (default `<DataDir>/DISPATCH_OFF`) is checked before every delivery: while it
     exists, deliveries are audited and ignored. A kill switch that needs an API, a
     credential or a restart is not a kill switch.
+14. **The core names no vendor, and each seam owns its own policy.** Three seams
+    (ADR 0001): a source decodes an event and owns its trigger phrase, prompt, tool
+    allowlist and download policy; a workspace provider produces and owns the task's
+    directory, its baseline and the checks that depend on *its* filesystem; a
+    runtime drives one turn and owns its session ruleset and shell policy.
+    `internal/dispatch` imports the seam packages and never an implementation — do
+    not add an `internal/agent/opencode` or `internal/workspace/localworktree`
+    import to it, and do not move a policy into the dispatcher that belongs to one
+    of them. The direction is what keeps a source unable to widen the shell policy
+    and a runtime unable to decide where a task's code comes from. Two places name
+    a product on purpose, because their job is that product's own host: `main`'s
+    wiring, and `internal/provision` plus the activation prober, which install and
+    verify opencode's files and read its agent registry and model catalogue.
 
 ## Code Conventions
 

@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/yusiwen/flowhub/internal/agent"
 )
 
 // Runner drives one unattended task: create the session, deliver the prompt,
@@ -492,29 +494,14 @@ func textOf(message Message) string {
 	return builder.String()
 }
 
-// SplitModel splits the "provider/model-id" spelling opencode uses for a model
-// reference. It is exported so the routing-table validation can reject a typo at
-// startup instead of at the first turn.
-func SplitModel(model string) (provider, id string, ok bool) {
-	model = strings.TrimSpace(model)
-	if model == "" {
-		return "", "", false
-	}
-	// Cut on the first slash: a model id may itself contain one
-	// (for example "accounts/fireworks/models/llama"), a provider id may not.
-	provider, id, found := strings.Cut(model, "/")
-	provider, id = strings.TrimSpace(provider), strings.TrimSpace(id)
-	if !found || provider == "" || id == "" {
-		return "", "", false
-	}
-	return provider, id, true
-}
-
+// validateModel refuses a model reference this runtime could not honour. The
+// "provider/model-id" spelling is the neutral one (agent.SplitModel); the message
+// stays in this package because this is where the refusal surfaces.
 func validateModel(model string) error {
 	if strings.TrimSpace(model) == "" {
 		return nil
 	}
-	if _, _, ok := SplitModel(model); !ok {
+	if _, _, ok := agent.SplitModel(model); !ok {
 		return fmt.Errorf("opencode: model %q must be spelled provider/model-id", model)
 	}
 	return nil
@@ -523,7 +510,7 @@ func validateModel(model string) error {
 // sessionModel renders the model for session creation, which uses the lowercase
 // {providerID, id} spelling. A nil result leaves the agent's own default alone.
 func sessionModel(model string) *SessionModel {
-	provider, id, ok := SplitModel(model)
+	provider, id, ok := agent.SplitModel(model)
 	if !ok {
 		return nil
 	}
@@ -532,7 +519,7 @@ func sessionModel(model string) *SessionModel {
 
 // promptModel renders the model for a prompt, which uses {providerID, modelID}.
 func promptModel(model string) *ModelRef {
-	provider, id, ok := SplitModel(model)
+	provider, id, ok := agent.SplitModel(model)
 	if !ok {
 		return nil
 	}

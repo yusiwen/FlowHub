@@ -1,4 +1,4 @@
-package worktree
+package localworktree
 
 import (
 	"context"
@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yusiwen/flowhub/internal/workspace"
 )
 
 // testRepo builds a real, hermetic git repository. The global and system git
@@ -44,20 +46,20 @@ func testRepo(t *testing.T) string {
 	return repo
 }
 
-func newManager(t *testing.T, base string) *Manager {
+func newProvider(t *testing.T, base string) *Provider {
 	t.Helper()
-	manager, err := New(Options{Base: base})
+	provider, err := New(Options{Base: base})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return manager
+	return provider
 }
 
 func TestPrepareCreatesAWorktreeOnItsOwnBranchAndIgnoresScratch(t *testing.T) {
 	repo := testRepo(t)
-	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
+	provider := newProvider(t, filepath.Join(t.TempDir(), "worktrees"))
 
-	wt, err := manager.Prepare(context.Background(), Request{
+	wt, err := provider.Prepare(context.Background(), workspace.Request{
 		Repo: repo, TaskKey: "TEST-1", DefaultBranch: "main",
 	})
 	if err != nil {
@@ -66,8 +68,20 @@ func TestPrepareCreatesAWorktreeOnItsOwnBranchAndIgnoresScratch(t *testing.T) {
 	if wt.Reused {
 		t.Fatal("first Prepare should create, not reuse")
 	}
-	if wt.Branch != "flowhub/TEST-1" {
-		t.Fatalf("branch = %q", wt.Branch)
+	// The branch is the task's own; asserting it from inside the checkout is what
+	// makes the claim about git state rather than about the provider's own report.
+	if branch := gitIn(t, wt.Path, "rev-parse", "--abbrev-ref", "HEAD"); branch != DefaultBranchPrefix+"TEST-1" {
+		t.Fatalf("worktree HEAD is on %q, want %q", branch, DefaultBranchPrefix+"TEST-1")
+	}
+	// The handle carries the provider's attestation. The path is canonical on
+	// purpose — the runtime keys sessions by the literal string — so compare it
+	// with the resolved repo, not with the string the test built.
+	canonicalRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wt.Provider != Name || wt.Repo != canonicalRepo {
+		t.Fatalf("handle = %+v, want provider %q and repo %q", wt, Name, canonicalRepo)
 	}
 	if _, err := os.Stat(filepath.Join(wt.Path, "README.md")); err != nil {
 		t.Fatalf("worktree does not contain the repository content: %v", err)
@@ -91,14 +105,14 @@ func TestPrepareCreatesAWorktreeOnItsOwnBranchAndIgnoresScratch(t *testing.T) {
 
 func TestPrepareIsIdempotentForTheSameTask(t *testing.T) {
 	repo := testRepo(t)
-	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
-	req := Request{Repo: repo, TaskKey: "TEST-2", DefaultBranch: "main"}
+	provider := newProvider(t, filepath.Join(t.TempDir(), "worktrees"))
+	req := workspace.Request{Repo: repo, TaskKey: "TEST-2", DefaultBranch: "main"}
 
-	first, err := manager.Prepare(context.Background(), req)
+	first, err := provider.Prepare(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	second, err := manager.Prepare(context.Background(), req)
+	second, err := provider.Prepare(context.Background(), req)
 	if err != nil {
 		t.Fatalf("second Prepare: %v", err)
 	}
@@ -109,7 +123,7 @@ func TestPrepareIsIdempotentForTheSameTask(t *testing.T) {
 		t.Fatalf("paths differ: %q vs %q", first.Path, second.Path)
 	}
 
-	paths, err := manager.List(context.Background(), repo)
+	paths, err := provider.List(context.Background(), repo)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -121,24 +135,24 @@ func TestPrepareIsIdempotentForTheSameTask(t *testing.T) {
 func TestPrepareRejectsUnsafeRequests(t *testing.T) {
 	repo := testRepo(t)
 	base := filepath.Join(t.TempDir(), "worktrees")
-	manager := newManager(t, base)
+	provider := newProvider(t, base)
 
 	cases := map[string]struct {
-		req  Request
+		req  workspace.Request
 		want string
 	}{
-		"no repo":             {Request{TaskKey: "T-1", DefaultBranch: "main"}, "Repo is required"},
-		"relative repo":       {Request{Repo: "relative/repo", TaskKey: "T-1", DefaultBranch: "main"}, "must be absolute"},
-		"not a git repo":      {Request{Repo: t.TempDir(), TaskKey: "T-1", DefaultBranch: "main"}, "not a git work tree"},
-		"no task key":         {Request{Repo: repo, DefaultBranch: "main"}, "TaskKey is required"},
-		"task key with slash": {Request{Repo: repo, TaskKey: "a/b", DefaultBranch: "main"}, "not a safe path"},
-		"task key with space": {Request{Repo: repo, TaskKey: "a b", DefaultBranch: "main"}, "not a safe path"},
-		"no default branch":   {Request{Repo: repo, TaskKey: "T-1"}, "DefaultBranch is required"},
-		"missing branch":      {Request{Repo: repo, TaskKey: "T-1", DefaultBranch: "nope"}, "does not exist"},
+		"no repo":             {workspace.Request{TaskKey: "T-1", DefaultBranch: "main"}, "Repo is required"},
+		"relative repo":       {workspace.Request{Repo: "relative/repo", TaskKey: "T-1", DefaultBranch: "main"}, "must be absolute"},
+		"not a git repo":      {workspace.Request{Repo: t.TempDir(), TaskKey: "T-1", DefaultBranch: "main"}, "not a git work tree"},
+		"no task key":         {workspace.Request{Repo: repo, DefaultBranch: "main"}, "TaskKey is required"},
+		"task key with slash": {workspace.Request{Repo: repo, TaskKey: "a/b", DefaultBranch: "main"}, "not a safe path"},
+		"task key with space": {workspace.Request{Repo: repo, TaskKey: "a b", DefaultBranch: "main"}, "not a safe path"},
+		"no default branch":   {workspace.Request{Repo: repo, TaskKey: "T-1"}, "DefaultBranch is required"},
+		"missing branch":      {workspace.Request{Repo: repo, TaskKey: "T-1", DefaultBranch: "nope"}, "does not exist"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := manager.Prepare(context.Background(), tc.req)
+			_, err := provider.Prepare(context.Background(), tc.req)
 			if err == nil {
 				t.Fatalf("Prepare succeeded, want an error containing %q", tc.want)
 			}
@@ -151,8 +165,8 @@ func TestPrepareRejectsUnsafeRequests(t *testing.T) {
 
 func TestBaseInsideTheRepositoryIsRejected(t *testing.T) {
 	repo := testRepo(t)
-	manager := newManager(t, filepath.Join(repo, "worktrees"))
-	_, err := manager.Prepare(context.Background(), Request{Repo: repo, TaskKey: "T-1", DefaultBranch: "main"})
+	provider := newProvider(t, filepath.Join(repo, "worktrees"))
+	_, err := provider.Prepare(context.Background(), workspace.Request{Repo: repo, TaskKey: "T-1", DefaultBranch: "main"})
 	if err == nil {
 		t.Fatal("a worktree base inside the repository must be refused")
 	}
@@ -163,26 +177,26 @@ func TestBaseInsideTheRepositoryIsRejected(t *testing.T) {
 
 func TestRemoveDropsTheWorktreeAndKeepsTheBranch(t *testing.T) {
 	repo := testRepo(t)
-	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
-	wt, err := manager.Prepare(context.Background(), Request{Repo: repo, TaskKey: "TEST-3", DefaultBranch: "main"})
+	provider := newProvider(t, filepath.Join(t.TempDir(), "worktrees"))
+	wt, err := provider.Prepare(context.Background(), workspace.Request{Repo: repo, TaskKey: "TEST-3", DefaultBranch: "main"})
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
-	if err := manager.Remove(context.Background(), repo, wt); err != nil {
+	if err := provider.Remove(context.Background(), wt); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 	if _, err := os.Stat(wt.Path); !os.IsNotExist(err) {
 		t.Fatalf("worktree path still exists: %v", err)
 	}
 	// The branch is where the agent's work lives, so it must survive.
-	branch := runGitForTest(t, repo, "rev-parse", "--verify", "refs/heads/"+wt.Branch)
+	branch := runGitForTest(t, repo, "rev-parse", "--verify", "refs/heads/"+DefaultBranchPrefix+"TEST-3")
 	if strings.TrimSpace(branch) == "" {
 		t.Fatal("the task branch was deleted with the worktree")
 	}
 
 	// Removing twice is a no-op, not an error.
-	if err := manager.Remove(context.Background(), repo, wt); err != nil {
+	if err := provider.Remove(context.Background(), wt); err != nil {
 		t.Fatalf("second Remove: %v", err)
 	}
 }
@@ -209,10 +223,10 @@ func runGitForTest(t *testing.T, dir string, args ...string) string {
 // bookkeeping is not proof that the checkout is still there.
 func TestPrepareRecreatesAWorktreeWhoseDirectoryVanished(t *testing.T) {
 	repo := testRepo(t)
-	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
-	request := Request{Repo: repo, TaskKey: "TEST-9", DefaultBranch: "main"}
+	provider := newProvider(t, filepath.Join(t.TempDir(), "worktrees"))
+	request := workspace.Request{Repo: repo, TaskKey: "TEST-9", DefaultBranch: "main"}
 
-	first, err := manager.Prepare(context.Background(), request)
+	first, err := provider.Prepare(context.Background(), request)
 	if err != nil {
 		t.Fatalf("first Prepare: %v", err)
 	}
@@ -220,7 +234,7 @@ func TestPrepareRecreatesAWorktreeWhoseDirectoryVanished(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Git still lists it, which is exactly the stale state.
-	listed, err := manager.List(context.Background(), repo)
+	listed, err := provider.List(context.Background(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +248,7 @@ func TestPrepareRecreatesAWorktreeWhoseDirectoryVanished(t *testing.T) {
 		t.Skip("git already pruned the missing worktree; nothing to regress")
 	}
 
-	second, err := manager.Prepare(context.Background(), request)
+	second, err := provider.Prepare(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Prepare after the directory vanished: %v", err)
 	}
@@ -257,14 +271,14 @@ func TestPrepareRecreatesAWorktreeWhoseDirectoryVanished(t *testing.T) {
 func TestPrepareClearsALeftoverDirectoryWithoutLosingFiles(t *testing.T) {
 	repo := testRepo(t)
 	base := filepath.Join(t.TempDir(), "worktrees")
-	manager := newManager(t, base)
+	provider := newProvider(t, base)
 
 	// Only FlowHub's own scratch: removed and recreated.
 	scratchOnly := filepath.Join(base, "TEST-7")
 	if err := os.MkdirAll(filepath.Join(scratchOnly, ScratchDir), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := manager.Prepare(context.Background(), Request{Repo: repo, TaskKey: "TEST-7", DefaultBranch: "main"})
+	prepared, err := provider.Prepare(context.Background(), workspace.Request{Repo: repo, TaskKey: "TEST-7", DefaultBranch: "main"})
 	if err != nil {
 		t.Fatalf("Prepare over our own scratch: %v", err)
 	}
@@ -281,7 +295,7 @@ func TestPrepareClearsALeftoverDirectoryWithoutLosingFiles(t *testing.T) {
 	if err := os.WriteFile(precious, []byte("do not lose me\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err = manager.Prepare(context.Background(), Request{Repo: repo, TaskKey: "TEST-8", DefaultBranch: "main"})
+	prepared, err = provider.Prepare(context.Background(), workspace.Request{Repo: repo, TaskKey: "TEST-8", DefaultBranch: "main"})
 	if err != nil {
 		t.Fatalf("Prepare over an occupied directory: %v", err)
 	}
@@ -375,10 +389,10 @@ func TestResolveAnswersFromTheOriginNotFromTheClone(t *testing.T) {
 	origin, fresh, stale := originWithTwoClones(t)
 	want := gitIn(t, origin, "rev-parse", "refs/heads/main")
 
-	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
+	provider := newProvider(t, filepath.Join(t.TempDir(), "worktrees"))
 	for _, clone := range []struct{ name, dir string }{{"fresh", fresh}, {"stale", stale}} {
 		t.Run(clone.name, func(t *testing.T) {
-			base, err := manager.Resolve(context.Background(), clone.dir, "main")
+			base, err := provider.Resolve(context.Background(), workspace.Request{Repo: clone.dir, BaseRef: "main"})
 			if err != nil {
 				t.Fatalf("Resolve: %v", err)
 			}
@@ -402,16 +416,16 @@ func TestResolveAnswersFromTheOriginNotFromTheClone(t *testing.T) {
 // shared truth, and Source says so instead of pretending the answer is pinned.
 func TestResolveIsHonestAboutARepositoryWithNoOrigin(t *testing.T) {
 	repo := testRepo(t)
-	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
+	provider := newProvider(t, filepath.Join(t.TempDir(), "worktrees"))
 
-	base, err := manager.Resolve(context.Background(), repo, "main")
+	base, err := provider.Resolve(context.Background(), workspace.Request{Repo: repo, BaseRef: "main"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if base.Source != "local" || base.Commit != gitIn(t, repo, "rev-parse", "HEAD") {
 		t.Fatalf("base = %+v, want the local HEAD with source=local", base)
 	}
-	if _, err := manager.Resolve(context.Background(), repo, "no-such-branch"); err == nil {
+	if _, err := provider.Resolve(context.Background(), workspace.Request{Repo: repo, BaseRef: "no-such-branch"}); err == nil {
 		t.Fatal("a branch that does not exist was resolved")
 	}
 }
@@ -427,12 +441,12 @@ func TestPrepareProducesThePinnedCommitEvenFromAStaleClone(t *testing.T) {
 		t.Fatal("precondition: the stale clone should not have the pinned commit yet")
 	}
 
-	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
-	base, err := manager.Resolve(context.Background(), stale, "main")
+	provider := newProvider(t, filepath.Join(t.TempDir(), "worktrees"))
+	base, err := provider.Resolve(context.Background(), workspace.Request{Repo: stale, BaseRef: "main"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	wt, err := manager.Prepare(context.Background(), Request{
+	wt, err := provider.Prepare(context.Background(), workspace.Request{
 		Repo: stale, TaskKey: "TEST-1", DefaultBranch: "main", BaseCommit: base.Commit,
 	})
 	if err != nil {
@@ -448,8 +462,8 @@ func TestPrepareProducesThePinnedCommitEvenFromAStaleClone(t *testing.T) {
 // on top of, because the agent's work would land on code the task never chose.
 func TestPrepareRefusesToAttachToABranchThatIsNotADescendant(t *testing.T) {
 	_, _, stale := originWithTwoClones(t)
-	manager := newManager(t, filepath.Join(t.TempDir(), "worktrees"))
-	base, err := manager.Resolve(context.Background(), stale, "main")
+	provider := newProvider(t, filepath.Join(t.TempDir(), "worktrees"))
+	base, err := provider.Resolve(context.Background(), workspace.Request{Repo: stale, BaseRef: "main"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -470,7 +484,7 @@ func TestPrepareRefusesToAttachToABranchThatIsNotADescendant(t *testing.T) {
 	gitIn(t, stale, "branch", "-f", DefaultBranchPrefix+"TEST-2", stray)
 	gitIn(t, stale, "checkout", "-q", "main")
 
-	_, err = manager.Prepare(context.Background(), Request{
+	_, err = provider.Prepare(context.Background(), workspace.Request{
 		Repo: stale, TaskKey: "TEST-2", DefaultBranch: "main", BaseCommit: base.Commit,
 	})
 	if err == nil {
@@ -483,7 +497,7 @@ func TestPrepareRefusesToAttachToABranchThatIsNotADescendant(t *testing.T) {
 	// The same branch, descended from the pin, is attached to rather than refused.
 	gitIn(t, stale, "checkout", "-q", "-B", DefaultBranchPrefix+"TEST-3", base.Commit)
 	gitIn(t, stale, "checkout", "-q", "main")
-	wt, err := manager.Prepare(context.Background(), Request{
+	wt, err := provider.Prepare(context.Background(), workspace.Request{
 		Repo: stale, TaskKey: "TEST-3", DefaultBranch: "main", BaseCommit: base.Commit,
 	})
 	if err != nil {

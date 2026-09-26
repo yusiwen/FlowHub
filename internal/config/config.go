@@ -167,10 +167,20 @@ type Config struct {
 	// can run (and be audited) without an agent that edits repositories.
 	Dispatch bool
 
-	// OpenCodeURL is the base URL of the headless opencode server. It is
-	// expected to be a loopback address: opencode 1.x has no authentication, so
-	// the only safe boundary is the machine itself.
+	// OpenCodeURL is the base URL of the headless opencode server. It is expected
+	// to be a loopback address unless credentials are configured: opencode turns on
+	// HTTP Basic Auth only when OPENCODE_SERVER_PASSWORD is set on the server, so
+	// without them the only safe boundary is the machine itself.
 	OpenCodeURL string
+
+	// OpenCodeUser and OpenCodePassword enable HTTP Basic Auth for every call to an
+	// agent server, which is what makes a runtime usable across a network instead of
+	// only over loopback. The password never reaches the audit log or `-print-config`
+	// (Report masks it), and the pair is set together or not at all: a username with
+	// no password is how a half-configured deployment looks, and it would fail every
+	// turn instead of refusing the start.
+	OpenCodeUser     string
+	OpenCodePassword string
 
 	// DispatchAgent is the opencode agent used when a routing entry does not
 	// name one. Which agent runs matters for the permission model, so it is
@@ -292,6 +302,8 @@ func Load() (Config, error) {
 	cfg.AdminToken = os.Getenv("FLOWHUB_ADMIN_TOKEN")
 	cfg.RuntimesFile = env("FLOWHUB_RUNTIMES_FILE", "")
 	cfg.OpenCodeURL = env("FLOWHUB_OPENCODE_URL", DefaultOpenCodeURL)
+	cfg.OpenCodeUser = os.Getenv("FLOWHUB_OPENCODE_USER")
+	cfg.OpenCodePassword = os.Getenv("FLOWHUB_OPENCODE_PASSWORD")
 	cfg.DispatchAgent = env("FLOWHUB_DISPATCH_AGENT", DefaultDispatchAgent)
 	cfg.Trigger = env("FLOWHUB_TRIGGER", DefaultTrigger)
 	cfg.StartStates = splitList(env("FLOWHUB_START_STATES", DefaultStartState))
@@ -454,6 +466,11 @@ func (c Config) validate() error {
 	}
 	if url.Host == "" {
 		return fmt.Errorf("FLOWHUB_OPENCODE_URL %q: missing host", c.OpenCodeURL)
+	}
+	if (c.OpenCodeUser == "") != (c.OpenCodePassword == "") {
+		// Set together or not at all: half a credential pair fails every turn, and
+		// it fails late. Refusing the start is the cheap place to catch it.
+		return fmt.Errorf("FLOWHUB_OPENCODE_USER and FLOWHUB_OPENCODE_PASSWORD must be set together (one of them is empty)")
 	}
 	return nil
 }
@@ -687,6 +704,7 @@ func (c Config) Report() string {
 	fmt.Fprintf(&b, "shutdown_timeout:   %s\n", c.ShutdownTimeout)
 	fmt.Fprintf(&b, "dispatch:           %t\n", c.Dispatch)
 	fmt.Fprintf(&b, "opencode_url:       %s\n", c.OpenCodeURL)
+	fmt.Fprintf(&b, "opencode_auth:      %s\n", authReport(c))
 	fmt.Fprintf(&b, "dispatch_agent:     %s\n", c.DispatchAgent)
 	fmt.Fprintf(&b, "dispatch_queue:     %d\n", c.DispatchQueueSize)
 	fmt.Fprintf(&b, "task_deadline:      %s\n", c.TaskDeadline)
@@ -729,6 +747,15 @@ func controlAPIReport(c Config) string {
 		return "disabled (set FLOWHUB_ADMIN_ADDR to manage runtimes)"
 	}
 	return fmt.Sprintf("%s (admin_token %s)", c.AdminAddr, MaskSecret(c.AdminToken))
+}
+
+// authReport says whether the agent servers are called with credentials, without
+// ever printing the password: the report is a document that gets pasted around.
+func authReport(c Config) string {
+	if c.OpenCodeUser == "" {
+		return "none (loopback only: set FLOWHUB_OPENCODE_USER and FLOWHUB_OPENCODE_PASSWORD to reach a remote runtime)"
+	}
+	return fmt.Sprintf("basic auth as %s (password %s)", c.OpenCodeUser, MaskSecret(c.OpenCodePassword))
 }
 
 // formatCost renders the cost budget so that "disabled" is visible instead of

@@ -1,9 +1,16 @@
-// Package dispatch turns an accepted webhook delivery into an opencode turn.
+// Package dispatch turns an accepted event into one unattended agent turn.
 //
-// It is the only place that joins the three halves of FlowHub: the routing table
-// (which repository), the task registry (which session) and the opencode runner
-// (which turn). Everything here runs on a worker goroutine, never on the webhook
-// request path, because the publisher of the webhook waits for our 202.
+// It is the only place that joins the four halves of FlowHub: the routing table
+// (which repository), the task registry (which session), the workspace provider
+// (which directory) and the runtime (which turn). Everything here runs on a worker
+// goroutine, never on the webhook request path, because the publisher of the webhook
+// waits for our 202.
+//
+// It names no tracker and no agent product (ADR 0001): the event source, the runtime
+// and the workspace provider are all injected, and each one owns the policy that is
+// really its own — the source the trigger phrase and the tool allowlist, the runtime
+// the session ruleset and the shell policy, the provider the baseline and the
+// checkout.
 package dispatch
 
 import (
@@ -17,37 +24,48 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yusiwen/flowhub/internal/agent"
 	"github.com/yusiwen/flowhub/internal/event"
-	"github.com/yusiwen/flowhub/internal/opencode"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
 	"github.com/yusiwen/flowhub/internal/runtimes"
 	"github.com/yusiwen/flowhub/internal/source"
 	"github.com/yusiwen/flowhub/internal/store"
-	"github.com/yusiwen/flowhub/internal/worktree"
+	"github.com/yusiwen/flowhub/internal/workspace"
 )
 
 // Options configures a Dispatcher.
 type Options struct {
-	Client   *opencode.Client
 	Registry *registry.Registry
 	Projects *projectmap.Map
 	Log      *slog.Logger
 	// Runtimes is the enrolled runtime inventory. When it is nil or empty the
-	// dispatcher falls back to Client, which is the environment-configured runtime
-	// named "default".
+	// dispatcher falls back to DefaultRuntime, which is the environment-configured
+	// one named "default".
 	Runtimes *runtimes.Inventory
-	// WorktreeBase is the fallback directory for task worktrees, used when a
-	// routing entry does not declare its own. Entries normally declare one,
-	// because the base has to be outside the repository it belongs to.
+	// NewRuntime builds the runtime adapter for one host from its name and address.
+	// It is injected because the dispatcher learns a runtime's address at routing
+	// time (the inventory is mutable while the process runs) and must not name a
+	// product to build one.
+	NewRuntime func(name, url string) agent.Runtime
+	// DefaultRuntime is the runtime configured purely through the environment,
+	// used when the inventory names none. Nil means "only enrolled runtimes".
+	DefaultRuntime agent.Runtime
+	// NewWorkspace builds the workspace provider for one checkout base directory.
+	// Injected for the same reason as NewRuntime: which provider produces a task's
+	// directory is a deployment decision, not a routing one.
+	NewWorkspace func(base string) (workspace.Workspace, error)
+	// WorktreeBase is the fallback directory for task checkouts, used when a routing
+	// entry does not declare its own. Entries normally declare one, because the base
+	// has to be outside the repository it belongs to.
 	WorktreeBase string
-	// Agent is the opencode agent name; empty uses the server default.
+	// Agent is the runtime's agent profile name; empty uses the runtime default.
 	Agent string
 	// Deadline bounds one turn.
 	Deadline time.Duration
 	// FirstResponse bounds how long a turn may take to produce its first assistant
-	// message before it is failed. Zero leaves the runner's own default.
+	// message before it is failed. Zero leaves the runtime's own default.
 	FirstResponse time.Duration
 	// Source decodes deliveries and supplies this tracker's policy, prompt and tool
 	// allowlist. Required: the dispatcher names no vendor (ADR 0001).
@@ -71,12 +89,13 @@ type Dispatcher struct {
 	// delivery and every prompt is judged by the same rules.
 	policy rules.Policy
 
-	// managers caches one worktree manager per base directory, and clients one
-	// opencode client per runtime. One worker per runtime touches them, so they are
-	// guarded rather than worker-local.
+	// spaces caches one workspace provider per checkout base directory, and runtimes
+	// one runtime adapter per host name — rebuilt when that host's address changes,
+	// because an operator may re-enrol it while this process runs. One worker per
+	// runtime touches them, so they are guarded rather than worker-local.
 	cacheMu  sync.Mutex
-	managers map[string]*worktree.Manager
-	clients  map[string]*opencode.Client
+	spaces   map[string]workspace.Workspace
+	runtimes map[string]cachedRuntime
 
 	// prepMu guards prepLocks, which serializes workspace preparation per repository:
 	// `git worktree add` is not safe to run twice at once in one clone, and two
@@ -108,9 +127,6 @@ type Dispatcher struct {
 
 // New builds a dispatcher. It does not start working until Run is called.
 func New(opts Options) (*Dispatcher, error) {
-	if opts.Client == nil {
-		return nil, errors.New("dispatch: an opencode client is required")
-	}
 	if opts.Registry == nil {
 		return nil, errors.New("dispatch: a registry is required")
 	}
@@ -121,6 +137,12 @@ func New(opts Options) (*Dispatcher, error) {
 	if opts.Source == nil {
 		return nil, errors.New("dispatch: an event source is required")
 	}
+	if opts.NewWorkspace == nil {
+		return nil, errors.New("dispatch: a workspace provider factory is required")
+	}
+	if opts.NewRuntime == nil {
+		return nil, errors.New("dispatch: a runtime factory is required")
+	}
 	if opts.Log == nil {
 		opts.Log = slog.Default()
 	}
@@ -129,9 +151,6 @@ func New(opts Options) (*Dispatcher, error) {
 	}
 	if opts.Deadline <= 0 {
 		opts.Deadline = 10 * time.Minute
-	}
-	if opts.AttachmentsDir == "" {
-		opts.AttachmentsDir = opencode.DefaultAttachmentPathPrefix
 	}
 	ruleset := opts.Source.Policy().Defaults()
 	if strings.TrimSpace(ruleset.Trigger) == "" {
@@ -146,8 +165,8 @@ func New(opts Options) (*Dispatcher, error) {
 		policy:    ruleset,
 		log:       opts.Log,
 		prepLocks: map[string]*sync.Mutex{},
-		managers:  map[string]*worktree.Manager{},
-		clients:   map[string]*opencode.Client{},
+		spaces:    map[string]workspace.Workspace{},
+		runtimes:  map[string]cachedRuntime{},
 		inFlight:  map[string]int{},
 		queue:     make(chan *store.Record, opts.QueueSize),
 		queues:    map[string]chan routed{},
@@ -604,22 +623,29 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 	if base == "" {
 		return registry.Task{}, fmt.Errorf("project %s declares no worktrees directory and no fallback is configured", entry.YouTrackKey)
 	}
-	manager, err := d.managerFor(base)
+	spaces, err := d.workspaceFor(base)
 	if err != nil {
 		return registry.Task{}, err
+	}
+	req := workspace.Request{
+		TaskKey:       rec.IssueID,
+		Repo:          entry.Repo.Path,
+		Remote:        entry.Repo.Remote,
+		DefaultBranch: entry.Repo.DefaultBranch,
+		BaseRef:       entry.Repo.DefaultBranch,
+		BaseCommit:    strings.TrimSpace(task.BaseCommit),
 	}
 
 	// The baseline is resolved once, when the task is created, and never again: a
 	// long-running task's patches stay reviewable against a fixed commit even if the
-	// origin moves. Resolving it through the origin is what makes two hosts with
+	// origin moves. Resolving it through the provider is what makes two hosts with
 	// clones fetched at different times agree on where the task starts.
-	baseCommit := strings.TrimSpace(task.BaseCommit)
-	if baseCommit == "" {
-		resolved, err := manager.Resolve(ctx, entry.Repo.Path, entry.Repo.DefaultBranch)
+	if req.BaseCommit == "" {
+		resolved, err := spaces.Resolve(ctx, req)
 		if err != nil {
 			return registry.Task{}, err
 		}
-		baseCommit = resolved.Commit
+		req.BaseCommit = resolved.Commit
 		d.log.Info("task baseline resolved",
 			"issue", rec.IssueID, "commit", shortCommit(resolved.Commit), "ref", resolved.Ref,
 			"source", resolved.Source, "repo", entry.Repo.Path)
@@ -633,12 +659,7 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 
 	lock := d.prepareLock(entry.Repo.Path)
 	lock.Lock()
-	prepared, err := manager.Prepare(ctx, worktree.Request{
-		Repo:          entry.Repo.Path,
-		TaskKey:       rec.IssueID,
-		DefaultBranch: entry.Repo.DefaultBranch,
-		BaseCommit:    baseCommit,
-	})
+	prepared, err := spaces.Prepare(ctx, req)
 	lock.Unlock()
 	if err != nil {
 		return registry.Task{}, err
@@ -647,7 +668,7 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 		t.Worktree = prepared.Path
 		t.Repo = prepared.Repo
 		if t.BaseCommit == "" {
-			t.BaseCommit = baseCommit
+			t.BaseCommit = req.BaseCommit
 		}
 	})
 }
@@ -685,46 +706,21 @@ func authorAllowed(allowed []string, actor string) bool {
 	return false
 }
 
-// Problems lists routing entries that cannot be dispatched to. It is checked at
-// startup because a misconfiguration should stop the process, not fail one issue
-// at a time after the operator believes the hub is running.
-func Problems(projects *projectmap.Map, fallbackWorktreeBase string) []string {
-	if projects == nil {
-		return nil
-	}
-	var problems []string
-	for _, entry := range projects.Entries() {
-		if !entry.IsEnabled() {
-			// A disabled entry is never matched and is not validated, so it may
-			// legitimately point at a checkout this host does not have.
-			continue
-		}
-		label := entry.YouTrackKey
-		if entry.Repo.DefaultBranch == "" {
-			problems = append(problems, fmt.Sprintf("%s: repo.default_branch is empty, so no task worktree can be based on it", label))
-		}
-		if strings.TrimSpace(entry.Worktrees) == "" && strings.TrimSpace(fallbackWorktreeBase) == "" {
-			problems = append(problems, fmt.Sprintf("%s: neither the entry's worktrees directory nor FLOWHUB_WORKTREE_BASE is set, so a task worktree has nowhere to live", label))
-		}
-	}
-	return problems
-}
-
-// managerFor returns the worktree manager for a base directory, creating it on
-// first use. The base comes from the routing entry, because it has to sit outside
-// the repository that entry points at.
-func (d *Dispatcher) managerFor(base string) (*worktree.Manager, error) {
+// workspaceFor returns the workspace provider for a checkout base directory,
+// creating it on first use. The base comes from the routing entry, because it has to
+// sit outside the repository that entry points at.
+func (d *Dispatcher) workspaceFor(base string) (workspace.Workspace, error) {
 	d.cacheMu.Lock()
 	defer d.cacheMu.Unlock()
-	if manager, ok := d.managers[base]; ok {
-		return manager, nil
+	if provider, ok := d.spaces[base]; ok {
+		return provider, nil
 	}
-	manager, err := worktree.New(worktree.Options{Base: base})
+	provider, err := d.opts.NewWorkspace(base)
 	if err != nil {
 		return nil, err
 	}
-	d.managers[base] = manager
-	return manager, nil
+	d.spaces[base] = provider
+	return provider, nil
 }
 
 // prepareLock returns the mutex that serializes workspace preparation for one
@@ -744,14 +740,22 @@ func (d *Dispatcher) prepareLock(repo string) *sync.Mutex {
 
 // runTurn delivers one prompt and records what came back.
 func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery event.Event, task registry.Task, match projectmap.Match, decision rules.Decision, binding runtimeBinding) {
-	phase := opencode.PhaseAnalysis
+	phase := agent.PhaseAnalysis
 	if decision.Action == rules.ActionExecute {
-		phase = opencode.PhaseExecution
+		phase = agent.PhaseExecution
 	}
 
+	// The tool policy is data owned by the source: which tools may run unattended,
+	// which call counts as the reply, and where a download may land. How any of that
+	// becomes a permission request is the runtime's business, and the shell policy
+	// stays inside the runtime, because a source must not be able to widen it.
+	tools := d.opts.Source.Tools()
+
 	prompt := d.opts.Source.Prompt(decision.Action, &delivery, rules.PromptContext{
-		Worktree:       task.Worktree,
-		AttachmentsDir: d.opts.AttachmentsDir,
+		Worktree: task.Worktree,
+		// The prompt and the arbiter read one value: telling the agent to write
+		// somewhere the runtime would reject is worse than saying nothing.
+		AttachmentsDir: tools.Download.Prefix,
 		Repository:     match.Entry.Repo.Path,
 		Author:         rec.PrimaryActor,
 		// The sign-off states what the agent was reacting to; it comes from the
@@ -763,28 +767,10 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		return
 	}
 
-	// The tool policy is data owned by the source: which tools may run unattended,
-	// which call counts as the reply, and where a download may land. Shell policy
-	// stays here, because a source must not be able to widen it.
-	tools := d.opts.Source.Tools()
-
-	arbiter := opencode.NewAnalysisArbiter()
-	if phase == opencode.PhaseExecution {
-		arbiter = opencode.NewExecutionArbiter()
-	}
-	arbiter.AllowTools = toolSet(tools.Allowed)
-	arbiter.CurlHosts = append([]string(nil), tools.Download.Hosts...)
-	arbiter.CurlOutputPrefix = tools.Download.Prefix
-
-	// The ruleset is the first permission layer and its ORDER is load bearing:
-	// the session ruleset is an array evaluated last-match-wins, so the catch-all
-	// has to come first and the specific entries after it.
-	ruleset := sessionRuleset(tools.Allowed)
-
 	// The routing entry owns the agent when it names one: which agent runs is a
 	// permission decision (that agent's own rules and tools), so it belongs next
 	// to the repository, not only in the environment.
-	agent := runtimeAgent(match.Entry, binding, d.opts.Agent)
+	agentName := runtimeAgent(match.Entry, binding, d.opts.Agent)
 
 	// The model is pinned for the same reason the agent is. The enrolment check
 	// verified the model the installed profile pins, but the agent server resolves
@@ -794,23 +780,26 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	// That happened on 2026-09-25. The routing entry still wins when it names one.
 	model := strings.TrimSpace(match.Entry.Model)
 	if model == "" {
-		model = binding.modelFor(agent)
+		model = binding.modelFor(agentName)
 	}
 
 	defer d.enterTurn(binding.Name)()
 
-	runner := opencode.NewRunner(binding.Client, arbiter, d.log)
-	runner.FirstResponse = d.opts.FirstResponse
-	result, err := runner.Run(ctx, opencode.Task{
-		Directory: task.Worktree,
-		Prompt:    prompt,
-		Agent:     agent,
-		Model:     model,
-		Title:     rec.IssueID,
-		SessionID: task.SessionID,
-		Ruleset:   ruleset,
-		Metadata:  map[string]any{"task_key": rec.IssueID, "action": string(decision.Action)},
-		Deadline:  d.opts.Deadline,
+	result, err := binding.Runtime.Run(ctx, agent.Turn{
+		Directory:    task.Worktree,
+		Prompt:       prompt,
+		Agent:        agentName,
+		Model:        model,
+		Title:        rec.IssueID,
+		SessionID:    task.SessionID,
+		Phase:        phase,
+		AllowedTools: tools.Allowed,
+		Downloads: agent.Downloads{
+			Hosts:  tools.Download.Hosts,
+			Prefix: tools.Download.Prefix,
+		},
+		Metadata: map[string]any{"task_key": rec.IssueID, "action": string(decision.Action)},
+		Deadline: d.opts.Deadline,
 	})
 
 	// Record the turn even when it failed: the audit is the only place the
@@ -884,51 +873,10 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	}
 }
 
-// sessionRuleset is the first permission layer.
-//
-// The catch-all comes first on purpose: the session ruleset is an array evaluated
-// last-match-wins, so a trailing catch-all would override every specific entry
-// (measured: a trailing "*": ask made an allowed tool ask again). Everything the
-// specific entries do not permit still reaches the arbiter as an `ask`.
-func sessionRuleset(allowedTools []string) []opencode.PermissionRule {
-	ruleset := []opencode.PermissionRule{
-		{Permission: "*", Pattern: "*", Action: "ask"},
-		{Permission: "read", Pattern: "*", Action: "allow"},
-		{Permission: "glob", Pattern: "*", Action: "allow"},
-		{Permission: "grep", Pattern: "*", Action: "allow"},
-		{Permission: "list", Pattern: "*", Action: "allow"},
-		{Permission: "todowrite", Pattern: "*", Action: "allow"},
-		// Gated so the phase can decide: "allow" would bypass the arbiter and
-		// "deny" would remove the tool from the analysis turn altogether.
-		{Permission: "edit", Pattern: "*", Action: "ask"},
-		{Permission: "bash", Pattern: "*", Action: "ask"},
-		// Never, in either phase.
-		{Permission: "external_directory", Pattern: "*", Action: "deny"},
-		{Permission: "webfetch", Pattern: "*", Action: "deny"},
-		{Permission: "websearch", Pattern: "*", Action: "deny"},
-	}
-	for _, tool := range allowedTools {
-		ruleset = append(ruleset, opencode.PermissionRule{Permission: tool, Pattern: "*", Action: "allow"})
-	}
-	return ruleset
-}
-
-// toolSet turns a source's allowlist into the arbiter's lookup map.
-func toolSet(tools []string) map[string]bool {
-	if len(tools) == 0 {
-		return nil
-	}
-	set := make(map[string]bool, len(tools))
-	for _, tool := range tools {
-		set[tool] = true
-	}
-	return set
-}
-
 // anyToolCompleted reports whether the turn called one of the source's reply
 // tools successfully, which is what "the issue got an answer" means. The list is
 // the source's; the loop is the dispatcher's.
-func anyToolCompleted(calls []opencode.ToolCall, replyTools []string) bool {
+func anyToolCompleted(calls []agent.ToolCall, replyTools []string) bool {
 	for _, call := range calls {
 		if call.Status != "completed" {
 			continue

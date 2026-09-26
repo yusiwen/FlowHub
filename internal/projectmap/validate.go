@@ -2,27 +2,30 @@ package projectmap
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 
-	// opencode is a leaf package (it imports nothing from this module), so the
-	// model-reference parser is shared instead of duplicated here.
-	"github.com/yusiwen/flowhub/internal/opencode"
+	"github.com/yusiwen/flowhub/internal/agent"
+	"github.com/yusiwen/flowhub/internal/workspace"
 )
 
-// agentNamePattern keeps the agent name safe to hand to opencode as a JSON field
+// agentNamePattern keeps the agent name safe to hand to a runtime as a JSON field
 // and to read back in logs.
 var agentNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-// Validate checks the filesystem side of the mapping. An empty result means the
-// table is safe to route with.
+// Validate checks the part of the mapping this package owns: the values a routing
+// entry declares about *work*, not about the host that will do it. An empty result
+// means the table is safe to route with.
 //
-// Every problem blocks startup: a mapping that claims to route but points at the
-// wrong clone is exactly how an agent ends up editing the wrong repository.
-// Disabled entries are skipped, because they may deliberately point at a checkout
-// that is not present on this host.
+// The filesystem checks that used to live here moved behind the workspace seam (ADR
+// 0001 step 2): whether a repository exists, is a git work tree, and has the origin
+// the entry declares is a fact of the machine that will prepare the checkout, not of
+// the configuration file. WorkspaceEntries and the provider's Validator answer it.
+//
+// Every problem blocks startup: a mapping that claims to route but names an
+// impossible agent or a malformed model is exactly how a turn dies after the
+// operator believes the hub is running. Disabled entries are skipped, because they
+// may deliberately point at a checkout that is not present on this host.
 func (m *Map) Validate() []string {
 	if m == nil {
 		return nil
@@ -39,114 +42,58 @@ func (m *Map) Validate() []string {
 
 func (e *Entry) validate() []string {
 	label := e.YouTrackKey
-
-	info, err := os.Stat(e.Repo.Path)
-	if err != nil {
-		return []string{fmt.Sprintf("%s: repo.path %s: %v", label, e.Repo.Path, err)}
-	}
-	if !info.IsDir() {
-		return []string{fmt.Sprintf("%s: repo.path %s is not a directory", label, e.Repo.Path)}
-	}
-
 	var problems []string
-	gitInfo, err := os.Stat(filepath.Join(e.Repo.Path, ".git"))
-	if err != nil {
-		return []string{fmt.Sprintf("%s: %s is not a git work tree (no .git)", label, e.Repo.Path)}
-	}
-	// When .git is a directory the shared config is right there. When it is a file
-	// (a linked worktree or a submodule) the config lives elsewhere, so the remote
-	// check is skipped rather than guessed.
-	if e.Repo.Remote != "" && gitInfo.IsDir() {
-		actual, ok := originRemote(e.Repo.Path)
-		switch {
-		case !ok:
-			problems = append(problems, fmt.Sprintf("%s: %s has no remote.origin.url to compare with repo.remote %q", label, e.Repo.Path, e.Repo.Remote))
-		case !sameRemote(actual, e.Repo.Remote):
-			problems = append(problems, fmt.Sprintf("%s: %s origin is %q but the mapping declares %q", label, e.Repo.Path, actual, e.Repo.Remote))
-		}
-	}
 
-	if e.Worktrees != "" {
-		switch {
-		case samePath(e.Worktrees, e.Repo.Path):
-			problems = append(problems, fmt.Sprintf("%s: worktrees must differ from repo.path", label))
-		case isBeneath(e.Worktrees, e.Repo.Path):
-			problems = append(problems, fmt.Sprintf("%s: worktrees %s is inside the repository; keep task checkouts outside the tree the agent reads", label, e.Worktrees))
-		}
-		if info, err := os.Stat(e.Worktrees); err == nil && !info.IsDir() {
-			problems = append(problems, fmt.Sprintf("%s: worktrees %s exists but is not a directory", label, e.Worktrees))
-		}
-		// A missing worktrees directory is fine: the dispatcher creates it.
+	if strings.TrimSpace(e.Repo.Path) == "" {
+		problems = append(problems, fmt.Sprintf("%s: repo.path is not configured", label))
 	}
-
 	if e.Agent != "" && !agentNamePattern.MatchString(e.Agent) {
 		problems = append(problems, fmt.Sprintf("%s: agent %q is not a valid agent name", label, e.Agent))
 	}
-	// The opencode API takes a provider id and a model id separately, so a bare
-	// model name cannot be honoured. Rejected here rather than silently ignored:
-	// a task that quietly runs on a different model than the operator configured
-	// is worse than one that does not start.
+	// A runtime takes a provider id and a model id separately, so a bare model name
+	// cannot be honoured. Rejected here rather than silently ignored: a task that
+	// quietly runs on a different model than the operator configured is worse than
+	// one that does not start.
 	if e.Model != "" {
-		if _, _, ok := opencode.SplitModel(e.Model); !ok {
-			problems = append(problems, fmt.Sprintf("%s: model %q must be spelled provider/model-id", label, e.Model))
+		if err := agent.ValidateModel(e.Model); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", label, err))
 		}
 	}
 	return problems
 }
 
-// originRemote reads remote.origin.url straight from .git/config, so validation
-// does not depend on the git binary being installed.
-func originRemote(repoPath string) (string, bool) {
-	data, err := os.ReadFile(filepath.Join(repoPath, ".git", "config"))
-	if err != nil {
-		return "", false
+// WorkspaceEntries renders the enabled entries as the plain data a workspace
+// provider validates, with the process-wide fallback checkout directory already
+// applied.
+//
+// The conversion lives here because this package owns the configuration format: the
+// seam stays free of it, so a provider never learns how a routing table is written.
+func (m *Map) WorkspaceEntries(fallbackBase string) []workspace.Entry {
+	if m == nil {
+		return nil
 	}
-	section := ""
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+	fallbackBase = strings.TrimSpace(fallbackBase)
+	entries := make([]workspace.Entry, 0, len(m.entries))
+	for _, entry := range m.entries {
+		if !entry.IsEnabled() {
 			continue
 		}
-		if strings.HasPrefix(line, "[") {
-			section = strings.ToLower(strings.Trim(line, "[] \t"))
-			continue
+		base := strings.TrimSpace(entry.Worktrees)
+		if base == "" {
+			// The fallback is canonicalized like every other path Load sees: the
+			// provider's containment check compares it against the repository, and
+			// a symlinked spelling of the same directory must not slip past it.
+			base = canonicalize(fallbackBase)
 		}
-		if section != `remote "origin"` {
-			continue
-		}
-		key, value, found := strings.Cut(line, "=")
-		if !found {
-			continue
-		}
-		if strings.TrimSpace(strings.ToLower(key)) == "url" {
-			return strings.TrimSpace(value), true
-		}
+		entries = append(entries, workspace.Entry{
+			Label:         entry.YouTrackKey,
+			Repo:          entry.Repo.Path,
+			Remote:        entry.Repo.Remote,
+			DefaultBranch: entry.Repo.DefaultBranch,
+			Base:          base,
+		})
 	}
-	return "", false
-}
-
-// sameRemote compares two remotes while ignoring a trailing slash or ".git", so
-// the ssh and https spellings of the same repository can be written either way.
-func sameRemote(a, b string) bool {
-	return normalizeRemote(a) == normalizeRemote(b)
-}
-
-func normalizeRemote(remote string) string {
-	remote = strings.TrimSpace(remote)
-	remote = strings.TrimSuffix(remote, "/")
-	remote = strings.TrimSuffix(remote, ".git")
-	return remote
-}
-
-func samePath(a, b string) bool { return filepath.Clean(a) == filepath.Clean(b) }
-
-// isBeneath reports whether path lies inside parent.
-func isBeneath(path, parent string) bool {
-	relative, err := filepath.Rel(parent, path)
-	if err != nil || relative == "." {
-		return false
-	}
-	return !strings.HasPrefix(relative, "..")
+	return entries
 }
 
 // Report renders the routing table for `flowhub -print-config`.

@@ -29,12 +29,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yusiwen/flowhub/internal/agent"
+	agentruntime "github.com/yusiwen/flowhub/internal/agent/opencode"
 	"github.com/yusiwen/flowhub/internal/config"
 	"github.com/yusiwen/flowhub/internal/dedupe"
 	"github.com/yusiwen/flowhub/internal/dispatch"
 	"github.com/yusiwen/flowhub/internal/logging"
 	"github.com/yusiwen/flowhub/internal/metrics"
-	"github.com/yusiwen/flowhub/internal/opencode"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/provision"
 	"github.com/yusiwen/flowhub/internal/registry"
@@ -44,6 +45,8 @@ import (
 	"github.com/yusiwen/flowhub/internal/source/youtrack"
 	"github.com/yusiwen/flowhub/internal/store"
 	"github.com/yusiwen/flowhub/internal/webhook"
+	"github.com/yusiwen/flowhub/internal/workspace"
+	"github.com/yusiwen/flowhub/internal/workspace/localworktree"
 )
 
 // Build metadata, injected by the Makefile:
@@ -105,8 +108,9 @@ func run() error {
 			cfg.ProjectsFile, strings.Join(problems, "\n  - "))
 	}
 
-	// The event source is the seam ADR 0001 added: the receiver and the dispatcher
-	// both take the same adapter, and neither names a tracker.
+	// The source seam: the receiver and the dispatcher take the same adapter, and
+	// neither names a tracker. The other two seams (workspace, runtime) are wired
+	// where the logger exists, because a runtime adapter logs through it.
 	src := source.Source(youtrack.New(rules.Policy{
 		Trigger:             cfg.Trigger,
 		StartStates:         cfg.StartStates,
@@ -133,7 +137,7 @@ func run() error {
 			fmt.Printf("mapping_problem:    %s\n", problem)
 		}
 		if cfg.Dispatch {
-			for _, problem := range dispatch.Problems(projects, cfg.WorktreeBase) {
+			for _, problem := range workspace.ValidateEntries(localworktree.Validator{}, projects.WorkspaceEntries(cfg.WorktreeBase)) {
 				fmt.Printf("dispatch_problem:   %s\n", problem)
 			}
 			problems, warnings := dispatch.RuntimeProblems(projects, inventory)
@@ -154,12 +158,14 @@ func run() error {
 	}
 	// A dispatcher that cannot reach a repository would fail one issue at a time
 	// while the operator believes the hub is running, so the same mapping is
-	// checked here, before anything is created.
+	// checked here, before anything is created — now in two halves: what the
+	// configuration says about the work (above) and what this host can actually do
+	// with it (the workspace provider's own checks).
 	if cfg.Dispatch {
 		if errors.Is(projectsErr, projectmap.ErrNotFound) {
 			return fmt.Errorf("FLOWHUB_DISPATCH=1 but no project mapping exists at %s: every delivery would be refused", cfg.ProjectsFile)
 		}
-		if problems := dispatch.Problems(projects, cfg.WorktreeBase); len(problems) > 0 {
+		if problems := workspace.ValidateEntries(localworktree.Validator{}, projects.WorkspaceEntries(cfg.WorktreeBase)); len(problems) > 0 {
 			return fmt.Errorf("refusing to start, dispatch is not possible:\n  - %s", strings.Join(problems, "\n  - "))
 		}
 		if problems, _ := dispatch.RuntimeProblems(projects, inventory); len(problems) > 0 {
@@ -337,6 +343,31 @@ func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src sour
 	return opts
 }
 
+// newRuntimeFactory returns the constructor the dispatcher uses to build one
+// runtime adapter per host.
+//
+// It is the single place in the binary that names an agent product, and the only
+// place that hands a runtime its credentials: everything above the seam passes an
+// agent.Runtime around and never learns which product is behind it (ADR 0001).
+// The dispatcher needs a factory rather than one runtime because it learns a host's
+// address at routing time — the inventory can change while the process runs.
+//
+// One HTTP request is bounded by the client, the turn by its own deadline; the
+// liveness probes bound themselves with a much shorter context.
+func newRuntimeFactory(cfg config.Config, logger *slog.Logger) func(name, url string) agent.Runtime {
+	return func(name, url string) agent.Runtime {
+		return agentruntime.NewRuntime(
+			agentruntime.New(agentruntime.Options{
+				BaseURL:  url,
+				Username: cfg.OpenCodeUser,
+				Password: cfg.OpenCodePassword,
+				Timeout:  cfg.TaskDeadline,
+			}),
+			agentruntime.RuntimeOptions{Name: name, Log: logger, FirstResponse: cfg.FirstResponse},
+		)
+	}
+}
+
 // opencodeProber decides whether a host that just claimed a name is usable.
 //
 // Answering /global/health is not enough. opencode accepts a session for an agent
@@ -345,7 +376,13 @@ func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src sour
 // profile the host claimed to exist on *that* server, and the model the host
 // reported to be one the server offers. Those are the checks `init --check` runs
 // locally, repeated from the side that will actually send the turns.
+//
+// It speaks opencode's own API rather than the agent seam, deliberately: the agent
+// registry and the model catalogue are what *this product* exposes, and a capability
+// check that pretended to be runtime-neutral would have to invent a speculative
+// interface for them. The dispatcher, which must stay neutral, does not use this.
 type opencodeProber struct {
+	cfg     config.Config
 	timeout time.Duration
 	log     *slog.Logger
 }
@@ -355,7 +392,12 @@ func (p opencodeProber) Probe(ctx context.Context, claim runtimes.Claim) error {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	client := opencode.New(opencode.Options{BaseURL: claim.Advertise, Timeout: timeout})
+	client := agentruntime.New(agentruntime.Options{
+		BaseURL:  claim.Advertise,
+		Username: p.cfg.OpenCodeUser,
+		Password: p.cfg.OpenCodePassword,
+		Timeout:  timeout,
+	})
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -373,7 +415,7 @@ func (p opencodeProber) Probe(ctx context.Context, claim runtimes.Claim) error {
 	if err != nil {
 		return fmt.Errorf("the host answered but its agent list could not be read: %w", err)
 	}
-	var claimed *opencode.AgentInfo
+	var claimed *agentruntime.AgentInfo
 	for index := range agents {
 		if agents[index].Name == profile {
 			claimed = &agents[index]
@@ -388,7 +430,7 @@ func (p opencodeProber) Probe(ctx context.Context, claim runtimes.Claim) error {
 	if model == "" {
 		return nil
 	}
-	provider, id, ok := opencode.SplitModel(model)
+	provider, id, ok := agent.SplitModel(model)
 	if !ok {
 		return fmt.Errorf("the host reported model %q for agent %s, which is not spelled provider/model", model, profile)
 	}
@@ -434,7 +476,7 @@ func startControlAPI(ctx context.Context, cfg config.Config, inventory *runtimes
 	control := &runtimes.Server{
 		Inventory:  inventory,
 		AdminToken: cfg.AdminToken,
-		Prober:     opencodeProber{timeout: 5 * time.Second, log: logger},
+		Prober:     opencodeProber{cfg: cfg, timeout: 5 * time.Second, log: logger},
 		BoundTasks: boundTasks,
 		Log:        logger,
 	}
@@ -478,12 +520,21 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 			"pause_file", cfg.ResolvedPauseFile())
 	}
 
-	client := opencode.New(opencode.Options{BaseURL: cfg.OpenCodeURL})
+	client := agentruntime.New(agentruntime.Options{
+		BaseURL:  cfg.OpenCodeURL,
+		Username: cfg.OpenCodeUser,
+		Password: cfg.OpenCodePassword,
+		Timeout:  cfg.TaskDeadline,
+	})
+	defaultRuntime := agentruntime.NewRuntime(client, agentruntime.RuntimeOptions{
+		Name: dispatch.DefaultRuntimeName, Log: logger, FirstResponse: cfg.FirstResponse,
+	})
+	factory := newRuntimeFactory(cfg, logger)
 	// Refuse to start when nothing can serve a turn: a dispatcher that accepts
 	// deliveries and then fails every one of them is worse than a refused start.
 	// With an inventory the rule becomes "at least one runtime answers", because
 	// the point of several hosts is that one may be down.
-	if err := checkRuntimesReachable(ctx, cfg, inventory, client, logger); err != nil {
+	if err := checkRuntimesReachable(ctx, cfg, inventory, defaultRuntime, factory, logger); err != nil {
 		return nil, nil, err
 	}
 
@@ -493,8 +544,14 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 	}
 
 	dispatcher, err := dispatch.New(dispatch.Options{
-		Client:   client,
-		Runtimes: inventory,
+		Runtimes:       inventory,
+		NewRuntime:     factory,
+		DefaultRuntime: defaultRuntime,
+		NewWorkspace: func(base string) (workspace.Workspace, error) {
+			// The co-located provider: FlowHub and the runtime share a filesystem, so
+			// a task's directory is a git worktree this process created.
+			return localworktree.New(localworktree.Options{Base: base})
+		},
 		Registry: tasks,
 		Projects: projects,
 		// One policy, owned by the source: what the dispatcher decides on and what
@@ -540,17 +597,17 @@ func stopDispatcher(stop context.CancelFunc, done <-chan struct{}, ctx context.C
 
 // checkRuntimesReachable probes every runtime the dispatcher could use, warns about
 // each one that does not answer, and fails only when none does.
-func checkRuntimesReachable(ctx context.Context, cfg config.Config, inventory *runtimes.Inventory, fallback *opencode.Client, logger *slog.Logger) error {
+func checkRuntimesReachable(ctx context.Context, cfg config.Config, inventory *runtimes.Inventory, fallback agent.Runtime, factory func(name, url string) agent.Runtime, logger *slog.Logger) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	active := inventory.Active()
 	if len(active) == 0 {
-		health, err := fallback.Health(probeCtx)
+		version, err := fallback.Health(probeCtx)
 		if err != nil {
 			return fmt.Errorf("FLOWHUB_DISPATCH=1 but opencode at %s is not answering: %w", cfg.OpenCodeURL, err)
 		}
-		logger.Info("opencode is reachable", "url", cfg.OpenCodeURL, "version", health.Version, "runtime", dispatch.DefaultRuntimeName)
+		logger.Info("opencode is reachable", "url", cfg.OpenCodeURL, "version", version, "runtime", dispatch.DefaultRuntimeName)
 		return nil
 	}
 
@@ -565,13 +622,13 @@ func checkRuntimesReachable(ctx context.Context, cfg config.Config, inventory *r
 			continue
 		}
 		runtimeCtx, runtimeCancel := context.WithTimeout(probeCtx, 5*time.Second)
-		health, err := opencode.New(opencode.Options{BaseURL: address, Timeout: 5 * time.Second}).Health(runtimeCtx)
+		version, err := factory(runtime.Name, address).Health(runtimeCtx)
 		runtimeCancel()
 		if err != nil {
 			logger.Warn("runtime is not answering; new work will avoid it", "runtime", runtime.Name, "url", address, "error", err)
 			continue
 		}
-		logger.Info("runtime is reachable", "runtime", runtime.Name, "url", address, "version", health.Version)
+		logger.Info("runtime is reachable", "runtime", runtime.Name, "url", address, "version", version)
 		reachable = append(reachable, runtime.Name)
 	}
 	if len(reachable) == 0 {

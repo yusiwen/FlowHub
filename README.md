@@ -248,9 +248,11 @@ switched on explicitly:
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
 | `FLOWHUB_DISPATCH` | `false` | Run opencode turns for accepted deliveries. Off means record-only |
-| `FLOWHUB_OPENCODE_URL` | `http://127.0.0.1:4096` | Base URL of the local headless opencode server. Startup probes `/global/health` and refuses to start if it does not answer |
+| `FLOWHUB_OPENCODE_URL` | `http://127.0.0.1:4096` | Base URL of the headless opencode server. Startup probes `/global/health` and refuses to start if it does not answer |
+| `FLOWHUB_OPENCODE_USER` | *(unset)* | HTTP Basic Auth username for every call to an agent server. Set with the password or not at all; required before a runtime that is not on loopback is usable |
+| `FLOWHUB_OPENCODE_PASSWORD` | *(unset)* | HTTP Basic Auth password, matching the server's `OPENCODE_SERVER_PASSWORD`. Never printed: `-print-config` shows a fingerprint |
 | `FLOWHUB_DISPATCH_AGENT` | `devops` | opencode agent for turns whose routing entry names none |
-| `FLOWHUB_DISPATCH_QUEUE` | `32` | Deliveries waiting for the single worker. A full queue drops work instead of blocking the publisher |
+| `FLOWHUB_DISPATCH_QUEUE` | `32` | Deliveries waiting for a runtime's worker. A full queue drops work instead of blocking the publisher |
 | `FLOWHUB_TASK_DEADLINE` | `15m` | One turn's budget. A deadline is not a failure: the session keeps running and is marked `executing` |
 | `FLOWHUB_FIRST_RESPONSE` | `90s` | How long a turn may take to produce its first assistant message before it is **failed**. A prompt the agent server never turns into a turn (a model its provider dropped) leaves the session idle with no message, which otherwise looks like a slow turn until the deadline. Capped at a third of `FLOWHUB_TASK_DEADLINE`, floored at `5s` |
 | `FLOWHUB_MAX_TURNS` | `8` | A task that triggers more often than this stops and asks for a human |
@@ -260,7 +262,7 @@ switched on explicitly:
 | `FLOWHUB_SKIP_ANALYZE_ON_CREATE` | `false` | Skip the automatic read-only analysis of a newly created issue |
 | `FLOWHUB_REGISTRY_FILE` | `<DataDir>/registry.jsonl` | Task registry: issue → repository, worktree, session, state, cost |
 | `FLOWHUB_PAUSE_FILE` | `<DataDir>/DISPATCH_OFF` | Kill switch. While this file exists, deliveries are audited and ignored |
-| `FLOWHUB_WORKTREE_BASE` | *(unset)* | Fallback worktree directory for routing entries that declare none |
+| `FLOWHUB_WORKTREE_BASE` | *(unset)* | Fallback checkout directory for routing entries that declare none. Facts about it (exists, outside the repository) are checked by the workspace provider, not by the routing table |
 
 The control API (ADR 0002 step 3) is a second listener, because the webhook entry
 and the admin API have opposite semantics: the webhook answers `202` to everything
@@ -565,7 +567,7 @@ restates the parts that must hold even if the agent file is changed. A routing
 entry may name its own `agent` instead, and that wins over
 `FLOWHUB_DISPATCH_AGENT`.
 
-The session-level ruleset in `internal/opencode/phase.go` stays the first
+The session-level ruleset in `internal/agent/opencode/runtime.go` stays the first
 permission layer and the arbiter the second, in both phases. The execution phase
 is the only phase in which `edit` is granted, which is what keeps an analysis turn
 harmless even if the model decides to be helpful. Which tools are allowed at all,
@@ -917,7 +919,10 @@ Layout:
 | `internal/store` | Audit record, non-blocking queue, daily JSONL writer, human readable payload log |
 | `internal/projectmap` | YouTrack project → repository routing table: strict loader, canonical paths, fail-closed validation, runtime addressing |
 | `internal/rules` | Trigger policy over the neutral event: ignore/analyze/plan/execute, self-comment detection, turn budget, reply basis |
-| `internal/opencode` | opencode client, permission arbiter and the runner that drives one unattended turn |
+| `internal/agent` | The runtime seam: `Runtime`, the neutral `Turn`/`Result`, the turn phase and the download policy |
+| `internal/agent/opencode` | opencode client, permission arbiter, session ruleset and the runner that drives one unattended turn |
+| `internal/workspace` | The workspace seam: `Workspace`, `Handle`, the pinned `Base`, and entry validation |
+| `internal/workspace/localworktree` | The co-located provider: one git worktree per task, baseline pinned through the origin |
 | `internal/dispatch` | The workers: intake loop, one queue and worker per runtime, worktree, session, registry, audit |
 | `internal/metrics` | Counters used by `/healthz` |
 | `config/config.example.json` | Committed template for the routing table |

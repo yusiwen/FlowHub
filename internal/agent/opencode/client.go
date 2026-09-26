@@ -1,6 +1,12 @@
-// Package opencode talks to a local `opencode serve` instance over its v1 HTTP
-// API: create a session bound to a directory, deliver one prompt, answer the
-// permission requests that arrive while the turn runs, and report the result.
+// Package opencode is the opencode implementation of the agent seam: it talks to an
+// `opencode serve` instance over its v1 HTTP API — create a session bound to a
+// directory, deliver one prompt, answer the permission requests that arrive while
+// the turn runs, and report the result.
+//
+// Runtime is the agent.Runtime this package offers; Client and Runner are its two
+// halves. The phase policy and the session ruleset belong to this product's
+// permission model and live here too, so the dispatcher never learns them
+// (ADR 0001).
 //
 // The protocol details encoded here were measured against opencode 1.18.31
 // (opencode-headless-automation-and-permissions.md, plus a live trial on

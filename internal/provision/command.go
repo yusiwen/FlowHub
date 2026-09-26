@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yusiwen/flowhub/internal/opencode"
+	agentruntime "github.com/yusiwen/flowhub/internal/agent/opencode"
 	"github.com/yusiwen/flowhub/internal/runtimes"
 )
 
@@ -417,7 +417,7 @@ func catalogueFor(url string) ModelCatalogue {
 	if strings.TrimSpace(url) == "" {
 		return nil
 	}
-	return opencode.New(opencode.Options{BaseURL: strings.TrimSpace(url), Timeout: catalogueTimeout})
+	return agentruntime.New(agentruntime.Options{BaseURL: strings.TrimSpace(url), Timeout: catalogueTimeout})
 }
 
 // printCheck renders the capability report, in whichever form was asked for.

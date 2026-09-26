@@ -235,57 +235,38 @@ func TestMatchSkipsDisabledEntries(t *testing.T) {
 	}
 }
 
-func TestValidateReportsFilesystemProblems(t *testing.T) {
-	base := t.TempDir()
-	good := writeRepo(t, filepath.Join(base, "good"), "git@example.cn:me/app.git")
-	notGit := filepath.Join(base, "not-git")
-	if err := os.MkdirAll(notGit, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	wrongRemote := writeRepo(t, filepath.Join(base, "wrong-remote"), "git@example.cn:me/other.git")
-
+// TestValidateReportsValueProblems covers the checks that stay in this package
+// after ADR 0001 step 2 moved the filesystem ones behind the workspace seam: the
+// values an entry declares about the work itself. A malformed agent name or model
+// reference is a configuration mistake whichever host serves the task.
+func TestValidateReportsValueProblems(t *testing.T) {
+	repo := t.TempDir()
 	cases := map[string]struct {
 		entry Entry
 		want  string
 	}{
-		"missing path": {
-			entry: Entry{YouTrackKey: "A", Repo: Repo{Path: filepath.Join(base, "absent")}},
-			want:  "no such file",
-		},
-		"not a git work tree": {
-			entry: Entry{YouTrackKey: "B", Repo: Repo{Path: notGit}},
-			want:  "not a git work tree",
-		},
-		"remote mismatch": {
-			entry: Entry{YouTrackKey: "C", Repo: Repo{Path: wrongRemote, Remote: "git@example.cn:me/app.git"}},
-			want:  "but the mapping declares",
-		},
-		"worktrees inside the repo": {
-			entry: Entry{YouTrackKey: "D", Repo: Repo{Path: good}, Worktrees: filepath.Join(good, "wt")},
-			want:  "is inside the repository",
-		},
-		"worktrees equal to the repo": {
-			entry: Entry{YouTrackKey: "E", Repo: Repo{Path: good}, Worktrees: good},
-			want:  "must differ from repo.path",
+		"no repo path": {
+			entry: Entry{YouTrackKey: "A"},
+			want:  "repo.path is not configured",
 		},
 		"bad agent name": {
-			entry: Entry{YouTrackKey: "F", Repo: Repo{Path: good}, Agent: "dev ops/../x"},
+			entry: Entry{YouTrackKey: "B", Repo: Repo{Path: repo}, Agent: "dev ops/../x"},
 			want:  "not a valid agent name",
 		},
 		"bare model name": {
-			entry: Entry{YouTrackKey: "H", Repo: Repo{Path: good}, Model: "gpt-5"},
+			entry: Entry{YouTrackKey: "C", Repo: Repo{Path: repo}, Model: "gpt-5"},
 			want:  "must be spelled provider/model-id",
 		},
 		"model without a name": {
-			entry: Entry{YouTrackKey: "I", Repo: Repo{Path: good}, Model: "deepseek/"},
+			entry: Entry{YouTrackKey: "D", Repo: Repo{Path: repo}, Model: "deepseek/"},
 			want:  "must be spelled provider/model-id",
 		},
 		"provider qualified model": {
-			entry: Entry{YouTrackKey: "J", Repo: Repo{Path: good}, Model: "deepseek/deepseek-v4-flash"},
+			entry: Entry{YouTrackKey: "E", Repo: Repo{Path: repo}, Model: "deepseek/deepseek-v4-flash"},
 			want:  "",
 		},
 		"ok": {
-			entry: Entry{YouTrackKey: "G", Repo: Repo{Path: good, Remote: "git@example.cn:me/app.git"}, Agent: "devops"},
+			entry: Entry{YouTrackKey: "F", Repo: Repo{Path: repo, Remote: "git@example.cn:me/app.git"}, Agent: "devops"},
 			want:  "",
 		},
 	}
@@ -307,18 +288,42 @@ func TestValidateReportsFilesystemProblems(t *testing.T) {
 	}
 }
 
-func TestSameRemoteIgnoresSpelling(t *testing.T) {
-	for _, pair := range [][2]string{
-		{"git@example.cn:me/app.git", "git@example.cn:me/app"},
-		{"https://example.cn/me/app.git", "https://example.cn/me/app/"},
-		{" git@example.cn:me/app.git ", "git@example.cn:me/app.git"},
-	} {
-		if !sameRemote(pair[0], pair[1]) {
-			t.Errorf("sameRemote(%q, %q) = false, want true", pair[0], pair[1])
-		}
+// TestWorkspaceEntriesResolvesTheFallbackBase pins what the provider is handed: the
+// entry's own checkout directory when it names one, the process-wide fallback
+// otherwise, and only enabled entries at all.
+func TestWorkspaceEntriesResolvesTheFallbackBase(t *testing.T) {
+	base := t.TempDir()
+	path := writeFile(t, filepath.Join(base, "projects.json"), `{
+	  "projects": [
+	    {"youtrack_key": "TEST", "repo": {"path": "`+filepath.Join(base, "one")+`", "remote": "git@example.cn:me/one.git", "default_branch": "main"}},
+	    {"youtrack_key": "OTHER", "repo": {"path": "`+filepath.Join(base, "two")+`"}, "worktrees": "`+filepath.Join(base, "wt-two")+`"},
+	    {"youtrack_key": "OFF", "repo": {"path": "`+filepath.Join(base, "three")+`"}, "enabled": false}
+	  ]
+	}`)
+	m, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
 	}
-	if sameRemote("git@example.cn:me/app.git", "git@example.cn:me/other.git") {
-		t.Error("different repositories compared equal")
+
+	entries := m.WorkspaceEntries(filepath.Join(base, "fallback"))
+	if len(entries) != 2 {
+		t.Fatalf("entries = %+v, want the two enabled ones", entries)
+	}
+	// Load canonicalizes every path it is given (the runtime keys sessions by the
+	// literal string, so /tmp and /private/tmp must not both appear), so compare
+	// against the canonicalized form rather than the string the test built.
+	if entries[0].Label != "TEST" || entries[0].Base != canonicalize(filepath.Join(base, "fallback")) {
+		t.Errorf("entry 0 = %+v, want TEST with the fallback base", entries[0])
+	}
+	if entries[0].Remote != "git@example.cn:me/one.git" || entries[0].DefaultBranch != "main" {
+		t.Errorf("entry 0 lost the repository identity: %+v", entries[0])
+	}
+	if entries[1].Label != "OTHER" || entries[1].Base != canonicalize(filepath.Join(base, "wt-two")) {
+		t.Errorf("entry 1 = %+v, want OTHER with its own worktrees directory", entries[1])
+	}
+
+	if got := (*Map)(nil).WorkspaceEntries("x"); got != nil {
+		t.Errorf("a nil map produced %v", got)
 	}
 }
 
