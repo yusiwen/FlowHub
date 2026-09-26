@@ -65,6 +65,12 @@ type PromptContext struct {
 	// translate ("the creation of this issue", `the comment "/opencode start"`).
 	// It comes from the decision, so the reply cannot claim a reason of its own.
 	Basis string
+	// Instructions is what the deployment wants this turn to know, from a
+	// `prompt_file` in the configuration file: project-specific guidance such as
+	// "this repository is Java, run `mvn -q verify`". It is *appended* to the
+	// adapter's own prompt, never a replacement, because the marker and the sign-off
+	// that keep FlowHub from answering its own replies belong to the adapter.
+	Instructions string
 }
 
 // TaskView is what the registry already knows about the issue.

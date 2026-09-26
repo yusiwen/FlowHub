@@ -20,7 +20,10 @@
         "max_turns": 8
       },
       "_comment_authors": "Optional source-level author allowlist (tracker logins, case-insensitive), inherited by every project of this source. A project may narrow it further; a project without its own list allows everyone this source allows.",
-      "authors": []
+      "authors": [],
+
+      "_comment_prompt_file": "Optional path to a file of extra instructions for this source's turns, resolved relative to this file. It is *appended* to the adapter's built-in prompt, never a replacement: the untrusted-input warning, the reply tool, the sign-off and the <!-- flowhub-auto --> marker are the adapter's contract and a text file must not be able to delete them. A missing, empty, directory or >32 KiB file refuses the start rather than quietly doing nothing.",
+      "prompt_file": "prompts/youtrack.md"
     }
   },
 
@@ -57,6 +60,8 @@
         "remote": "git@your-git-host:owner/repo.git",
         "default_branch": "main"
       },
+      "_comment_prompt_file": "Optional per-project instructions, appended after the source's. This is where a repository says \"this repo is Java, run `mvn -q verify`\"; it is read at load time like the source's and refused the same way if it is unusable.",
+      "prompt_file": "prompts/test-project.md",
       "_comment_worktrees": "Base directory for the one-checkout-per-task isolation. Absolute, outside repo.path, created on demand. Required once dispatch is on (FLOWHUB_DISPATCH=1) unless FLOWHUB_WORKTREE_BASE provides the fallback.",
       "worktrees": "/absolute/path/to/flowhub-worktrees",
 

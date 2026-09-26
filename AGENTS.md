@@ -174,7 +174,11 @@ documents. The rules below are load-bearing; do not relax them casually.
    while the router stays free of conventions. The index is `(source, project)`, the
    file's version is explicit (a version 1 file is translated on read and reported
    as such), every unknown field is an error, and each effective value is printed
-   with the level that supplied it. Startup validates the file, every path,
+   with the level that supplied it. A `prompt_file` (source or project level) may only
+   *add* instructions: the untrusted-input warning, the reply tool, the sign-off and
+   the `<!-- flowhub-auto -->` marker are the adapter's contract and stay in code,
+   because a text file that could delete the marker would break the loop prevention
+   in rule 10. Startup validates the file, every path,
    git work tree and `origin` before any
    file is created, and refuses otherwise. Do not add a "use the only configured
    repository" fallback: silently editing the wrong repository is the worst

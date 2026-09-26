@@ -375,11 +375,28 @@ effective:          runtimes.builder-a deadline=20m (level: runtimes.builder-a)
 effective:          projects[youtrack:TEST] model=deepseek/v4 (level: projects[youtrack:TEST])
 ```
 
-Two limits are deliberate and refused rather than ignored:
-`sources.<name>.prompt_file` is not implemented yet (the adapter's built-in prompt
-is used), and `runtimes.<name>.max_concurrent` accepts only `1` — a session belongs
-to one runtime and a prompt sent to a busy session is silently swallowed, so raising
-it needs per-task locking that does not exist yet.
+### Prompt files
+
+A source (`sources.<name>.prompt_file`) and a project
+(`projects[].prompt_file`) may each name a file of extra instructions, resolved
+relative to the configuration file. Both are **appended** to the adapter's built-in
+prompt, in their own `## Project instructions` section, and both are read when the
+configuration is loaded:
+
+* a missing, empty, directory or larger-than-32-KiB file **refuses the start** — a
+  configured file that silently had no effect is the failure mode this project
+  refuses everywhere;
+* the file is guidance about *how* to work in a repository ("this repo is Java, run
+  `mvn -q verify`"), not a replacement for the contract. The untrusted-input warning,
+  the reply tool, the sign-off that names the trigger, and the
+  `<!-- flowhub-auto -->` marker stay in the adapter's code, because a text file that
+  could delete the marker would break the loop prevention that stops FlowHub from
+  answering its own replies.
+
+One limit is still deliberate and refused rather than ignored:
+`runtimes.<name>.max_concurrent` accepts only `1` — a session belongs to one runtime
+and a prompt sent to a busy session is silently swallowed, so raising it needs
+per-task locking that does not exist yet.
 
 ### Which host runs the work
 
@@ -455,7 +472,7 @@ even though YouTrack knows the answer. Measured evidence:
 | `enabled: false` | Never matched, and not validated (it may point at a checkout this host does not have) |
 | `runtime` / `runtimes` | The eligibility set for a new task. A name that is not a runtime name (`^[a-z0-9][a-z0-9._-]{0,62}$`) is refused when the file is loaded, because it could never be enrolled |
 | `runtime_policy` | `spread` or `first-healthy`, per project or for the whole file; anything else is refused at load |
-| `sources.<name>` | `enabled`, the trigger `policy`, an author allowlist a project may narrow, and `prompt_file` (refused until implemented) |
+| `sources.<name>` | `enabled`, the trigger `policy`, an author allowlist a project may narrow, and `prompt_file` (extra instructions, appended — see below) |
 | `runtimes.<name>` | `url`, `auth` (a username plus the *name* of the variable holding the password), `agent`, `model`, `deadline`, `max_concurrent` (only `1`) |
 
 ### Startup validation (fail-closed)
@@ -467,8 +484,8 @@ before any file is created:
   error, not a no-op;
 * a version 2 file that uses a version 1 spelling (`youtrack_key`, `also_keys`),
   refused with the replacement named;
-* a `source` this binary cannot build (the error lists the adapters it knows), or a
-  `sources.<name>.prompt_file`, which is not implemented yet;
+* a `source` this binary cannot build (the error lists the adapters it knows);
+* a `prompt_file` that is missing, empty, a directory, or over 32 KiB;
 * a `runtimes.<name>` block that cannot be honoured: a URL that is not http(s), a
   `max_concurrent` other than `1`, an unparsable `deadline`, a user without a
   `password_env` (or the reverse), or a `password_env` naming an empty variable;

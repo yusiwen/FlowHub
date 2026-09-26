@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,6 +76,10 @@ type v2Source struct {
 	Policy     v2SourcePolicy `json:"policy,omitempty"`
 	PromptFile string         `json:"prompt_file,omitempty"`
 	Authors    []string       `json:"authors,omitempty"`
+
+	// promptExtra is the file's content, read at load time. It is unexported so the
+	// strict decoder ignores it while the loader can hand it to the adapter.
+	promptExtra string
 }
 
 // v2SourcePolicy is a source's trigger policy as written in the file. Every field
@@ -136,6 +142,10 @@ type v2Project struct {
 	Model         string   `json:"model,omitempty"`
 	Authors       []string `json:"authors,omitempty"`
 	Enabled       *bool    `json:"enabled,omitempty"`
+	// PromptFile adds instructions for this project's turns, on top of the source's.
+	// It is how a repository says "this repo is Java, run `mvn -q verify`" (ADR 0001
+	// open question 6) without editing the tracker adapter.
+	PromptFile string `json:"prompt_file,omitempty"`
 
 	// The version 1 spellings are declared only so that a version 2 file which uses
 	// them is refused with the replacement named, instead of with "unknown field".
@@ -237,9 +247,8 @@ func checkV2(project v2Project, index int) error {
 	return nil
 }
 
-// SourceProblems reports every `sources.<name>` block this binary cannot honour: a
-// name it cannot build, named with the list of what it knows, and a `prompt_file` it
-// cannot use yet.
+// SourceProblems reports every `sources.<name>` block this binary cannot honour:
+// a name it cannot build, named with the list of what it knows.
 //
 // The known names are passed in rather than resolved here, because the registry is
 // the binary's, not the file's: this package owns the format, `main` owns which
@@ -254,19 +263,53 @@ func (m *Map) SourceProblems(known []string) []string {
 	}
 	var problems []string
 	for _, name := range m.Sources() {
-		block := m.sources[name]
 		if !buildable[name] {
 			problems = append(problems, fmt.Sprintf("sources.%s: this binary cannot build a %q source (it knows: %s)",
 				name, name, strings.Join(known, ", ")))
-			continue
-		}
-		if strings.TrimSpace(block.PromptFile) != "" {
-			// Deliberately refused rather than ignored: a declared prompt file that
-			// silently does nothing is the failure this project refuses elsewhere.
-			problems = append(problems, fmt.Sprintf("sources.%s.prompt_file: a prompt file is not implemented yet; remove it and the adapter's built-in prompt is used", name))
 		}
 	}
 	return problems
+}
+
+// maxPromptFileBytes bounds a prompt file. It is an operator's notes, not a corpus:
+// a cap keeps a mistake (piping a log into it) from turning every turn into a
+// context blowout, and it is generous enough that a real instruction set fits.
+const maxPromptFileBytes = 32 << 10
+
+// readPromptFile resolves a prompt file against the configuration file's directory
+// and reads it.
+//
+// Relative to the configuration file on purpose: a prompt file belongs to the
+// deployment, so it travels with the file that names it rather than depending on the
+// process's working directory. An empty or oversized file is refused rather than
+// used: "it is configured but has no effect" is the failure this project refuses
+// everywhere else.
+func (m *Map) readPromptFile(label, path string) (string, error) {
+	resolved := strings.TrimSpace(path)
+	if resolved == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(filepath.Dir(m.path), resolved)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", label, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s: %s is a directory, not a file", label, resolved)
+	}
+	if info.Size() > maxPromptFileBytes {
+		return "", fmt.Errorf("%s: %s is %d bytes, over the %d byte limit", label, resolved, info.Size(), maxPromptFileBytes)
+	}
+	content, err := os.ReadFile(resolved)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", label, err)
+	}
+	if strings.TrimSpace(string(content)) == "" {
+		return "", fmt.Errorf("%s: %s is empty, so it would have no effect", label, resolved)
+	}
+	return string(content), nil
 }
 
 // sortedKeys returns a map's keys in a deterministic order, so a validation error

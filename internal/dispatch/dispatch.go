@@ -793,6 +793,9 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		// The sign-off states what the agent was reacting to; it comes from the
 		// decision, so the reply cannot invent a reason for itself.
 		Basis: d.policy.Basis(decision, delivery),
+		// The routing entry's own instructions, read from its prompt_file when the
+		// configuration was loaded.
+		Instructions: match.Entry.PromptExtra,
 	})
 	if prompt == "" {
 		d.log.Error("no prompt was built for the action", "action", decision.Action, "issue", rec.IssueID)

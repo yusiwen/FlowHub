@@ -94,6 +94,12 @@ type Entry struct {
 	// source block may narrow it further; an empty list here means "everyone the
 	// source allows".
 	Authors []string
+	// PromptExtra is this project's own instructions for a turn, read from its
+	// `prompt_file` at load time and handed to the adapter. It is appended to the
+	// adapter's built-in prompt, never a replacement: the marker and the sign-off
+	// that keep FlowHub from answering its own replies are the adapter's contract,
+	// and a text file must not be able to delete them.
+	PromptExtra string
 	// Enabled defaults to true when absent; a disabled entry is never matched.
 	Enabled *bool
 
@@ -285,6 +291,16 @@ func (m *Map) SourceEnabled(name string) bool {
 	return *block.Enabled
 }
 
+// SourcePromptExtra is a source's own turn instructions, read from its
+// `sources.<name>.prompt_file` at load time. Empty when the file names none.
+func (m *Map) SourcePromptExtra(name string) string {
+	block, ok := m.sourceBlock(name)
+	if !ok {
+		return ""
+	}
+	return block.promptExtra
+}
+
 // SourceAuthors is a source-level author allowlist, empty when the file names none.
 func (m *Map) SourceAuthors(name string) []string {
 	block, ok := m.sourceBlock(name)
@@ -406,8 +422,16 @@ func (m *Map) load(file *v2File, path string, translated bool) (*Map, error) {
 		m.format = FormatV2
 	}
 
-	m.sources = file.Sources
-	m.sourceOrder = sortedSourceNames(file.Sources)
+	m.sources = map[string]v2Source{}
+	for name, block := range file.Sources {
+		extra, err := m.readPromptFile("sources."+name+".prompt_file", block.PromptFile)
+		if err != nil {
+			return nil, fmt.Errorf("configuration file %s: %w", path, err)
+		}
+		block.promptExtra = extra
+		m.sources[name] = block
+	}
+	m.sourceOrder = sortedSourceNames(m.sources)
 	m.runtimes = file.Runtimes
 	m.runtimeOrder = sortedRuntimeNames(file.Runtimes)
 
@@ -420,6 +444,11 @@ func (m *Map) load(file *v2File, path string, translated bool) (*Map, error) {
 	for index := range file.Projects {
 		project := file.Projects[index]
 		if err := checkV2(project, index); err != nil {
+			return nil, fmt.Errorf("configuration file %s: %w", path, err)
+		}
+		extra, err := m.readPromptFile(fmt.Sprintf("projects[%s:%s].prompt_file",
+			project.Source, project.Project), project.PromptFile)
+		if err != nil {
 			return nil, fmt.Errorf("configuration file %s: %w", path, err)
 		}
 		entry := &Entry{
@@ -435,6 +464,7 @@ func (m *Map) load(file *v2File, path string, translated bool) (*Map, error) {
 			RuntimePolicy: project.RuntimePolicy,
 			Authors:       project.Authors,
 			Enabled:       project.Enabled,
+			PromptExtra:   extra,
 		}
 		if err := m.register(entry, index); err != nil {
 			return nil, fmt.Errorf("configuration file %s: %w", path, err)

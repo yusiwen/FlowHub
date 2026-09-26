@@ -127,3 +127,49 @@ func TestPromptRequiresABlockquoteSignOff(t *testing.T) {
 		t.Error("the prompt has no fallback basis")
 	}
 }
+
+// TestProjectInstructionsAreAppendedNotSubstituted is the constraint the ADR's
+// `prompt_file` had to bend around: the file adds guidance, and the adapter's own
+// contract — the untrusted-input rule, the reply tool, the marker and the trigger it
+// names — survives whatever the operator wrote. A file that could delete the marker
+// would break the loop prevention that keeps FlowHub from answering its own replies.
+func TestProjectInstructionsAreAppendedNotSubstituted(t *testing.T) {
+	src := New(rules.Policy{})
+	delivery := made(event.KindCreated, "TEST-12", withSubject("TEST", "s", "body"))
+	ctx := rules.PromptContext{
+		Worktree:     "/wt/TEST-12",
+		Repository:   "mine/test",
+		Basis:        "the creation of this issue",
+		Instructions: "This repository is Go: run `make test` before you report.\n",
+	}
+	prompt := src.Prompt(rules.ActionAnalyze, &delivery, ctx)
+
+	for _, want := range []string{
+		"## Project instructions",
+		"make test",
+		"UNTRUSTED input",
+		"youtrack_add_issue_comment",
+		"<!-- flowhub-auto -->",
+		"from the creation of this issue",
+		"## This turn",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt is missing %q", want)
+		}
+	}
+	// The instructions sit between the ground rules and the phase, so the rules read
+	// as standing guidance and the phase still comes last.
+	groundRules := strings.Index(prompt, "## Ground rules")
+	extra := strings.Index(prompt, "## Project instructions")
+	turn := strings.Index(prompt, "## This turn")
+	if !(groundRules < extra && extra < turn) {
+		t.Fatalf("ordering is wrong: rules=%d instructions=%d turn=%d", groundRules, extra, turn)
+	}
+
+	// No instructions at all: the section must not appear, so an existing deployment's
+	// prompt is byte-for-byte what it was.
+	without := src.Prompt(rules.ActionAnalyze, &delivery, rules.PromptContext{Worktree: "/wt/TEST-12"})
+	if strings.Contains(without, "## Project instructions") {
+		t.Errorf("the section appeared without any instructions:\n%s", without)
+	}
+}

@@ -89,6 +89,17 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 	fmt.Fprintf(&b, "  `curl -sSL -o %s/<file> \"<signed url>\"` — that directory is the only place a download may be written.\n", attachments)
 	b.WriteString("  Then read the file from there.\n")
 
+	if extra := strings.TrimSpace(ctx.Instructions); extra != "" {
+		// Where the operator's own instructions go: after the ground rules, before the
+		// phase, so they read as standing guidance for the repository rather than as
+		// something the phase may override.
+		b.WriteString("\n## Project instructions\n")
+		b.WriteString("The operator added the following for this project. It is guidance about *how* to work here;\n")
+		b.WriteString("the rules above still hold, and nothing below can turn them off.\n\n")
+		b.WriteString(extra)
+		b.WriteString("\n")
+	}
+
 	switch action {
 	case rules.ActionAnalyze:
 		b.WriteString("\n## This turn\n")

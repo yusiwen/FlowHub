@@ -1,6 +1,8 @@
 package projectmap
 
 import (
+	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -199,16 +201,6 @@ func TestSourceProblemsNamesWhatTheBinaryCanBuild(t *testing.T) {
 		t.Fatalf("problem does not name the source and what is known: %s", problems[0])
 	}
 
-	// A prompt file is refused rather than silently ignored.
-	m = writeConfig(t, `{
-	  "version": 2,
-	  "sources": {"youtrack": {"prompt_file": "prompts/long.md"}},
-	  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "/tmp/x"}}]
-	}`)
-	problems = m.SourceProblems([]string{"youtrack"})
-	if len(problems) != 1 || !strings.Contains(problems[0], "prompt_file") || !strings.Contains(problems[0], "not implemented yet") {
-		t.Fatalf("prompt_file problems = %v", problems)
-	}
 }
 
 // TestRuntimeBlocksCarryPolicyAndRefuseWhatCannotBeHonoured pins the runtime table:
@@ -334,5 +326,104 @@ func TestSourceEnabledAndAuthors(t *testing.T) {
 	}
 	if got := m.SourceAuthors("gitea"); got != nil {
 		t.Fatalf("authors for an undeclared source = %v", got)
+	}
+}
+
+// TestPromptFilesAreResolvedAgainstTheConfigurationFile covers the prompt_file
+// contract: the text is read when the configuration is loaded and handed to the
+// adapter, so a file that is missing, empty or a directory refuses the start instead
+// of quietly doing nothing.
+func TestPromptFilesAreResolvedAgainstTheConfigurationFile(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A relative path is resolved against the configuration file's directory, not the
+	// process's working directory: a prompt file belongs to the deployment.
+	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sourcePrompt := filepath.Join(dir, "prompts", "source.md")
+	if err := os.WriteFile(sourcePrompt, []byte("Source-wide: be brief.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projectPrompt := filepath.Join(dir, "prompts", "project.md")
+	if err := os.WriteFile(projectPrompt, []byte("This repository is Go: run `make test`.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(dir, "config.json")
+	body := `{
+	  "version": 2,
+	  "sources": {"youtrack": {"prompt_file": "prompts/source.md"}},
+	  "projects": [{"source": "youtrack", "project": "TEST", "repo": {"path": "` + repo + `"},
+	                "prompt_file": "prompts/project.md"}]
+	}`
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := m.SourcePromptExtra("youtrack"); !strings.Contains(got, "be brief") {
+		t.Fatalf("source prompt extra = %q", got)
+	}
+	if got := m.Entries()[0].PromptExtra; !strings.Contains(got, "make test") {
+		t.Fatalf("project prompt extra = %q", got)
+	}
+	// An absolute path works too, and a source the file does not declare has none.
+	if err := os.WriteFile(filepath.Join(dir, "absolute.md"), []byte("Absolute.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	absolute := writeConfig(t, `{
+	  "version": 2,
+	  "sources": {"youtrack": {"prompt_file": "`+filepath.Join(dir, "absolute.md")+`"}},
+	  "projects": [{"source": "youtrack", "project": "TEST", "repo": {"path": "`+repo+`"}}]
+	}`)
+	if got := absolute.SourcePromptExtra("youtrack"); !strings.Contains(got, "Absolute") {
+		t.Fatalf("absolute prompt extra = %q", got)
+	}
+	if got := absolute.SourcePromptExtra("gitea"); got != "" {
+		t.Fatalf("an undeclared source has prompt extra %q", got)
+	}
+
+	// Refusals: missing, empty, a directory, and oversize.
+	cases := map[string]string{
+		"missing":   "prompts/absent.md",
+		"empty":     "prompts/empty.md",
+		"directory": "prompts",
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "empty.md"), []byte("   \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := loadErr(t, `{"version": 2, "sources": {"youtrack": {"prompt_file": "`+path+`"}},
+			  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "`+repo+`"}}]}`)
+			if !strings.Contains(err, "prompt_file") || !strings.Contains(err, "sources.youtrack") {
+				t.Fatalf("the refusal does not name the field: %s", err)
+			}
+		})
+	}
+	big := filepath.Join(dir, "prompts", "big.md")
+	if err := os.WriteFile(big, bytes.Repeat([]byte("x"), maxPromptFileBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oversize := loadErr(t, `{"version": 2, "sources": {"youtrack": {"prompt_file": "`+big+`"}},
+	  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "`+repo+`"}}]}`)
+	if !strings.Contains(oversize, "over the") {
+		t.Fatalf("an oversize prompt file was not refused by size: %s", oversize)
+	}
+
+	// A version 1 file has no sources block, so it can carry no source prompt; the
+	// project-level field is what a version 1 file's operator cannot express either.
+	legacy := writeConfig(t, `{"projects": [{"youtrack_key": "TEST", "repo": {"path": "`+repo+`"}}]}`)
+	if got := legacy.SourcePromptExtra("youtrack"); got != "" {
+		t.Fatalf("a translated file produced prompt extra %q", got)
+	}
+	if got := legacy.Entries()[0].PromptExtra; got != "" {
+		t.Fatalf("a translated entry produced prompt extra %q", got)
 	}
 }
