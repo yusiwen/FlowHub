@@ -40,7 +40,7 @@
       "model": "deepseek/deepseek-v4-flash",
       "_comment_deadline": "One turn's budget on this host. FLOWHUB_TASK_DEADLINE is the outermost default.",
       "deadline": "15m",
-      "_comment_max_concurrent": "Only 1 is accepted. A session belongs to one runtime and a prompt sent to a busy session is silently swallowed, so raising this needs per-task locking that does not exist yet.",
+      "_comment_max_concurrent": "How many distinct TASKS this host may serve at once, 1..64. One task is never in two turns at once: a second delivery for a task already running waits and runs when that turn ends. The host's own claim (its CPU count, reported at init) is a ceiling, so this can only narrow what the host offered. Fixed when the host is first used, so a change needs a restart.",
       "max_concurrent": 1
     }
   },

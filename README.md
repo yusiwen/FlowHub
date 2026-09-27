@@ -393,10 +393,14 @@ configuration is loaded:
   could delete the marker would break the loop prevention that stops FlowHub from
   answering its own replies.
 
-One limit is still deliberate and refused rather than ignored:
-`runtimes.<name>.max_concurrent` accepts only `1` — a session belongs to one runtime
-and a prompt sent to a busy session is silently swallowed, so raising it needs
-per-task locking that does not exist yet.
+`runtimes.<name>.max_concurrent` is how many **distinct tasks** one host may serve
+at the same time, `1` by default and at most `64`. It is not "how many prompts one
+session may get": a task is never in two turns at once, and a second delivery for a
+task already running waits in its host's scheduler and runs when that turn ends. The
+host's own claim (the CPU count it reported at `init`) is a ceiling — the effective
+breadth is the smaller of the two — so a file cannot make a host take more than it
+said it could. The breadth is fixed when a host is first used, so a change takes
+effect after a restart.
 
 ### Which host runs the work
 
@@ -411,15 +415,19 @@ project:
 
 | Policy | Rule |
 | --- | --- |
-| `spread` (default) | Fewest turns in flight, then fewest non-terminal tasks in the registry, then name order — so a second machine is used instead of sitting idle |
+| `spread` (default) | A host with a free worker first, then fewest deliveries committed (queued or running), then fewest non-terminal tasks in the registry, then name order — so a second machine is used instead of sitting idle |
 | `first-healthy` | The first name in the declared order that answers, so the rest are failover |
 
 Every tie-break is deterministic, and the choice is logged with the numbers it was
 made from:
 
 ```
-msg="runtime chosen" runtime=builder-tmp policy=spread eligible=2 in_flight=0 active_tasks=1 candidates=builder-tmp,builder-b
+msg="runtime chosen" runtime=builder-tmp policy=spread eligible=2 busy=0 running=0 max_concurrent=2 in_flight=0 active_tasks=1 candidates=builder-tmp,builder-b
 ```
+
+A host that is already at its `max_concurrent` is still a candidate — the delivery
+waits in its scheduler rather than being refused — but a host that can start a turn
+now is preferred, so raising the breadth actually uses it.
 
 **A task that is already bound goes to its own runtime, always**, whatever the
 policy says and whatever the project's eligibility set has become since. Failover
@@ -473,7 +481,7 @@ even though YouTrack knows the answer. Measured evidence:
 | `runtime` / `runtimes` | The eligibility set for a new task. A name that is not a runtime name (`^[a-z0-9][a-z0-9._-]{0,62}$`) is refused when the file is loaded, because it could never be enrolled |
 | `runtime_policy` | `spread` or `first-healthy`, per project or for the whole file; anything else is refused at load |
 | `sources.<name>` | `enabled`, the trigger `policy`, an author allowlist a project may narrow, and `prompt_file` (extra instructions, appended — see below) |
-| `runtimes.<name>` | `url`, `auth` (a username plus the *name* of the variable holding the password), `agent`, `model`, `deadline`, `max_concurrent` (only `1`) |
+| `runtimes.<name>` | `url`, `auth` (a username plus the *name* of the variable holding the password), `agent`, `model`, `deadline`, `max_concurrent` (`1`..`64`, how many distinct tasks the host may serve at once) |
 
 ### Startup validation (fail-closed)
 
@@ -487,7 +495,7 @@ before any file is created:
 * a `source` this binary cannot build (the error lists the adapters it knows);
 * a `prompt_file` that is missing, empty, a directory, or over 32 KiB;
 * a `runtimes.<name>` block that cannot be honoured: a URL that is not http(s), a
-  `max_concurrent` other than `1`, an unparsable `deadline`, a user without a
+  `max_concurrent` outside `1..64`, an unparsable `deadline`, a user without a
   `password_env` (or the reverse), or a `password_env` naming an empty variable;
 * a duplicate `(source, project)`, or an `agent` name that is not a plain
   identifier, or a `model` that is not spelled `provider/model-id`;
@@ -638,14 +646,16 @@ therefore cannot walk into another task's checkout, and the dispatcher refuses t
 reuse a session when the routing table now points at a different repository than
 the task was created against.
 
-Turns are serialized **per runtime**, not per process. The reason a session cannot
-be prompted twice at once is that a busy session silently swallows the second
-prompt — and a session belongs to one runtime for life, so the runtime is the right
-unit: an intake loop decides which runtime takes a delivery and hands it to that
-runtime's own queue, and each runtime runs its turns with a single worker. Two
-runtimes therefore work in parallel, one runtime still works one task at a time,
-and `FLOWHUB_DISPATCH_QUEUE` bounds each queue (a full queue drops, it never
-blocks the publisher).
+Turns are serialized **per task**, and the runtime is a *capacity* rather than a
+lock. The reason a session cannot be prompted twice at once is that a busy session
+silently swallows the second prompt, and a task owns exactly one session for life,
+so the task is the unit: an intake loop decides which runtime takes a delivery
+(once per task, so one issue cannot be handed to two hosts), and each runtime's
+scheduler groups the deliveries routed to it by task and serves up to
+`max_concurrent` *different* tasks with that many workers. A second delivery for a
+task already running waits, is not dropped, and is judged against the state the
+previous turn left. Two runtimes work in parallel, and `FLOWHUB_DISPATCH_QUEUE`
+bounds each runtime (a full runtime drops, it never blocks the publisher).
 
 ### The agent definition
 
@@ -716,8 +726,10 @@ store the secret. `TestRedactionNeverEchoesAnUnrecognisedKey` pins it.
   no credential.
 * `FLOWHUB_DISPATCH=0` and a restart.
 * `GET /healthz` shows `dispatch.{queued,handled,ignored,dropped,paused,agent}`
-  plus a per-runtime view (`runtimes.<name>.{queued,in_flight,depth,last_error}`),
-  so "which host is stuck" is one call; `-print-config` prints the effective policy.
+  plus a per-runtime view
+  (`runtimes.<name>.{queued,running,tasks,busy,in_flight,max_concurrent,last_error}`),
+  so "which host is stuck, and is it using the breadth it was given" is one call;
+  `-print-config` prints the effective policy.
 
 ## Endpoints
 

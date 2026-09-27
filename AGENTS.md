@@ -101,7 +101,7 @@ internal/agent/opencode/  the opencode implementation: client, arbiter, session 
 internal/workspace/   the workspace seam: Workspace, Handle, Base, Validator
 internal/workspace/localworktree/  one git worktree per task, baseline pinned through the origin
 internal/rules/     trigger policy over the neutral event (ignore/analyze/plan/execute) and the reply basis
-internal/dispatch/  the worker: intake loop, one queue+worker per runtime, routing, workspace hand-off, session, registry, audit
+internal/dispatch/  the worker: intake loop, one task scheduler per runtime, routing, workspace hand-off, session, registry, audit
 internal/provision/ data-plane host prep: `flowhub runtime init [--check]`, `doctor --push`, `uninstall` (capability report, embedded artifacts, manifest, runtime identity, heartbeat)
 internal/runtimes/  control plane: runtime inventory, states, invites, secrets (hashes only), `/control/v1` admin API and the `invite`/`list`/`show`/`remove`/`rotate` CLI
 internal/dedupe/    TTL idempotency cache
@@ -224,12 +224,18 @@ documents. The rules below are load-bearing; do not relax them casually.
    says so. The dispatcher refuses to reuse a
    session when the routing table now points at a different repository than the
    task was created against, and it never falls back to the shared checkout.
-   **The unit of serialization is the runtime, not the process**: an intake loop
-   decides which runtime takes a delivery and hands it to that runtime's own queue,
-   where its own single worker runs the turns. A prompt sent to a busy session is
-   silently swallowed, and a session belongs to one runtime for life — so different
-   runtimes run turns in parallel while one runtime still runs them one at a time.
-   `max_concurrent` stays 1 until per-task locking exists.
+   **The unit of serialization is the task, and the runtime is its capacity**: an
+   intake loop decides which runtime takes a delivery and hands it to that runtime's
+   scheduler, which groups the deliveries by task and serves up to
+   `runtimes.<name>.max_concurrent` *distinct* tasks at once (default 1, at most 64,
+   and never more than the host claimed at `init`). A task is never in two turns at
+   once — a prompt sent to a busy session is silently swallowed, and a session belongs
+   to one task for life — so a second delivery for a running task waits in its
+   scheduler and runs when that turn ends; it is never dropped and never races the
+   first. The routing decision is made once per task burst and remembered until that
+   task's work drains, so two deliveries of one issue cannot reach two hosts. Do not
+   replace the scheduler with a per-task mutex taken after dequeueing: that parks a
+   worker on another task's turn (`internal/dispatch/schedule.go`, ADR 0003).
 10. **The agent's reply must never start another turn.** Our own comments are
     recognised by content, because the agent posts as the same YouTrack user as
     the human. Three independent layers: the `<!-- flowhub-auto -->` marker in the

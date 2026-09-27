@@ -1,8 +1,61 @@
 # ADR 0003 — Per-task scheduling, and what `max_concurrent` may mean
 
-**Status:** Proposed, with the implementation written in the same change (2026-09-27).
-The body below is the design as it was written **before** the code; the header records
-what actually landed and every departure from the sketch.
+**Status:** Proposed, **implemented** (2026-09-27). The body below is the design as it
+was written **before** the code; what landed, what it measured, and every departure from
+the sketch are recorded here.
+
+Landed in one change, in the order the migration plan lists: `internal/dispatch/schedule.go`
+(the scheduler — pending per task, a ready FIFO, a running set, a one-slot wake token, up
+to `max_concurrent` workers); the routing memo in the dispatcher (intake decides once per
+task burst, and `forgetRoute` drops the entry when that task's work drains);
+`enqueue`/`workScheduled` in place of the per-runtime channel and its single worker; the
+counters and the ranking read from the scheduler (`busy` = queued + running, the new
+`running`, `tasks` and `max_concurrent` keys in `/healthz`, and `spread` ordered by "has a
+free worker" first); `internal/projectmap` accepting `1..64` and carrying the value into
+`DeclaredRuntime`; `internal/provision` claiming the host's CPU count as its ceiling; and
+the `turn started` log line. The environment-configured runtime (`FLOWHUB_OPENCODE_URL`
+with no file block) keeps a breadth of 1, because only the file declares one.
+
+Four departures from the sketch, each found while implementing or measuring it:
+
+* **The breadth is read once and then read back from the scheduler.** `rankRuntimes` asks
+  `breadthFor`, which returns the number the host's scheduler was started with when there
+  is one. Recomputing it from the configuration on every routing decision could disagree
+  with the worker count actually in force after a re-enrolment raised or lowered the
+  claim; one number with one source is worth the extra accessor.
+* **`/healthz` counts *tasks*, and the first version counted them twice.** It summed the
+  running set and the pending map, so a task with a turn running *and* a delivery waiting
+  was reported as two tasks. The live run showed `"tasks": 2` for `TEST-9003`, which is
+  one task; the union is what the key means now, and the unit test asserts it.
+* **The wake token is a one-slot, non-blocking send rather than a condition variable.**
+  The reason a lost token cannot strand work is written next to it: a full slot means a
+  token exists, whoever consumes it looks for work after consuming it, and the work that
+  was signalled was added before the drop.
+* **The queue bound stayed per runtime** (`Options.QueueSize`), as §4 says, and the unit
+  test pins the consequence: handing a delivery to a worker frees its place in the bound
+  exactly as dequeuing from the channel it replaced did, while `busy` keeps counting the
+  turn until it finishes.
+
+**Measured** (2026-09-27, live, `runtimes.builder-tmp.max_concurrent: 2` on an enrolled
+host with no claim of its own, `-print-config` reporting `max_concurrent=2 (level:
+runtimes.builder-tmp)`). Two new tasks posted back to back: both `turn started` lines
+9 ms apart on `builder-tmp`, `/healthz` reporting
+`{"busy":2,"in_flight":2,"max_concurrent":2,"queued":0,"running":2,"tasks":2}` for the
+whole 13 s they overlapped, and two separate opencode sessions each finishing `true`.
+Two deliveries for one task, the second sent while the first turn was running: `/healthz`
+held at `{"queued":1,"running":1,"tasks":1,"in_flight":1}` — one task, one turn, the
+second delivery waiting and not dropped — and the second turn then started 8 ms after the
+first finished, on the same session, with `continued=true` in the opencode log. The suite
+is green (`make clean && make build && make fmt-check && make lint && make staticcheck &&
+make test && make test-race && make smoke`, exit 0, `SMOKE PASSED`, 15 packages under both
+the normal and the race build), and no probe leaked the URL key or the token into the data
+directory (a grep for both values over it returns nothing; the audit log shows
+`hooks/youtrack/***`). The three probe issues were `TEST-9001`…`TEST-9003`, which do not
+exist in the tracker: every turn therefore finished with `replied=false`, because the
+agent's `youtrack_add_issue_comment` call has no issue to comment on. That says nothing
+about the scheduler — the turns ran, overlapped and finished — and the reply path itself
+was verified in the earlier steps (`TEST-36`, `replied=true`).
+
 
 ## Context
 
