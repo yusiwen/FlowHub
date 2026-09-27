@@ -202,7 +202,7 @@ func TestSpreadBalancesNewTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, key := range []string{"TEST-1", "TEST-2"} {
-		if _, _, err := reg.Ensure(key, func(task *registry.Task) {
+		if _, _, err := reg.Ensure(youtrack.SourceName, key, func(task *registry.Task) {
 			task.Runtime = "builder-a"
 			task.State = registry.StateAnalyzing
 		}); err != nil {
@@ -237,7 +237,7 @@ func TestFirstHealthyKeepsTheDeclaredOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := reg.Ensure("TEST-1", func(task *registry.Task) {
+	if _, _, err := reg.Ensure(youtrack.SourceName, "TEST-1", func(task *registry.Task) {
 		task.Runtime = "builder-a"
 		task.State = registry.StateExecuting
 	}); err != nil {

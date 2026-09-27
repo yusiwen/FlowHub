@@ -373,7 +373,7 @@ func (d *Dispatcher) routeOne(ctx context.Context, rec *store.Record) (routed, b
 		return routed{}, false
 	}
 
-	task, _ := d.opts.Registry.Get(rec.IssueID)
+	task, _ := d.opts.Registry.Get(d.opts.Source.Name(), rec.IssueID)
 	if name := strings.TrimSpace(task.Runtime); name != "" {
 		binding, ok := d.bindingFor(name)
 		if !ok {
@@ -540,7 +540,7 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		return
 	}
 
-	task, known := d.opts.Registry.Get(rec.IssueID)
+	task, known := d.opts.Registry.Get(d.opts.Source.Name(), rec.IssueID)
 	taskView := rules.TaskView{Known: known}
 	if known {
 		taskView.Plan = task.Plan
@@ -610,7 +610,7 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 	}
 
 	if !known {
-		created, _, err := d.opts.Registry.Ensure(rec.IssueID, func(t *registry.Task) {
+		created, _, err := d.opts.Registry.Ensure(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
 			t.Repo = entry.Repo.Path
 			t.Runtime = binding.Name
 			t.Agent = runtimeAgent(entry, binding, d.opts.Agent)
@@ -626,7 +626,7 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 	// An existing row written before runtimes were recorded still gets its
 	// binding, so the removal check has something to compare.
 	if task.Runtime == "" {
-		if task, err := d.opts.Registry.Update(rec.IssueID, func(t *registry.Task) {
+		if task, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
 			t.Runtime = binding.Name
 		}); err == nil {
 			task.Runtime = binding.Name
@@ -686,7 +686,7 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 	if err != nil {
 		return registry.Task{}, err
 	}
-	return d.opts.Registry.Update(rec.IssueID, func(t *registry.Task) {
+	return d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
 		t.Worktree = prepared.Path
 		t.Repo = prepared.Repo
 		if t.BaseCommit == "" {
@@ -890,7 +890,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		plan = registry.PlanDraft
 	}
 
-	if _, err := d.opts.Registry.Update(rec.IssueID, func(t *registry.Task) {
+	if _, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
 		if result.SessionID != "" {
 			t.SessionID = result.SessionID
 		}

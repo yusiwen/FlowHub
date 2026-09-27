@@ -289,7 +289,7 @@ func TestIssueCreatedRunsAReadOnlyAnalysisTurn(t *testing.T) {
 		t.Fatal("edit must be gated with ask so the phase can decide")
 	}
 
-	task, ok := reg.Get("TEST-40")
+	task, ok := reg.Get(youtrack.SourceName, "TEST-40")
 	if !ok {
 		t.Fatal("the task was not recorded")
 	}
@@ -342,7 +342,7 @@ func TestSecondEventContinuesTheSameSessionAndWorktree(t *testing.T) {
 		t.Fatalf("the second prompt is not an execution prompt:\n%s", fake.prompts[1])
 	}
 
-	task, ok := reg.Get("TEST-41")
+	task, ok := reg.Get(youtrack.SourceName, "TEST-41")
 	if !ok {
 		t.Fatal("task missing")
 	}
@@ -360,7 +360,7 @@ func TestOurOwnReplyDoesNotStartAnotherTurn(t *testing.T) {
 	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
 
 	dispatcher.handle(context.Background(), delivery("TEST-42", "issueCreated", issueCreatedBody("TEST-42")))
-	task, _ := reg.Get("TEST-42")
+	task, _ := reg.Get(youtrack.SourceName, "TEST-42")
 
 	ownComment := `{"event":"commentAdded","id":"TEST-42","summary":"s","description":"d",` +
 		`"project":{"key":"TEST","name":"TEST","shortName":"TEST"},` +
@@ -373,7 +373,7 @@ func TestOurOwnReplyDoesNotStartAnotherTurn(t *testing.T) {
 	if len(fake.prompts) != 1 {
 		t.Fatalf("our own reply started another turn (%d prompts)", len(fake.prompts))
 	}
-	after, _ := reg.Get("TEST-42")
+	after, _ := reg.Get(youtrack.SourceName, "TEST-42")
 	if after.Turns != task.Turns {
 		t.Fatalf("turns changed from %d to %d", task.Turns, after.Turns)
 	}
@@ -474,7 +474,7 @@ func TestTurnWithoutAReplyIsRecordedAsSuch(t *testing.T) {
 
 	dispatcher.handle(context.Background(), delivery("TEST-46", "issueCreated", issueCreatedBody("TEST-46")))
 
-	task, ok := reg.Get("TEST-46")
+	task, ok := reg.Get(youtrack.SourceName, "TEST-46")
 	if !ok {
 		t.Fatal("the task was not recorded")
 	}
@@ -545,7 +545,7 @@ func TestAuthorAllowlistBlocksEveryoneElse(t *testing.T) {
 	if sessions != 0 {
 		t.Fatalf("sessions = %d, want none for an actor outside the allowlist", sessions)
 	}
-	if _, ok := reg.Get("TEST-52"); ok {
+	if _, ok := reg.Get(youtrack.SourceName, "TEST-52"); ok {
 		t.Fatal("a blocked delivery must not create a task")
 	}
 
@@ -585,7 +585,7 @@ func TestTaskRecordsThePinnedBaseline(t *testing.T) {
 	dispatcher.handle(context.Background(), delivery("TEST-41", "issueCreated", issueCreatedBody("TEST-41")))
 
 	head := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
-	task, ok := reg.Get("TEST-41")
+	task, ok := reg.Get(youtrack.SourceName, "TEST-41")
 	if !ok {
 		t.Fatal("no registry row for the task")
 	}
@@ -603,7 +603,7 @@ func TestTaskRecordsThePinnedBaseline(t *testing.T) {
 		t.Fatalf("the test moved HEAD unexpectedly: %s != %s", commit, head)
 	}
 	dispatcher.handle(context.Background(), delivery("TEST-41", "issueCreated", issueCreatedBody("TEST-41")))
-	after, _ := reg.Get("TEST-41")
+	after, _ := reg.Get(youtrack.SourceName, "TEST-41")
 	if after.BaseCommit != head {
 		t.Fatalf("base_commit changed to %q on a later turn", after.BaseCommit)
 	}
@@ -634,7 +634,7 @@ func TestATextlessTurnKeepsTheRecordedReply(t *testing.T) {
 	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
 
 	dispatcher.handle(context.Background(), delivery("TEST-42", "issueCreated", issueCreatedBody("TEST-42")))
-	first, _ := reg.Get("TEST-42")
+	first, _ := reg.Get(youtrack.SourceName, "TEST-42")
 	if first.LastReply == "" {
 		t.Fatal("the first turn recorded no reply")
 	}
@@ -644,7 +644,7 @@ func TestATextlessTurnKeepsTheRecordedReply(t *testing.T) {
 	fake.mu.Unlock()
 	dispatcher.handle(context.Background(), delivery("TEST-42", "issueCreated", issueCreatedBody("TEST-42")))
 
-	second, _ := reg.Get("TEST-42")
+	second, _ := reg.Get(youtrack.SourceName, "TEST-42")
 	if second.LastReply != first.LastReply {
 		t.Fatalf("last reply = %q, want the previous %q", second.LastReply, first.LastReply)
 	}
@@ -747,8 +747,8 @@ func TestRuntimesRunTurnsInParallel(t *testing.T) {
 	})
 
 	// The two tasks landed on different runtimes, which is what spread promised.
-	first, _ := reg.Get("TEST-50")
-	second, _ := reg.Get("TEST-51")
+	first, _ := reg.Get(youtrack.SourceName, "TEST-50")
+	second, _ := reg.Get(youtrack.SourceName, "TEST-51")
 	if first.Runtime == "" || second.Runtime == "" || first.Runtime == second.Runtime {
 		t.Fatalf("runtimes = %q and %q, want two different hosts", first.Runtime, second.Runtime)
 	}
@@ -796,7 +796,7 @@ func TestRouteRefusesABoundTaskWhoseRuntimeIsGone(t *testing.T) {
 	dispatcher, reg := newScheduledDispatcher(t, fake, server, `,"runtime":"builder-a"`)
 
 	// A task bound to a runtime this process does not have: the row outlives the host.
-	if _, _, err := reg.Ensure("TEST-54", func(task *registry.Task) {
+	if _, _, err := reg.Ensure(youtrack.SourceName, "TEST-54", func(task *registry.Task) {
 		task.Runtime = "builder-gone"
 		task.State = registry.StateAnalyzing
 	}); err != nil {

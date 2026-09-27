@@ -622,7 +622,9 @@ lost), and the anchored trigger.
 
 ### The task registry and the worktree
 
-One task is one YouTrack issue. The registry
+One task is one tracker item, identified by its source *and* its key — a YouTrack
+`TEST-17` and another tracker's `TEST-17` are two tasks, with two sessions, and an
+update can only touch its own. The registry
 (`<DataDir>/registry.jsonl`, append-only) records, per task: the repository, the
 worktree, the opencode session id, the agent, the state, the plan state, the
 number of turns, the accumulated cost, and the agent's last reply text. State

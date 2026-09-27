@@ -22,7 +22,7 @@ func TestOpenOnAMissingFileIsEmptyNotAnError(t *testing.T) {
 	if r.Len() != 0 {
 		t.Fatalf("Len = %d, want 0", r.Len())
 	}
-	if _, ok := r.Get("TEST-1"); ok {
+	if _, ok := r.Get(DefaultSource, "TEST-1"); ok {
 		t.Fatal("an empty registry returned a task")
 	}
 }
@@ -30,10 +30,10 @@ func TestOpenOnAMissingFileIsEmptyNotAnError(t *testing.T) {
 func TestPutGetUpdateAndList(t *testing.T) {
 	r := openTest(t, filepath.Join(t.TempDir(), "registry.jsonl"))
 
-	if err := r.Put(Task{Key: "TEST-1", Repo: "/repo", SessionID: "ses_1", State: StateAnalyzing, Plan: PlanNone}); err != nil {
+	if err := r.Put(Task{Source: DefaultSource, Key: "TEST-1", Repo: "/repo", SessionID: "ses_1", State: StateAnalyzing, Plan: PlanNone}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	task, ok := r.Get("TEST-1")
+	task, ok := r.Get(DefaultSource, "TEST-1")
 	if !ok {
 		t.Fatal("Get did not find the task")
 	}
@@ -44,7 +44,7 @@ func TestPutGetUpdateAndList(t *testing.T) {
 		t.Fatal("timestamps were not stamped")
 	}
 
-	updated, err := r.Update("TEST-1", func(t *Task) {
+	updated, err := r.Update(DefaultSource, "TEST-1", func(t *Task) {
 		t.State = StateAwaitingInput
 		t.Plan = PlanDraft
 		t.Turns = 1
@@ -59,11 +59,11 @@ func TestPutGetUpdateAndList(t *testing.T) {
 		t.Fatal("Update dropped CreatedAt")
 	}
 
-	if _, err := r.Update("NOPE", func(*Task) {}); !errors.Is(err, ErrTaskNotFound) {
+	if _, err := r.Update(DefaultSource, "NOPE", func(*Task) {}); !errors.Is(err, ErrTaskNotFound) {
 		t.Fatalf("Update on an unknown task = %v, want ErrTaskNotFound", err)
 	}
 
-	if err := r.Put(Task{Key: "TEST-2", Repo: "/repo2", State: StateDone, Plan: PlanConfirmed}); err != nil {
+	if err := r.Put(Task{Source: DefaultSource, Key: "TEST-2", Repo: "/repo2", State: StateDone, Plan: PlanConfirmed}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if got := len(r.List()); got != 2 {
@@ -75,7 +75,8 @@ func TestStateSurvivesARestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.jsonl")
 	first := openTest(t, path)
 	if err := first.Put(Task{
-		Key: "TEST-9", Repo: "/repo", Worktree: "/wt/TEST-9", SessionID: "ses_9",
+		Source: DefaultSource,
+		Key:    "TEST-9", Repo: "/repo", Worktree: "/wt/TEST-9", SessionID: "ses_9",
 		Agent: "devops", State: StateExecuting, Plan: PlanConfirmed, Turns: 3, Cost: 0.25,
 		LastReply: "the analysis text",
 	}); err != nil {
@@ -83,7 +84,7 @@ func TestStateSurvivesARestart(t *testing.T) {
 	}
 	// Update is the partial-change API: it must not clear the fields the first
 	// write established.
-	if _, err := first.Update("TEST-9", func(task *Task) {
+	if _, err := first.Update(DefaultSource, "TEST-9", func(task *Task) {
 		task.State = StateDone
 		task.Turns = 4
 	}); err != nil {
@@ -91,7 +92,7 @@ func TestStateSurvivesARestart(t *testing.T) {
 	}
 
 	reopened := openTest(t, path)
-	task, ok := reopened.Get("TEST-9")
+	task, ok := reopened.Get(DefaultSource, "TEST-9")
 	if !ok {
 		t.Fatal("the task did not survive a reopen")
 	}
@@ -111,13 +112,13 @@ func TestStateSurvivesARestart(t *testing.T) {
 // caller that wants to change one field must use Update instead.
 func TestPutReplacesTheWholeSnapshot(t *testing.T) {
 	r := openTest(t, filepath.Join(t.TempDir(), "registry.jsonl"))
-	if err := r.Put(Task{Key: "A", Repo: "/repo", SessionID: "ses_1", Agent: "devops", Turns: 2}); err != nil {
+	if err := r.Put(Task{Source: DefaultSource, Key: "A", Repo: "/repo", SessionID: "ses_1", Agent: "devops", Turns: 2}); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Put(Task{Key: "A", State: StateDone}); err != nil {
+	if err := r.Put(Task{Source: DefaultSource, Key: "A", State: StateDone}); err != nil {
 		t.Fatal(err)
 	}
-	task, _ := r.Get("A")
+	task, _ := r.Get(DefaultSource, "A")
 	if task.Repo != "" || task.SessionID != "" || task.Agent != "" || task.Turns != 0 {
 		t.Fatalf("Put merged instead of replacing: %+v", task)
 	}
@@ -129,7 +130,7 @@ func TestPutReplacesTheWholeSnapshot(t *testing.T) {
 func TestEnsureCreatesOnlyOnce(t *testing.T) {
 	r := openTest(t, filepath.Join(t.TempDir(), "registry.jsonl"))
 
-	task, created, err := r.Ensure("TEST-4", func(t *Task) { t.Repo = "/repo"; t.Agent = "devops" })
+	task, created, err := r.Ensure(DefaultSource, "TEST-4", func(t *Task) { t.Repo = "/repo"; t.Agent = "devops" })
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
@@ -137,7 +138,7 @@ func TestEnsureCreatesOnlyOnce(t *testing.T) {
 		t.Fatalf("task = %+v created=%t", task, created)
 	}
 
-	again, created, err := r.Ensure("TEST-4", func(t *Task) { t.Repo = "/other" })
+	again, created, err := r.Ensure(DefaultSource, "TEST-4", func(t *Task) { t.Repo = "/other" })
 	if err != nil {
 		t.Fatalf("second Ensure: %v", err)
 	}
@@ -155,10 +156,10 @@ func TestEnsureCreatesOnlyOnce(t *testing.T) {
 func TestFilePermissionsAndSingleLinePerPut(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.jsonl")
 	r := openTest(t, path)
-	if err := r.Put(Task{Key: "A", State: StateDone}); err != nil {
+	if err := r.Put(Task{Source: DefaultSource, Key: "A", State: StateDone}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Update("A", func(t *Task) { t.Turns = 1 }); err != nil {
+	if _, err := r.Update(DefaultSource, "A", func(t *Task) { t.Turns = 1 }); err != nil {
 		t.Fatal(err)
 	}
 
@@ -198,5 +199,93 @@ func TestCorruptLineIsAnError(t *testing.T) {
 func TestOpenRequiresAPath(t *testing.T) {
 	if _, err := Open("  "); err == nil {
 		t.Fatal("want an error for an empty path")
+	}
+}
+
+// TestTasksAreIndexedBySourceAndKey is ADR 0001 open question 4, decided: two
+// trackers may have a project with the same key, and a task must never be continued
+// on the wrong one. The registry's index is (source, key), so the same key in two
+// sources is two tasks with two sessions.
+func TestTasksAreIndexedBySourceAndKey(t *testing.T) {
+	r := openTest(t, filepath.Join(t.TempDir(), "registry.jsonl"))
+
+	if err := r.Put(Task{Source: "youtrack", Key: "TEST-17", Repo: "/repo/one",
+		SessionID: "ses_youtrack", State: StateAnalyzing, Plan: PlanNone}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := r.Put(Task{Source: "gitea", Key: "TEST-17", Repo: "/repo/two",
+		SessionID: "ses_gitea", State: StateAnalyzing, Plan: PlanNone}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if r.Len() != 2 {
+		t.Fatalf("Len = %d, want two tasks", r.Len())
+	}
+
+	left, ok := r.Get("youtrack", "TEST-17")
+	if !ok || left.SessionID != "ses_youtrack" || left.Repo != "/repo/one" {
+		t.Fatalf("youtrack task = %+v", left)
+	}
+	right, ok := r.Get("gitea", "TEST-17")
+	if !ok || right.SessionID != "ses_gitea" || right.Repo != "/repo/two" {
+		t.Fatalf("gitea task = %+v", right)
+	}
+	// A source that never wrote the key has no task, which is what keeps an unknown
+	// tracker from adopting another one's session.
+	if _, ok := r.Get("drone", "TEST-17"); ok {
+		t.Fatal("an unrelated source found a task it never wrote")
+	}
+	// The source is part of the identity a caller writes down.
+	if left.Qualified() != "youtrack:TEST-17" || right.Qualified() != "gitea:TEST-17" {
+		t.Fatalf("Qualified = %q / %q", left.Qualified(), right.Qualified())
+	}
+	// A partial update touches only its own task.
+	if _, err := r.Update("gitea", "TEST-17", func(task *Task) { task.Turns = 3 }); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	left, _ = r.Get("youtrack", "TEST-17")
+	right, _ = r.Get("gitea", "TEST-17")
+	if left.Turns != 0 || right.Turns != 3 {
+		t.Fatalf("turns after a gitea update: youtrack=%d gitea=%d", left.Turns, right.Turns)
+	}
+	// A task with no source is a caller bug, not a task: refusing it here is what
+	// keeps an anonymous row from colliding with every source at once.
+	if err := r.Put(Task{Key: "TEST-18"}); err == nil {
+		t.Fatal("Put accepted a task without a source")
+	}
+}
+
+// TestAPreSeamRowIsReadAsYouTrack is the migration: the registry on disk has rows
+// written before the source seam existed, and they must keep working. Reading one as
+// YouTrack is what it meant when it was written; the field is added the next time the
+// task is written, so the file migrates as it is used rather than being rewritten.
+func TestAPreSeamRowIsReadAsYouTrack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.jsonl")
+	legacy := `{"task_key":"TEST-20","repo":"/repo/old","session_id":"ses_old","state":"awaiting_input","plan_state":"draft"}`
+	if err := os.WriteFile(path, []byte(legacy+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := openTest(t, path)
+
+	task, ok := r.Get("youtrack", "TEST-20")
+	if !ok {
+		t.Fatal("a pre-seam row was not readable as YouTrack")
+	}
+	if task.Source != DefaultSource || task.SessionID != "ses_old" {
+		t.Fatalf("task = %+v", task)
+	}
+	if task.Qualified() != "youtrack:TEST-20" {
+		t.Fatalf("Qualified = %q", task.Qualified())
+	}
+	if _, ok := r.Get("gitea", "TEST-20"); ok {
+		t.Fatal("a pre-seam row answered for a source that did not exist then")
+	}
+
+	// The next write carries the source, so the row is migrated by use.
+	if _, err := r.Update("youtrack", "TEST-20", func(task *Task) { task.Turns++ }); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	task, _ = r.Get("youtrack", "TEST-20")
+	if task.Source != DefaultSource {
+		t.Fatalf("the written row has source %q, want %q", task.Source, DefaultSource)
 	}
 }

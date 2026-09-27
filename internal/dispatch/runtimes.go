@@ -364,7 +364,7 @@ func (d *Dispatcher) boundTasksFor(name string) []string {
 		case registry.StateDone, registry.StateFailed:
 			continue
 		}
-		out = append(out, task.Key)
+		out = append(out, task.Qualified())
 	}
 	sort.Strings(out)
 	return out

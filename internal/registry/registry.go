@@ -53,10 +53,24 @@ const (
 	PlanConfirmed PlanState = "confirmed"
 )
 
-// Task is one YouTrack issue being worked on.
+// DefaultSource is the source a row written before the source seam is attributed
+// to.
+//
+// It is a fact about history rather than a preference of this package: every row in
+// an existing registry was produced by the only adapter FlowHub had, so reading such
+// a row as YouTrack is what it meant when it was written. The field is added to the
+// row the next time it is written, so the file migrates as it is used rather than
+// being rewritten.
+const DefaultSource = "youtrack"
+
+// Task is one tracker item being worked on.
 type Task struct {
-	Key  string `json:"task_key"`
-	Repo string `json:"repo"`
+	// Source names the adapter this task belongs to, e.g. "youtrack". Together with
+	// Key it is the task's identity: two trackers may well have a project with the
+	// same key, and a task must never be continued on the wrong one.
+	Source string `json:"source,omitempty"`
+	Key    string `json:"task_key"`
+	Repo   string `json:"repo"`
 	// Runtime is the agent host this task is bound to. A session cannot move
 	// between hosts, so the binding is for the task's life: a task whose runtime is
 	// gone is refused rather than re-homed. Empty means "not yet chosen".
@@ -78,7 +92,7 @@ type Task struct {
 	Turns int     `json:"turns"`
 	Cost  float64 `json:"cost"`
 	// LastReply is the last assistant text we saw for this task. The agent posts
-	// its replies through an MCP server as the same YouTrack user as the human, so
+	// its replies through an MCP server as the same tracker user as the human, so
 	// identity cannot separate them: a comment that repeats this text is
 	// recognised as our own by content instead.
 	LastReply string    `json:"last_reply,omitempty"`
@@ -87,10 +101,31 @@ type Task struct {
 }
 
 // Registry is a concurrency-safe, file-backed task table.
+//
+// Tasks are indexed by (source, key), so a YouTrack `TEST-17` and a Gitea
+// `owner/repo#42` — or a Gitea project that also happens to be called TEST — are
+// different tasks. The index key never appears in the file: the file keeps `source`
+// and `task_key` as separate fields, which is what makes a row readable and the
+// migration from a pre-seam row trivial.
 type Registry struct {
 	path  string
 	mu    sync.Mutex
 	tasks map[string]*Task
+}
+
+// indexKey is the map key for one task. The separator cannot appear in a source name
+// or a task key, so no pair can collide with another.
+func indexKey(source, key string) string {
+	return strings.ToLower(strings.TrimSpace(source)) + "\x00" + key
+}
+
+// Qualified renders the task's identity the way an operator writes it, for a log or
+// the control API. Falls back to the bare key for a row with no source.
+func (t Task) Qualified() string {
+	if strings.TrimSpace(t.Source) == "" {
+		return t.Key
+	}
+	return t.Source + ":" + t.Key
 }
 
 // ErrTaskNotFound is returned by Update for an unknown task.
@@ -125,10 +160,10 @@ func (r *Registry) Len() int {
 }
 
 // Get returns a copy of one task.
-func (r *Registry) Get(key string) (Task, bool) {
+func (r *Registry) Get(source, key string) (Task, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	task, ok := r.tasks[key]
+	task, ok := r.tasks[indexKey(source, key)]
 	if !ok {
 		return Task{}, false
 	}
@@ -154,6 +189,9 @@ func (r *Registry) List() []Task {
 func (r *Registry) Put(task Task) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if strings.TrimSpace(task.Source) == "" {
+		return errors.New("registry: task source is required")
+	}
 	if strings.TrimSpace(task.Key) == "" {
 		return errors.New("registry: task key is required")
 	}
@@ -162,18 +200,18 @@ func (r *Registry) Put(task Task) error {
 	}
 	task.UpdatedAt = time.Now().UTC()
 	stored := task
-	r.tasks[task.Key] = &stored
+	r.tasks[indexKey(task.Source, task.Key)] = &stored
 	return r.append(task)
 }
 
 // Update applies mutate to the stored task and saves the result. It is the only
 // way to change a task, so every write goes through one code path.
-func (r *Registry) Update(key string, mutate func(*Task)) (Task, error) {
+func (r *Registry) Update(source, key string, mutate func(*Task)) (Task, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	task, ok := r.tasks[key]
+	task, ok := r.tasks[indexKey(source, key)]
 	if !ok {
-		return Task{}, fmt.Errorf("%w: %s", ErrTaskNotFound, key)
+		return Task{}, fmt.Errorf("%w: %s:%s", ErrTaskNotFound, source, key)
 	}
 	mutate(task)
 	task.UpdatedAt = time.Now().UTC()
@@ -185,11 +223,11 @@ func (r *Registry) Update(key string, mutate func(*Task)) (Task, error) {
 }
 
 // Ensure returns the task, creating it with the given seed when it is unknown.
-func (r *Registry) Ensure(key string, seed func(*Task)) (Task, bool, error) {
-	if task, ok := r.Get(key); ok {
+func (r *Registry) Ensure(source, key string, seed func(*Task)) (Task, bool, error) {
+	if task, ok := r.Get(source, key); ok {
 		return task, false, nil
 	}
-	task := Task{Key: key, State: StateAnalyzing, Plan: PlanNone}
+	task := Task{Source: source, Key: key, State: StateAnalyzing, Plan: PlanNone}
 	if seed != nil {
 		seed(&task)
 	}
@@ -241,8 +279,15 @@ func (r *Registry) replay() error {
 		if task.Key == "" {
 			return fmt.Errorf("registry: %s line %d has no task_key", r.path, line)
 		}
+		if strings.TrimSpace(task.Source) == "" {
+			// A row written before the source seam existed. Reading it as YouTrack is
+			// what it meant when it was written; the field appears the next time the
+			// task is written, so the file migrates as it is used rather than needing
+			// a rewrite.
+			task.Source = DefaultSource
+		}
 		stored := task
-		r.tasks[task.Key] = &stored
+		r.tasks[indexKey(task.Source, task.Key)] = &stored
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("registry: scan %s: %w", r.path, err)

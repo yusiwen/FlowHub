@@ -209,8 +209,12 @@ documents. The rules below are load-bearing; do not relax them casually.
    answered), and a request that is handled is never listed as pending again — a
    request the server keeps listing must not stop a finished turn from completing.
 9. **One task, one worktree, one session.** `internal/registry` is the
-   append-only record of that binding (`<DataDir>/registry.jsonl`) and
-   `internal/workspace/localworktree` creates the checkout. The base commit is **pinned through
+   append-only record of that binding (`<DataDir>/registry.jsonl`), indexed by
+   `(source, key)`: a task is identified by the adapter that produced it *and* its
+   key, so two trackers may share a project key without sharing a session, and a row
+   written before the source seam existed is read as `youtrack` (the field is written
+   the next time the task is touched). `internal/workspace/localworktree` creates the
+   checkout. The base commit is **pinned through
    the origin** once per task and recorded (`base_commit`), never re-resolved: two
    hosts whose clones were fetched at different times must start a project's tasks
    from the same commit. `Prepare` produces exactly that commit (fetching it only

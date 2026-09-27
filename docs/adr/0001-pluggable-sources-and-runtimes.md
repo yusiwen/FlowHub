@@ -84,7 +84,9 @@ Four deviations from the sketch, all deliberate:
   runtime-neutral capability check would need a speculative interface for those two
   endpoints, so step 2 leaves them product-specific and says so.
 
-**Revision:** 11 — recorded step 3b as landed: `prompt_file` at both levels, implemented as appended instructions instead of a replacement template, with the reason (a deletable marker would break loop prevention) and the consequence (no placeholder language to maintain). Revision 10 — recorded step 3a as landed: the v2 format, the v1 translation, the
+**Revision:** 12 — recorded open question 4 as decided and landed: the registry is
+indexed by `(source, key)` with a lazy migration for pre-seam rows, verified against
+the live file. Revision 11 — recorded step 3b as landed: `prompt_file` at both levels, implemented as appended instructions instead of a replacement template, with the reason (a deletable marker would break loop prevention) and the consequence (no placeholder language to maintain). Revision 10 — recorded step 3a as landed: the v2 format, the v1 translation, the
 `(source, project)` index, per-level precedence with provenance, the source registry
 and the runtime/source blocks; plus the two deferrals (3b `prompt_file`, and the
 location move waiting for the provider that needs it). Revision 9 — recorded step 2
@@ -975,11 +977,20 @@ Step 4 is the point of the whole exercise: if adding Gitea requires touching
    download to a fixed prefix, and the arbiter allows exactly that. Gitea carries
    attachments too. Recommendation: keep them as `Subject.Attachments` and let
    `ToolPolicy.Download` decide where they may land.
-4. **Task key collisions.** `registry` keys tasks by `Subject.Key`. Two sources
-   could produce the same key (`TEST-17` in YouTrack and in a Gitea tracker).
-   Recommendation: qualify the registry key with the source (`youtrack:TEST-17`)
-   from the start, and migrate existing rows on first read. Confirm, because it
-   changes the registry format.
+4. ~~**Task key collisions.**~~ **Decided and landed.** `registry.Task` carries the
+   source, and the registry's index is `(source, key)`, so a YouTrack `TEST-17` and a
+   tracker that also calls a project `TEST` are two tasks with two sessions — and a
+   partial update can only ever touch its own. The *file* keeps `source` and
+   `task_key` as separate fields rather than gluing them into one string, which makes
+   a row readable by hand and the migration trivial: a row written before the seam
+   existed has no `source` and is read as `youtrack`, because that is what it meant
+   when it was written; the field appears the next time the task is written, so the
+   file migrates as it is used instead of being rewritten. `Put` refuses a task with
+   no source, because an anonymous row would collide with every source at once.
+   **Measured against this host's live registry** (63 lines, 20 tasks, every one
+   written before the field existed): all 20 load, keep their session and worktree,
+   answer to `Get("youtrack", key)`, are correctly invisible to `gitea`, and all 20
+   runtime bindings survive.
 5. **One runtime per process, or per task?** The v2 sketch puts `runtime` at the
    top level, with `projects[].agent`/`model` as the per-project override.
    Recommendation: one runtime per process until a real need for two appears.
