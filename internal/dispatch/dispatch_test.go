@@ -660,16 +660,46 @@ func (f *fakeOpencode) promptCount() int {
 	return len(f.prompts)
 }
 
+// sessionCount and continuedCount are how a test sees whether a second turn reused
+// the task's session or silently started another one.
+func (f *fakeOpencode) sessionCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessions
+}
+
+func (f *fakeOpencode) continuedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.continued
+}
+
+// runtimeEntry is one host's row of the /healthz snapshot, or nil when that host has
+// no work and therefore no scheduler.
+func runtimeEntry(t *testing.T, dispatcher *Dispatcher, name string) map[string]any {
+	t.Helper()
+	runtimes, _ := dispatcher.Snapshot()["runtimes"].(map[string]map[string]any)
+	return runtimes[name]
+}
+
 // newScheduledDispatcher wires a dispatcher over a real repository and two enrolled
 // runtimes on the fake server, which is what the scheduler tests need: a real
 // worktree per task, and a policy that spreads them.
 func newScheduledDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.Server, extra string) (*Dispatcher, *registry.Registry) {
 	t.Helper()
+	return newScheduledDispatcherWith(t, fake, server, func(repo, base string) string {
+		return `{"projects":[{"youtrack_key":"TEST","repo":{"path":"` + repo + `","default_branch":"main"},"worktrees":"` + base + `"` + extra + `}]}`
+	})
+}
+
+// newScheduledDispatcherWith is the same wiring with the configuration file supplied
+// by the test, because a v2 file has to name the runtime block the breadth lives in.
+func newScheduledDispatcherWith(t *testing.T, fake *fakeOpencode, server *httptest.Server, build func(repo, base string) string) (*Dispatcher, *registry.Registry) {
+	t.Helper()
 	repo := testRepo(t)
 	base := filepath.Join(t.TempDir(), "worktrees")
 	projectsFile := filepath.Join(t.TempDir(), "config.json")
-	body := `{"projects":[{"youtrack_key":"TEST","repo":{"path":"` + repo + `","default_branch":"main"},"worktrees":"` + base + `"` + extra + `}]}`
-	if err := os.WriteFile(projectsFile, []byte(body), 0o600); err != nil {
+	if err := os.WriteFile(projectsFile, []byte(build(repo, base)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	projects, err := projectmap.Load(projectsFile)
@@ -680,6 +710,20 @@ func newScheduledDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.S
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The file's runtime blocks travel to the dispatcher the way main's
+	// declaredRuntimes does it: enrolment answers where a host is, the file answers
+	// what to ask of it (the breadth included).
+	var declared []DeclaredRuntime
+	for _, name := range projects.Runtimes() {
+		block, _ := projects.RuntimeBlock(name)
+		declared = append(declared, DeclaredRuntime{
+			Name:          name,
+			URL:           strings.TrimSpace(block.URL),
+			Agent:         strings.TrimSpace(block.Agent),
+			Model:         strings.TrimSpace(block.Model),
+			MaxConcurrent: block.MaxConcurrentTasks(),
+		})
+	}
 	fake.directory = repo
 	dispatcher, err := New(Options{
 		NewRuntime:     runtimeFactory(5 * time.Second),
@@ -687,6 +731,7 @@ func newScheduledDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.S
 		NewWorkspace:   testWorkspaces,
 		Source:         youtrack.New(rules.Policy{}),
 		Runtimes:       testInventory(t, server.URL, "builder-a", "builder-b"),
+		Declared:       declared,
 		Registry:       reg,
 		Projects:       projects,
 		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -785,6 +830,169 @@ func TestOneRuntimeStillRunsOneTurnAtATime(t *testing.T) {
 	if got := fake.promptCount(); got != 2 {
 		t.Fatalf("prompts = %d, want both turns to have run", got)
 	}
+}
+
+// TestOneHostRunsTwoTasksAtOnceWhenItsBreadthIsTwo is the point of the breadth: two
+// *tasks* on one host at the same time, which the single-worker-per-runtime rule
+// could not do.
+func TestOneHostRunsTwoTasksAtOnceWhenItsBreadthIsTwo(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.hold = make(chan struct{})
+	server := fake.start()
+	defer server.Close()
+	defer fake.release()
+	dispatcher, reg := newScheduledDispatcherWith(t, fake, server, func(repo, base string) string {
+		return `{"version":2,
+		  "runtimes":{"builder-a":{"url":"` + server.URL + `","agent":"devops","max_concurrent":2}},
+		  "projects":[{"source":"youtrack","project":"TEST","repo":{"path":"` + repo + `","default_branch":"main"},"worktrees":"` + base + `","runtime":"builder-a"}]}`
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dispatcher.Run(ctx)
+
+	dispatcher.Dispatch(delivery("TEST-60", "issueCreated", issueCreatedBody("TEST-60")))
+	dispatcher.Dispatch(delivery("TEST-61", "issueCreated", issueCreatedBody("TEST-61")))
+
+	waitFor(t, 5*time.Second, func() bool { return fake.promptCount() == 2 })
+	entry := runtimeEntry(t, dispatcher, "builder-a")
+	if entry == nil {
+		t.Fatal("the host that ran the turns has no snapshot entry")
+	}
+	if got, _ := entry["running"].(int); got != 2 {
+		t.Fatalf("running = %v, want 2: one host, two tasks, breadth two", entry["running"])
+	}
+	if got, _ := entry["max_concurrent"].(int); got != 2 {
+		t.Fatalf("max_concurrent = %v, want the configured 2", entry["max_concurrent"])
+	}
+	if got, _ := entry["queued"].(int); got != 0 {
+		t.Fatalf("queued = %v, want nothing waiting: both tasks have a worker", entry["queued"])
+	}
+
+	fake.release()
+	waitFor(t, 10*time.Second, func() bool {
+		return dispatcher.Snapshot()["handled"].(int64) == 2
+	})
+	for _, key := range []string{"TEST-60", "TEST-61"} {
+		task, ok := reg.Get(youtrack.SourceName, key)
+		if !ok || task.Runtime != "builder-a" {
+			t.Fatalf("%s = %+v, want it on builder-a", key, task)
+		}
+	}
+}
+
+// TestASecondDeliveryForATaskWaitsForItsTurn is the other half of the breadth: the
+// host may run two tasks, but never one task twice. The waiting delivery is held, not
+// dropped, and runs the moment the first turn finishes.
+func TestASecondDeliveryForATaskWaitsForItsTurn(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.hold = make(chan struct{})
+	server := fake.start()
+	defer server.Close()
+	defer fake.release()
+	dispatcher, reg := newScheduledDispatcherWith(t, fake, server, func(repo, base string) string {
+		return `{"version":2,
+		  "runtimes":{"builder-a":{"url":"` + server.URL + `","agent":"devops","max_concurrent":2}},
+		  "projects":[{"source":"youtrack","project":"TEST","repo":{"path":"` + repo + `","default_branch":"main"},"worktrees":"` + base + `","runtime":"builder-a"}]}`
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dispatcher.Run(ctx)
+
+	first := delivery("TEST-62", "issueCreated", issueCreatedBody("TEST-62"))
+	second := delivery("TEST-62", "issueCreated", issueCreatedBody("TEST-62"))
+	second.RawBody = issueCreatedBody("TEST-62") + "\n"
+	dispatcher.Dispatch(first)
+	dispatcher.Dispatch(second)
+
+	waitFor(t, 5*time.Second, func() bool {
+		entry := runtimeEntry(t, dispatcher, "builder-a")
+		return entry != nil && entry["running"] == 1 && entry["queued"] == 1
+	})
+	// The first turn is held open, so a second prompt can never arrive: the scheduler
+	// keeps the second delivery of the same task waiting.
+	time.Sleep(300 * time.Millisecond)
+	if got := fake.promptCount(); got != 1 {
+		t.Fatalf("prompts in flight = %d, want 1: one task is in one turn at a time", got)
+	}
+
+	fake.release()
+	waitFor(t, 10*time.Second, func() bool {
+		return dispatcher.Snapshot()["handled"].(int64) == 2
+	})
+	if got := fake.promptCount(); got != 2 {
+		t.Fatalf("prompts = %d, want the waiting delivery to run rather than be dropped", got)
+	}
+	task, _ := reg.Get(youtrack.SourceName, "TEST-62")
+	if task.Turns != 2 {
+		t.Fatalf("turns = %d, want both deliveries recorded", task.Turns)
+	}
+}
+
+// TestATaskWithNoRowYetGoesToExactlyOneRuntime: two deliveries of one burst reach the
+// router before either has created the task row, so without the routing memo they
+// could be handed to two hosts — two worktrees, two sessions, one issue. Measured
+// before the fix: two prompts in flight on two hosts.
+func TestATaskWithNoRowYetGoesToExactlyOneRuntime(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.hold = make(chan struct{})
+	server := fake.start()
+	defer server.Close()
+	defer fake.release()
+	dispatcher, reg := newScheduledDispatcher(t, fake, server, `,"runtimes":["builder-a","builder-b"],"runtime_policy":"spread"`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dispatcher.Run(ctx)
+
+	dispatcher.Dispatch(delivery("TEST-63", "issueCreated", issueCreatedBody("TEST-63")))
+	dispatcher.Dispatch(delivery("TEST-63", "issueCreated", issueCreatedBody("TEST-63")))
+
+	waitFor(t, 5*time.Second, func() bool {
+		runtimes, _ := dispatcher.Snapshot()["runtimes"].(map[string]map[string]any)
+		if len(runtimes) != 1 {
+			return false
+		}
+		for _, entry := range runtimes {
+			if entry["running"] == 1 && entry["queued"] == 1 {
+				return true
+			}
+		}
+		return false
+	})
+	// Only one prompt may exist even though the second delivery is already here: the
+	// first turn is held open and the second waits for it.
+	time.Sleep(300 * time.Millisecond)
+	if got := fake.promptCount(); got != 1 {
+		t.Fatalf("prompts in flight = %d, want 1: one task is one turn at a time", got)
+	}
+
+	fake.release()
+	waitFor(t, 10*time.Second, func() bool {
+		return dispatcher.Snapshot()["handled"].(int64) == 2
+	})
+
+	runtimes, _ := dispatcher.Snapshot()["runtimes"].(map[string]map[string]any)
+	if len(runtimes) != 1 {
+		t.Fatalf("runtimes = %+v, want both deliveries on one host", runtimes)
+	}
+	if got := fake.sessionCount(); got != 1 {
+		t.Fatalf("sessions = %d, want one session for the task", got)
+	}
+	if got := fake.continuedCount(); got != 1 {
+		t.Fatalf("continued = %d, want the second delivery to continue the session", got)
+	}
+	task, _ := reg.Get(youtrack.SourceName, "TEST-63")
+	if task.Runtime == "" {
+		t.Fatal("the task has no runtime binding")
+	}
+	if _, ok := runtimes[task.Runtime]; !ok {
+		t.Fatalf("the task is bound to %s, which has no work in the snapshot %+v", task.Runtime, runtimes)
+	}
+	// The memo is a cache of one decision, not a second registry: once the burst has
+	// drained there is nothing left to remember.
+	waitFor(t, 5*time.Second, func() bool { return dispatcher.pendingRoutes() == 0 })
 }
 
 // TestRouteRefusesABoundTaskWhoseRuntimeIsGone: routing is where the refusal happens

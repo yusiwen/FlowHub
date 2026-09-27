@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -117,6 +118,12 @@ func Register(ctx context.Context, client *runtimes.Client, inviteToken, name st
 		Agent:          opts.Agent,
 		AgentProfile:   AgentProfileFor(opts.Agent),
 		FlowHubVersion: opts.FlowHubVersion,
+		// The host's own ceiling on how many tasks it will serve at once. The
+		// control plane's file decides the breadth; this can only lower it, so it is
+		// the answer to "this machine should not be asked for more than that". Cores
+		// are the number because an unattended turn may run a build, which is the
+		// resource a second concurrent turn actually contends for.
+		MaxConcurrent: runtime.NumCPU(),
 	}
 	if report != nil {
 		claim.AgentVersion = versionOf(report)

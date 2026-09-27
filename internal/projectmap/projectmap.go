@@ -121,6 +121,12 @@ const (
 	PolicyFirstHealthy = "first-healthy"
 )
 
+// MaxRuntimeConcurrency is the largest breadth a `runtimes.<name>.max_concurrent`
+// may ask for. It is not a capacity model: each unit is a task running an agent turn
+// at the same time, and the bound exists so that a typo (`1000`) is a startup error
+// rather than a thousand goroutines and a thousand turns (ADR 0003 §6).
+const MaxRuntimeConcurrency = 64
+
 // runtimeNamePattern mirrors the inventory's rule for a runtime name. A name that
 // could never be enrolled is a typo, and a typo has to fail when the table is
 // loaded instead of quietly making a project unroutable.
@@ -335,6 +341,16 @@ func (m *Map) RuntimeBlock(name string) (RuntimeBlock, bool) {
 	return block, ok
 }
 
+// MaxConcurrentTasks is how many distinct tasks this host block allows at once,
+// resolving the declared default. The zero value means "one", which is what every
+// deployment had before the breadth existed.
+func (b RuntimeBlock) MaxConcurrentTasks() int {
+	if b.MaxConcurrent == nil {
+		return 1
+	}
+	return *b.MaxConcurrent
+}
+
 // Format is the version the file was written in, and Translated reports that it was
 // a version 1 file with no `version` key, which the loader converted on read.
 func (m *Map) Format() int {
@@ -511,9 +527,17 @@ func validateRuntimeBlock(name string, block v2Runtime) error {
 			return fmt.Errorf("runtimes.%s.auth: password_env is required: the secret stays in the environment and the file only names the variable", name)
 		}
 	}
-	if block.MaxConcurrent != nil && *block.MaxConcurrent != 1 {
-		return fmt.Errorf("runtimes.%s.max_concurrent: %d is not supported; a session belongs to one runtime and a prompt sent to a busy session is swallowed, so raising this needs per-task locking that does not exist yet",
-			name, *block.MaxConcurrent)
+	if block.MaxConcurrent != nil {
+		switch {
+		case *block.MaxConcurrent < 1:
+			// A breadth below one is not a narrower runtime, it is a host that can never
+			// take work; the field means "how many tasks at once", so one is the floor.
+			return fmt.Errorf("runtimes.%s.max_concurrent: %d is not a breadth; it must be at least 1",
+				name, *block.MaxConcurrent)
+		case *block.MaxConcurrent > MaxRuntimeConcurrency:
+			return fmt.Errorf("runtimes.%s.max_concurrent: %d is above the supported maximum of %d; each unit is a task running an agent turn at the same time, so a number this large is a typo rather than a plan",
+				name, *block.MaxConcurrent, MaxRuntimeConcurrency)
+		}
 	}
 	if deadline := strings.TrimSpace(block.Deadline); deadline != "" {
 		if _, err := time.ParseDuration(deadline); err != nil {

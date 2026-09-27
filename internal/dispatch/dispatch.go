@@ -101,6 +101,9 @@ type DeclaredRuntime struct {
 	Model string
 	// Deadline bounds one turn on this host; zero falls back to the process default.
 	Deadline time.Duration
+	// MaxConcurrent is how many distinct tasks this host may serve at once. Zero or
+	// absent means 1; the host's own claim can only lower it (ADR 0003 §6).
+	MaxConcurrent int
 }
 
 // Dispatcher consumes accepted deliveries.
@@ -132,13 +135,20 @@ type Dispatcher struct {
 	dropped atomic.Int64
 	ignored atomic.Int64
 
-	// queueMu guards the per-runtime queues and their counters. The intake loop
-	// creates a queue (and starts its worker) the first time a runtime is used, and
-	// /healthz reads the counters from an HTTP handler.
-	queueMu   sync.Mutex
-	queues    map[string]chan routed
-	workers   map[string]bool
-	busyPerRT map[string]int
+	// queueMu guards the per-runtime schedulers, the routing memo and the per-runtime
+	// error text. The intake loop creates a scheduler (and starts its workers) the
+	// first time a runtime is used, and /healthz reads the counters from an HTTP
+	// handler. The lock order when both are held is queueMu, then a scheduler's own
+	// mutex, and never the reverse.
+	queueMu    sync.Mutex
+	schedulers map[string]*runtimeScheduler
+	// routes remembers which runtime an in-flight burst of a task was routed to. It
+	// exists because a task whose registry row does not exist yet would otherwise be
+	// ranked once per delivery, and two deliveries of one burst could be handed to
+	// two hosts — two worktrees, two sessions, one issue (ADR 0003 §3). The entry is
+	// dropped when that task's work drains, so this stays a cache of a decision
+	// rather than a second registry.
+	routes    map[taskID]runtimeBinding
 	lastError map[string]string
 
 	// loadMu guards inFlight, which the selection policy reads from the worker
@@ -183,18 +193,17 @@ func New(opts Options) (*Dispatcher, error) {
 	}
 
 	return &Dispatcher{
-		opts:      opts,
-		policy:    ruleset,
-		log:       opts.Log,
-		prepLocks: map[string]*sync.Mutex{},
-		spaces:    map[string]workspace.Workspace{},
-		runtimes:  map[string]cachedRuntime{},
-		inFlight:  map[string]int{},
-		queue:     make(chan *store.Record, opts.QueueSize),
-		queues:    map[string]chan routed{},
-		workers:   map[string]bool{},
-		busyPerRT: map[string]int{},
-		lastError: map[string]string{},
+		opts:       opts,
+		policy:     ruleset,
+		log:        opts.Log,
+		prepLocks:  map[string]*sync.Mutex{},
+		spaces:     map[string]workspace.Workspace{},
+		runtimes:   map[string]cachedRuntime{},
+		inFlight:   map[string]int{},
+		queue:      make(chan *store.Record, opts.QueueSize),
+		schedulers: map[string]*runtimeScheduler{},
+		routes:     map[taskID]runtimeBinding{},
+		lastError:  map[string]string{},
 	}, nil
 }
 
@@ -220,20 +229,26 @@ func (d *Dispatcher) Dispatch(rec *store.Record) {
 }
 
 // routed is one delivery on its way to a runtime: the intake loop decided *which*
-// runtime, and that runtime's worker runs the turn.
+// runtime, and that runtime's scheduler runs the turn.
 type routed struct {
 	record  *store.Record
 	binding runtimeBinding
 }
 
-// Run routes deliveries to their runtime's worker until the context is cancelled.
+// taskIDOf is the identity a delivery's turn is serialized by.
+func (d *Dispatcher) taskIDOf(rec *store.Record) taskID {
+	return taskID{source: d.opts.Source.Name(), key: rec.IssueID}
+}
+
+// Run routes deliveries to their runtime's workers until the context is cancelled.
 //
-// The unit of serialization is the runtime, not the process. The reason one worker
-// was needed at all — a prompt sent to a busy session is silently swallowed
-// (opencode issue #46842) — is a property of a *session*, and a session belongs to
-// one runtime for life. So each runtime gets its own queue and its own single
-// worker, and different runtimes run turns in parallel. `max_concurrent` stays 1
-// until per-task locking exists; the queue is where raising it would go.
+// The unit of *routing* is the runtime; the unit of *serialization* is the task
+// (ADR 0003). One scheduler per runtime groups the deliveries routed to it by task
+// and serves up to that host's breadth of distinct tasks at once, so different tasks
+// run in parallel while one task's second delivery waits for its first turn. The
+// reason the exclusion exists at all — a prompt sent to a busy session is silently
+// swallowed (opencode issue #46842) — is a property of a *session*, and a task owns
+// exactly one session for life.
 //
 // The intake loop itself only decides the runtime (and probes it, so it is off the
 // webhook path but still serialized); it never runs a turn.
@@ -262,14 +277,16 @@ func (d *Dispatcher) Run(ctx context.Context) {
 
 // handle runs one delivery end to end on the calling goroutine.
 //
-// Production goes through Run — intake, then the runtime's own queue and worker —
-// while this is the same two steps without a scheduler in between, which is what
-// the pipeline tests want. Both call exactly the same code.
+// Production goes through Run — intake, then the runtime's scheduler and workers —
+// while this is the same two steps without a scheduler in between, which is what the
+// pipeline tests want. Both call exactly the same code, and this path is
+// deliberately serial, so it releases the routing memo itself.
 func (d *Dispatcher) handle(ctx context.Context, rec *store.Record) {
 	item, ok := d.routeOne(ctx, rec)
 	if !ok {
 		return
 	}
+	defer d.forgetRoute(d.taskIDOf(rec))
 	d.runRouted(ctx, item)
 }
 
@@ -299,21 +316,28 @@ func (d *Dispatcher) Snapshot() map[string]any {
 }
 
 // runtimeSnapshot is the per-runtime view: how much work is waiting for it, how
-// many turns it is running, and the last thing that went wrong on it. One HTTP call
-// answers "which host is stuck" instead of a log dig.
+// many tasks it is serving, how many turns are actually running, the breadth it was
+// started with, and the last thing that went wrong on it. One HTTP call answers
+// "which host is stuck" instead of a log dig.
 func (d *Dispatcher) runtimeSnapshot() map[string]map[string]any {
 	d.queueMu.Lock()
-	defer d.queueMu.Unlock()
-	out := make(map[string]map[string]any, len(d.queues))
-	for name, queue := range d.queues {
-		// Read the counter directly: busyFor would take this same lock again, and a
-		// mutex is not reentrant.
-		entry := map[string]any{
-			"queued":    len(queue),
-			"busy":      d.busyPerRT[name],
-			"in_flight": d.inFlightFor(name),
-		}
-		if message, ok := d.lastError[name]; ok {
+	schedulers := make(map[string]*runtimeScheduler, len(d.schedulers))
+	for name, scheduler := range d.schedulers {
+		schedulers[name] = scheduler
+	}
+	errors := make(map[string]string, len(d.lastError))
+	for name, message := range d.lastError {
+		errors[name] = message
+	}
+	d.queueMu.Unlock()
+
+	out := make(map[string]map[string]any, len(schedulers))
+	for name, scheduler := range schedulers {
+		// The scheduler's own mutex is taken here without queueMu held, so the only
+		// lock order in this file stays queueMu -> scheduler, never the reverse.
+		entry := scheduler.snapshot()
+		entry["in_flight"] = d.inFlightFor(name)
+		if message, ok := errors[name]; ok {
 			entry["last_error"] = message
 		}
 		out[name] = entry
@@ -388,6 +412,15 @@ func (d *Dispatcher) routeOne(ctx context.Context, rec *store.Record) (routed, b
 		return routed{record: rec, binding: binding}, true
 	}
 
+	// A task with no row yet is ranked once per burst, not once per delivery: two
+	// deliveries that arrive together would otherwise be free to choose two hosts,
+	// and the issue would get two worktrees and two sessions. The memo is dropped
+	// when this task's work drains, so the registry stays authoritative.
+	id := d.taskIDOf(rec)
+	if binding, ok := d.rememberedRoute(id); ok {
+		return routed{record: rec, binding: binding}, true
+	}
+
 	match, ok := d.opts.Projects.Match(d.opts.Source.Name(), rec.ProjectKey)
 	if !ok {
 		// Fail closed, and fail here rather than in the worker: an unroutable project
@@ -404,92 +437,153 @@ func (d *Dispatcher) routeOne(ctx context.Context, rec *store.Record) (routed, b
 			"issue", rec.IssueID, "project", rec.ProjectKey, "error", err)
 		return routed{}, false
 	}
+	d.rememberRoute(id, binding)
 	return routed{record: rec, binding: binding}, true
 }
 
-// queueFor returns a runtime's queue, creating it the first time the runtime is
-// used. The second result says whether it was created, which is the caller's signal
-// to start that runtime's single worker.
-func (d *Dispatcher) queueFor(name string) (chan routed, bool) {
+// rememberedRoute returns the runtime an in-flight burst of this task was routed
+// to, if there is one.
+func (d *Dispatcher) rememberedRoute(id taskID) (runtimeBinding, bool) {
 	d.queueMu.Lock()
 	defer d.queueMu.Unlock()
-	if queue, ok := d.queues[name]; ok {
-		return queue, false
-	}
-	queue := make(chan routed, d.opts.QueueSize)
-	d.queues[name] = queue
-	return queue, true
+	binding, ok := d.routes[id]
+	return binding, ok
 }
 
-// enqueue hands a delivery to its runtime's worker, starting that worker on first
-// use. A full per-runtime queue drops the delivery, exactly like the intake queue:
-// blocking here would push back into the webhook request path.
+// rememberRoute records the routing decision for a task whose work is now in flight.
+func (d *Dispatcher) rememberRoute(id taskID, binding runtimeBinding) {
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	d.routes[id] = binding
+}
+
+// forgetRoute drops the memo once a task's work has drained. The next delivery then
+// reads the registry again, which by now carries the binding the turn recorded.
+func (d *Dispatcher) forgetRoute(id taskID) {
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	delete(d.routes, id)
+}
+
+// pendingRoutes counts the routing decisions still remembered. It is used by the
+// scheduler's tests, because a memo that never empties would be a second registry.
+func (d *Dispatcher) pendingRoutes() int {
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	return len(d.routes)
+}
+
+// schedulerFor returns a runtime's scheduler, creating it — with its workers'
+// breadth — the first time the runtime is used. The second result says whether it
+// was created, which is the caller's signal to start its workers.
+//
+// The breadth is fixed here and does not follow a later re-enrolment: work already
+// queued must not be lost, and shrinking a live pool means deciding what to do with
+// the turns it already started (ADR 0003 §6).
+func (d *Dispatcher) schedulerFor(name string, breadth int) (*runtimeScheduler, bool) {
+	d.queueMu.Lock()
+	defer d.queueMu.Unlock()
+	if scheduler, ok := d.schedulers[name]; ok {
+		return scheduler, false
+	}
+	scheduler := newRuntimeScheduler(name, breadth, d.opts.QueueSize)
+	d.schedulers[name] = scheduler
+	return scheduler, true
+}
+
+// enqueue hands a delivery to its runtime's scheduler, starting that runtime's
+// workers on first use. A full runtime drops the delivery, exactly like the intake
+// queue: blocking here would push back into the webhook request path.
 //
 // Workers are never stopped except by the context. An idle goroutine per known
 // runtime costs nothing next to the bookkeeping of stopping one safely, and a
-// runtime that is revoked and re-enrolled keeps its queue rather than losing work
+// runtime that is revoked and re-enrolled keeps its scheduler rather than losing work
 // that was already routed to it.
 func (d *Dispatcher) enqueue(ctx context.Context, item routed, workers *sync.WaitGroup) {
 	name := item.binding.Name
-	queue, created := d.queueFor(name)
+	breadth := item.binding.maxConcurrent()
+	scheduler, created := d.schedulerFor(name, breadth)
 	if created {
-		d.log.Info("runtime worker started", "runtime", name, "queue_size", d.opts.QueueSize)
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			d.workRuntime(ctx, name, queue)
-		}()
+		d.log.Info("runtime workers started",
+			"runtime", name, "max_concurrent", breadth, "queue_size", d.opts.QueueSize)
+		for range breadth {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				d.workScheduled(ctx, scheduler)
+			}()
+		}
 	}
-	// The load is counted from the moment the delivery is committed to this runtime,
-	// not from the moment its worker picks it up. The difference matters under a
-	// burst: two deliveries that arrive together are routed back to back, and by the
-	// time the second is ranked the first may already have been dequeued — with its
-	// turn still preparing, so neither "queued" nor "in flight" would show it. That
-	// is how a spread of two tasks landed on one host.
-	d.countBusy(name, 1)
-	select {
-	case queue <- item:
-	default:
-		d.countBusy(name, -1)
+	id := d.taskIDOf(item.record)
+	if !scheduler.add(id, item) {
 		d.dropped.Add(1)
 		d.log.Error("the runtime's queue is full, dropping delivery",
 			"runtime", name, "issue", item.record.IssueID, "queue_size", d.opts.QueueSize)
+		// Nothing of this task is left here, so the memo must not keep pointing at
+		// this runtime: the next delivery is free to rank again.
+		if scheduler.idle(id) {
+			d.forgetRoute(id)
+		}
 	}
 }
 
-// workRuntime is one runtime's single worker: it runs the turns routed to that
-// runtime, one at a time, which is the granularity that matters because a session
-// belongs to one runtime for life.
-func (d *Dispatcher) workRuntime(ctx context.Context, name string, queue chan routed) {
+// workScheduled is one of a runtime's workers: it serves one delivery at a time,
+// and the scheduler guarantees that no two of them serve the same task at once.
+func (d *Dispatcher) workScheduled(ctx context.Context, scheduler *runtimeScheduler) {
 	for {
-		select {
-		case <-ctx.Done():
+		item, ok := scheduler.next(ctx)
+		if !ok {
 			return
-		case item := <-queue:
-			d.runRouted(ctx, item)
-			d.countBusy(name, -1)
-			d.handled.Add(1)
+		}
+		id := d.taskIDOf(item.record)
+		d.runRouted(ctx, item)
+		d.handled.Add(1)
+		if scheduler.finish(id) {
+			d.forgetRoute(id)
 		}
 	}
 }
 
 // busyFor reports how much work is committed to a runtime right now: deliveries
-// waiting in its queue, being prepared, or running a turn. The spread policy reads
+// accepted and not yet started, plus the tasks being served. The spread policy reads
 // it, so two deliveries that arrive together do not both land on the host that
 // happens to sort first.
 func (d *Dispatcher) busyFor(name string) int {
 	d.queueMu.Lock()
-	defer d.queueMu.Unlock()
-	return d.busyPerRT[name]
+	scheduler, ok := d.schedulers[name]
+	d.queueMu.Unlock()
+	if !ok {
+		return 0
+	}
+	return scheduler.busy()
 }
 
-func (d *Dispatcher) countBusy(name string, delta int) {
+// runningFor reports how many tasks a runtime is serving right now.
+func (d *Dispatcher) runningFor(name string) int {
 	d.queueMu.Lock()
-	defer d.queueMu.Unlock()
-	d.busyPerRT[name] += delta
-	if d.busyPerRT[name] <= 0 {
-		delete(d.busyPerRT, name)
+	scheduler, ok := d.schedulers[name]
+	d.queueMu.Unlock()
+	if !ok {
+		return 0
 	}
+	return scheduler.runningCount()
+}
+
+// breadthFor is how many tasks a runtime may serve at once: the breadth its
+// scheduler was started with when there is one, because that is the number actually
+// in force — a breadth fixed at first use does not follow a later re-enrolment
+// (ADR 0003 §6) — and otherwise the configured breadth, for a host no delivery has
+// reached yet.
+func (d *Dispatcher) breadthFor(binding runtimeBinding) int {
+	d.queueMu.Lock()
+	scheduler, ok := d.schedulers[binding.Name]
+	d.queueMu.Unlock()
+	if ok {
+		// The field is written once, before the scheduler is published under queueMu,
+		// so loading it after taking that lock is ordered.
+		return scheduler.max
+	}
+	return binding.maxConcurrent()
 }
 
 // setRuntimeError and clearRuntimeError keep the per-runtime view /healthz reports,
@@ -825,6 +919,14 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	}
 
 	defer d.enterTurn(binding.Name)()
+
+	// Announce the turn before it starts. Overlap is a property of the log rather than
+	// something to infer from two completion lines, and it is the line that shows a
+	// runtime is using the breadth it was configured with.
+	d.log.Info("turn started",
+		"issue", rec.IssueID, "action", decision.Action, "phase", phase,
+		"runtime", binding.Name, "agent", agentName, "model", model,
+		"session", task.SessionID, "max_concurrent", d.breadthFor(binding))
 
 	result, err := binding.Runtime.Run(ctx, agent.Turn{
 		Directory:    task.Worktree,

@@ -470,11 +470,12 @@ func declaredRuntimes(cfg config.Config, projects *projectmap.Map) []dispatch.De
 	for _, name := range projects.Runtimes() {
 		block, _ := projects.RuntimeBlock(name)
 		out = append(out, dispatch.DeclaredRuntime{
-			Name:     name,
-			URL:      strings.TrimSpace(block.URL),
-			Agent:    strings.TrimSpace(block.Agent),
-			Model:    strings.TrimSpace(block.Model),
-			Deadline: runtimeDeadline(cfg, projects, name),
+			Name:          name,
+			URL:           strings.TrimSpace(block.URL),
+			Agent:         strings.TrimSpace(block.Agent),
+			Model:         strings.TrimSpace(block.Model),
+			Deadline:      runtimeDeadline(cfg, projects, name),
+			MaxConcurrent: block.MaxConcurrentTasks(),
 		})
 	}
 	return out

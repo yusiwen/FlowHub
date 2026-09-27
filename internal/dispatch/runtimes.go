@@ -58,7 +58,8 @@ func (d *Dispatcher) pickRuntime(ctx context.Context, task registry.Task, entry 
 		}
 		d.log.Info("runtime chosen",
 			"runtime", load.Binding.Name, "policy", load.Policy, "eligible", len(loads),
-			"busy", load.Busy, "in_flight", load.InFlight, "active_tasks", load.Active,
+			"busy", load.Busy, "running", load.Running, "max_concurrent", load.Max,
+			"in_flight", load.InFlight, "active_tasks", load.Active,
 			"candidates", strings.Join(candidateNames(loads), ","))
 		return load.Binding, nil
 	}
@@ -72,23 +73,31 @@ type runtimeLoad struct {
 	Binding  runtimeBinding
 	Policy   string
 	InFlight int
-	// Busy counts the work already committed to this runtime: deliveries waiting in
-	// its queue, being prepared, or running a turn. It is what makes a burst spread —
+	// Busy counts the work already committed to this runtime: deliveries accepted and
+	// not yet started, plus the tasks being served. It is what makes a burst spread —
 	// two deliveries that arrive together both reach the router before either has
 	// created a task row, so without it the second would see an idle runtime and
 	// follow the first onto the same host.
-	Busy   int
-	Active int
+	Busy int
+	// Running is how many tasks this host is serving right now, and Max is its
+	// breadth; Full is the two compared. A full host is still a candidate — the
+	// delivery waits in its scheduler — but a host with a free worker is preferred,
+	// so raising the breadth actually uses it.
+	Running int
+	Max     int
+	Full    bool
+	Active  int
 }
 
 // rankRuntimes lists the runtimes a new task may use, ordered by the project's
 // policy.
 //
 //   - first-healthy keeps the declared order, which is what makes the list a
-//     failover order;
-//   - spread sorts by work already in flight, then by active tasks in the registry,
-//     then by name, so a second machine is used instead of being idle and a fresh
-//     registry still behaves predictably.
+//     failover order — including onto a host that is already at its breadth, because
+//     the order is the operator's preference and not a load-balancing one;
+//   - spread sorts by "has a free worker", then by work already in flight, then by
+//     active tasks in the registry, then by name, so a second machine is used instead
+//     of being idle and a fresh registry still behaves predictably.
 func (d *Dispatcher) rankRuntimes(entry *projectmap.Entry) []runtimeLoad {
 	policy := projectmap.PolicySpread
 	if entry != nil {
@@ -98,17 +107,26 @@ func (d *Dispatcher) rankRuntimes(entry *projectmap.Entry) []runtimeLoad {
 	candidates := d.runtimeCandidates(entry)
 	loads := make([]runtimeLoad, 0, len(candidates))
 	for _, candidate := range candidates {
+		breadth := d.breadthFor(candidate)
+		running := d.runningFor(candidate.Name)
 		loads = append(loads, runtimeLoad{
 			Binding:  candidate,
 			Policy:   policy,
 			InFlight: d.inFlightFor(candidate.Name),
 			Busy:     d.busyFor(candidate.Name),
+			Running:  running,
+			Max:      breadth,
+			Full:     running >= breadth,
 			Active:   len(d.boundTasksFor(candidate.Name)),
 		})
 	}
 	if policy == projectmap.PolicySpread {
 		sort.SliceStable(loads, func(a, b int) bool {
-			// "In flight or queued right now", exactly as the ADR orders it.
+			// A free worker first: "in flight or queued right now" is still what orders
+			// the rest, exactly as the ADR orders it.
+			if loads[a].Full != loads[b].Full {
+				return !loads[a].Full
+			}
 			if loads[a].Busy != loads[b].Busy {
 				return loads[a].Busy < loads[b].Busy
 			}
@@ -218,6 +236,7 @@ func (d *Dispatcher) allRuntimes() []runtimeBinding {
 				URL:          url,
 				Runtime:      d.runtimeFor(runtime.Name, url),
 				Models:       runtime.Models,
+				HostMax:      runtime.MaxConcurrent,
 				Declared:     policy,
 			})
 		}
@@ -273,9 +292,27 @@ type runtimeBinding struct {
 	// Models is what the runtime reported its agent profiles pin, keyed by profile
 	// name. Empty for the environment-configured runtime, which never enrolled.
 	Models map[string]string
+	// HostMax is the breadth the host itself claimed at enrolment: how many tasks it
+	// says it can serve at once. Zero means the host made no claim.
+	HostMax int
 	// Declared is the configuration file's policy for this host, when the file names
 	// it. Enrolment reports facts; this decides what to ask.
 	Declared DeclaredRuntime
+}
+
+// maxConcurrent is how many distinct tasks this host may serve at the same time: the
+// operator's number from the configuration file, and never more than the host itself
+// claimed it can take. An absent file value means 1, so a host only gets a wider
+// breadth when someone wrote one down (ADR 0003 §6).
+func (b runtimeBinding) maxConcurrent() int {
+	breadth := 1
+	if b.Declared.MaxConcurrent > 0 {
+		breadth = b.Declared.MaxConcurrent
+	}
+	if b.HostMax > 0 && b.HostMax < breadth {
+		breadth = b.HostMax
+	}
+	return breadth
 }
 
 // deadline is how long one turn on this runtime may run: the file's per-runtime

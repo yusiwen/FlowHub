@@ -229,6 +229,81 @@ func TestSpreadBalancesNewTasks(t *testing.T) {
 	}
 }
 
+// TestSpreadPrefersAHostWithAFreeWorker: the breadth changes the *order*, not the
+// answer. A host that can start a turn now is preferred over one that is merely less
+// loaded, and a host at its breadth is still a candidate — the delivery waits there
+// rather than being refused.
+func TestSpreadPrefersAHostWithAFreeWorker(t *testing.T) {
+	inventory := testInventory(t, "http://127.0.0.1:1", "builder-a", "builder-b")
+	reg, err := registry.Open(filepath.Join(t.TempDir(), "registry.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := testDispatcherFor(t, inventory, testProjects(t, `,"runtimes":["builder-a","builder-b"]`), reg)
+
+	// builder-a has breadth one and is serving a turn: full.
+	full, _ := dispatcher.schedulerFor("builder-a", 1)
+	full.add(testTask("TEST-1"), scheduled("TEST-1"))
+	if _, ok := full.take(); !ok {
+		t.Fatal("the full host did not take its delivery")
+	}
+	// builder-b has breadth two, one turn running and one delivery waiting: busier
+	// than builder-a, but it has a free worker.
+	free, _ := dispatcher.schedulerFor("builder-b", 2)
+	free.add(testTask("TEST-2"), scheduled("TEST-2"))
+	if _, ok := free.take(); !ok {
+		t.Fatal("the second host did not take its delivery")
+	}
+	free.add(testTask("TEST-3"), scheduled("TEST-3"))
+
+	loads := dispatcher.rankRuntimes(testProjects(t, `,"runtimes":["builder-a","builder-b"]`).Entries()[0])
+	if len(loads) != 2 {
+		t.Fatalf("loads = %+v, want both hosts eligible", loads)
+	}
+	if loads[0].Binding.Name != "builder-b" {
+		t.Fatalf("first candidate = %s, want builder-b: it has a free worker", loads[0].Binding.Name)
+	}
+	if loads[0].Full || !loads[1].Full {
+		t.Fatalf("full flags = %v/%v, want false then true", loads[0].Full, loads[1].Full)
+	}
+	if loads[0].Busy != 2 || loads[1].Busy != 1 {
+		t.Fatalf("busy = %d/%d, want the free-but-busier host first (2 then 1)", loads[0].Busy, loads[1].Busy)
+	}
+	if loads[0].Max != 2 || loads[1].Max != 1 {
+		t.Fatalf("breadths = %d/%d, want 2 then 1", loads[0].Max, loads[1].Max)
+	}
+}
+
+// TestMaxConcurrentIsTheOperatorNumberCappedByTheHost: the file decides the breadth,
+// the host can only lower it, and absent everywhere means one — so enrolling a host
+// never raises concurrency on its own.
+func TestMaxConcurrentIsTheOperatorNumberCappedByTheHost(t *testing.T) {
+	cases := []struct {
+		name     string
+		declared int
+		claimed  int
+		want     int
+	}{
+		{"nothing said", 0, 0, 1},
+		{"only the host claims", 0, 8, 1},
+		{"only the file declares", 4, 0, 4},
+		{"the host claims more", 4, 8, 4},
+		{"the host claims less", 8, 4, 4},
+		{"they agree", 4, 4, 4},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			binding := runtimeBinding{
+				Declared: DeclaredRuntime{MaxConcurrent: test.declared},
+				HostMax:  test.claimed,
+			}
+			if got := binding.maxConcurrent(); got != test.want {
+				t.Fatalf("maxConcurrent = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 // TestFirstHealthyKeepsTheDeclaredOrder is the other policy: the list is a failover
 // order, so the first entry takes everything while it answers.
 func TestFirstHealthyKeepsTheDeclaredOrder(t *testing.T) {

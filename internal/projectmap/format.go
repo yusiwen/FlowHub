@@ -110,9 +110,10 @@ type v2Runtime struct {
 	Model string         `json:"model,omitempty"`
 	// Deadline bounds one turn on this host.
 	Deadline string `json:"deadline,omitempty"`
-	// MaxConcurrent is accepted as 1 and refused otherwise: a session belongs to one
-	// runtime and a prompt sent to a busy session is swallowed, so raising this needs
-	// per-task locking that does not exist yet.
+	// MaxConcurrent is how many distinct tasks this host may serve at the same time,
+	// in `1..MaxRuntimeConcurrency`. Absent means 1, which is what every deployment
+	// had before per-task scheduling existed; the host's own claim can only lower it
+	// (ADR 0003).
 	MaxConcurrent *int `json:"max_concurrent,omitempty"`
 }
 

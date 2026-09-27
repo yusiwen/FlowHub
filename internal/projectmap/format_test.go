@@ -232,12 +232,26 @@ func TestRuntimeBlocksCarryPolicyAndRefuseWhatCannotBeHonoured(t *testing.T) {
 		t.Fatalf("Runtimes = %v", got)
 	}
 
+	if got, _ := m.RuntimeBlock("local"); got.MaxConcurrentTasks() != 1 {
+		t.Fatalf("MaxConcurrentTasks = %d, want 1", got.MaxConcurrentTasks())
+	}
+	// A breadth above one is accepted (ADR 0003): it is how many distinct tasks the
+	// host may serve at once, not how many prompts one session may get.
+	wider := writeConfig(t, `{"version": 2, "runtimes": {"local": {"url": "http://127.0.0.1:4096", "max_concurrent": 4}},
+	  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "/tmp/x"}, "runtime": "local"}]}`)
+	widerBlock, ok := wider.RuntimeBlock("local")
+	if !ok || widerBlock.MaxConcurrentTasks() != 4 {
+		t.Fatalf("a breadth of four was not carried: %+v", widerBlock)
+	}
+
 	cases := map[string]string{
-		"max_concurrent above one": `{"max_concurrent": 4}`,
-		"a bare host":              `{"url": "builder-a.lan:4096"}`,
-		"an unparsable deadline":   `{"url": "http://h:1", "deadline": "soon"}`,
-		"half a credential pair":   `{"url": "http://h:1", "auth": {"user": "flowhub"}}`,
-		"an empty user":            `{"url": "http://h:1", "auth": {"password_env": "X"}}`,
+		"a breadth of zero":           `{"max_concurrent": 0}`,
+		"a negative breadth":          `{"max_concurrent": -2}`,
+		"a breadth above the maximum": `{"max_concurrent": 65}`,
+		"a bare host":                 `{"url": "builder-a.lan:4096"}`,
+		"an unparsable deadline":      `{"url": "http://h:1", "deadline": "soon"}`,
+		"half a credential pair":      `{"url": "http://h:1", "auth": {"user": "flowhub"}}`,
+		"an empty user":               `{"url": "http://h:1", "auth": {"password_env": "X"}}`,
 	}
 	for name, block := range cases {
 		t.Run(name, func(t *testing.T) {
