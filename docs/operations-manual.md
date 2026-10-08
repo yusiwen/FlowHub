@@ -274,11 +274,19 @@ The default path is `~/.config/flowhub/config.json`
 overrides it. The file lives outside the repository on purpose: it is
 host-specific.
 
-> **Known rough edge in the template.** `config/config.example.json` references
-> `prompt_file` paths (`prompts/youtrack.md`, `prompts/test-project.md`) that do
-> not exist in the repository. A `prompt_file` is validated at load time and a
-> missing file **stops the start**. Either create those files or **delete the
-> `prompt_file` lines** from your copy. Deleting them is the fast path.
+The template's two `prompt_file` references (`prompts/youtrack.md`,
+`prompts/test-project.md`) ship in the same directory, and the example configuration
+resolves them **relative to the configuration file**. Copy the `prompts` directory
+alongside it, or delete the two `prompt_file` lines. A `prompt_file` that is missing,
+empty, a directory or over 32 KiB refuses the start — deliberately, because a
+configured file that silently did nothing is worse.
+
+The two levels differ: `sources.<name>.prompt_file` is standing guidance for every
+turn that source produces, while `projects[].prompt_file` applies only to the entry
+that names it. Both are appended to the adapter's built-in prompt under
+`## Operator instructions` (as `### This source` and `### This project`), and neither
+can switch off the untrusted-input rule, the reply tool or the
+`<!-- flowhub-auto -->` marker.
 
 ### 5.2 The minimum that works
 
