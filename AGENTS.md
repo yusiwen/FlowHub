@@ -163,6 +163,13 @@ documents. The rules below are load-bearing; do not relax them casually.
    carries an inline `password`) must be mode `0600`: group or other access refuses
    the start with the `chmod 600` fix in the message. Never print a password:
    `-print-config` names the source, and a test asserts the value stays out.
+   **Every path that talks to an agent server resolves credentials by runtime name**,
+   and that name comes from the declaration that owns the address
+   (`defaultRuntimeNameFor`: the first declared block whose URL is
+   `FLOWHUB_OPENCODE_URL`, else `default`) — the startup probe, the activation prober
+   and the turn must present the same pair. Probing under the fallback name while the
+   credentials live under a declared name is how a correct table was refused with a
+   401 on 2026-10-08.
 4. **Parsing is lenient.** Nothing but `event` is required, unknown fields are
    ignored, and `changedFields[].value/oldValue` stay `json.RawMessage`: the
    released app, its `main` branch and the official docs disagree.
