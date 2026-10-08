@@ -323,9 +323,11 @@ Rules that decide whether the start is allowed:
 * It is applied before the subcommand dispatch, so `flowhub runtime init --check` sees
   the same values.
 
-A service host should usually keep `EnvironmentFile=` in the unit (§10.1) and leave
-`FLOWHUB_ENV_FILE=-` here. Keeping both is safe too: the environment beats the file, so
-the unit's values are authoritative either way.
+A service host should keep `EnvironmentFile=` in the unit (§10.1) and set
+`FLOWHUB_ENV_FILE=-` there, so exactly one file describes that host. Sharing the
+`.env` with the unit also works — the environment beats the file, so the unit's values
+are authoritative — but the file is **still read**: it must be `0600`, and every
+variable it sets that the unit does not will apply.
 
 ### 5.3 The minimum that works
 
