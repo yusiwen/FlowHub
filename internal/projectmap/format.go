@@ -62,6 +62,11 @@ type v2File struct {
 	Runtimes      map[string]v2Runtime `json:"runtimes,omitempty"`
 	Projects      []v2Project          `json:"projects"`
 	RuntimePolicy string               `json:"runtime_policy,omitempty"`
+	// CredentialsFile names one JSON file holding Basic Auth pairs keyed by runtime
+	// name, so a deployment with several hosts does not have to export a variable per
+	// host (and a service unit does not have to duplicate the secrets). It is read
+	// once, at load time, and must not be readable by group or other.
+	CredentialsFile string `json:"credentials_file,omitempty"`
 }
 
 // v2Source is one `sources.<name>` block: whether the source exists at all, what
@@ -119,9 +124,18 @@ type v2Runtime struct {
 
 type v2RuntimeAuth struct {
 	User string `json:"user"`
-	// PasswordEnv names the environment variable holding the password. An empty name
-	// with a user is refused: half a credential pair fails every turn, late.
-	PasswordEnv string `json:"password_env"`
+	// Exactly one of Password, PasswordEnv and PasswordFile may be named. The
+	// credentials file may also supply the pair, keyed by runtime name; a runtime that
+	// names one of these three wins over it, and naming more than one is refused at
+	// load time, because "which password is in force" must not be ambiguous.
+	//
+	// PasswordEnv is the spelling that keeps the configuration file free of secrets
+	// and predates the other two; Password writes the secret into the file, which is
+	// why the file's own permissions are then enforced; PasswordFile keeps one secret
+	// per file.
+	Password     string `json:"password,omitempty"`
+	PasswordEnv  string `json:"password_env,omitempty"`
+	PasswordFile string `json:"password_file,omitempty"`
 }
 
 // v2Project is one `projects[]` entry.
@@ -374,6 +388,14 @@ func (m *Map) Provenance(defaults PolicyDefaults) []Provenance {
 		block := m.runtimes[name]
 		scope := "runtimes." + name
 		for _, field := range []string{"url", "auth", "agent", "model", "deadline", "max_concurrent"} {
+			// `auth` is rendered by the Map, because naming the source of the password
+			// needs the credentials file and the environment.
+			if field == "auth" {
+				if value, named := m.renderAuth(name); named {
+					out = append(out, Provenance{Scope: scope, Field: field, Value: value, Level: scope})
+				}
+				continue
+			}
 			if value, named := renderRuntimeField(block, field); named {
 				out = append(out, Provenance{Scope: scope, Field: field, Value: value, Level: scope})
 			}
@@ -428,7 +450,10 @@ func renderRuntimeField(block v2Runtime, field string) (string, bool) {
 		if block.Auth == nil {
 			return "", false
 		}
-		return block.Auth.User + " (password from $" + block.Auth.PasswordEnv + ")", true
+		// Reached only for a block whose source the Map could not resolve; the report
+		// path uses renderAuth, which names the level that actually supplied the
+		// password. This fallback names the declaration, never a secret.
+		return block.Auth.User + " (password from a runtime-specific source)", true
 	case "agent":
 		return block.Agent, strings.TrimSpace(block.Agent) != ""
 	case "model":
