@@ -497,3 +497,63 @@ func TestTheEnvFileReportNamesVariablesNeverValues(t *testing.T) {
 }
 
 var errEnvFileProbe = errors.New("environment file refused")
+
+// TestTheFallbackProbeUsesTheRuntimeCredentials is the regression test for a 401
+// found live on 2026-10-08: a runtime whose `auth` block named a variable was refused
+// at startup — "opencode at … is not answering: GET /global/health: HTTP 401" — while
+// the same credentials served the turns fine.
+//
+// The fallback runtime (`FLOWHUB_OPENCODE_URL`, named `default`) was built from
+// `cfg.OpenCodeUser`/`Password`, which only ever holds the process-wide environment
+// pair, and it is the runtime the reachability probe uses when no host is enrolled.
+// The test asserts the probe accepts exactly the right pair and that a wrong one still
+// fails, so a future change cannot make the probe "pass" by dropping the header.
+func TestTheFallbackProbeUsesTheRuntimeCredentials(t *testing.T) {
+	// The variables this test drives are cleared so the assertion is about the file.
+	for _, name := range []string{"OSCRUB_OPENCODE_PASSWORD", "FLOWHUB_OPENCODE_USER", "FLOWHUB_OPENCODE_PASSWORD"} {
+		t.Setenv(name, "")
+		os.Unsetenv(name)
+	}
+	t.Setenv("OSCRUB_OPENCODE_PASSWORD", "from-the-config")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, password, ok := r.BasicAuth()
+		if !ok || user != "opencode" || password != "from-the-config" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"healthy":true,"version":"1.18.33"}`))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	// The runtime is declared under its own name pointing at FLOWHUB_OPENCODE_URL,
+	// which is the shape that was refused live: `default` is not the name the
+	// credentials live under, so probing as `default` sent no header at all.
+	body := `{"version": 2,
+	  "runtimes": {"local": {"url": "` + server.URL + `", "auth": {"user": "opencode", "password_env": "OSCRUB_OPENCODE_PASSWORD"}}},
+	  "projects": [{"source": "youtrack", "project": "TEST", "repo": {"path": "/tmp/test"}, "runtime": "local"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+
+	cfg := config.Config{OpenCodeURL: server.URL, TaskDeadline: time.Minute}
+	runtime := buildDefaultRuntime(cfg, projects, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := runtime.Health(context.Background()); err != nil {
+		t.Fatalf("the fallback runtime did not authenticate with the runtime's own credentials: %v", err)
+	}
+
+	// The control: without the credential the same probe must fail, so the assertion
+	// above is proving that the header was sent and accepted, not that the server is
+	// permissive.
+	noCredentials := buildDefaultRuntime(cfg, emptyProjects(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := noCredentials.Health(context.Background()); err == nil {
+		t.Fatal("a runtime without credentials was accepted by a server that requires them")
+	}
+}
