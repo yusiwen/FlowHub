@@ -350,3 +350,9 @@ make fmt-check && make lint && make test && make smoke
 
 Report the exact commands you ran and their results. If a check could not be run
 (for example a missing toolchain), say so explicitly instead of implying success.
+
+The same targets run in CI (`.github/workflows/ci.yml`) on every push to `master` and
+every pull request into it, so a local pass is the first gate rather than the only one.
+That job builds and tests with the Go version `go.mod` declares, and switches to
+`go1.27.1` for `staticcheck` alone, because the Makefile's pinned linter needs a newer
+toolchain than the module does.

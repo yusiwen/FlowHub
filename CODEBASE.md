@@ -171,6 +171,7 @@ Environment table and the curl examples are in `README.md`. Verification targets
 | File | Role |
 | --- | --- |
 | `Makefile` | Canonical workflow; injects `main.Version` / `main.CommitSHA` / `main.BuildTime` via ldflags and always builds with `CGO_ENABLED=0` |
+| `.github/workflows/ci.yml` | The same seven targets on `ubuntu-24.04`, for every push to `master`, every pull request into it and a manual dispatch; builds and tests with the version `go.mod` declares and switches to `go1.27.1` for `staticcheck` alone, because the pinned linter needs a newer toolchain than the module does |
 | `flake.nix` + `flake.lock` | Pinned Go 1.27 dev shell (Go, gopls, gofumpt, git, openssl, curl, jq) |
 | `.envrc` | direnv hook that activates the flake; sets `NIX_CONFIG` so the experimental features are on |
 | `scripts/smoke.sh` | End-to-end check driven by `make smoke`; self-cleaning, asserts HTTP codes, audit reasons, log modes and credential containment |
