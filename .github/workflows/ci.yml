@@ -51,7 +51,11 @@ jobs:
         run: make lint
 
       - name: staticcheck
-        run: make staticcheck
+        # The Makefile pins `staticcheck@v0.8.1` so local runs match CI, and that tool
+        # needs Go >= 1.26 to build — a property of the linter, not of this module,
+        # which declares 1.24. Everything else in this job runs on the declared floor;
+        # only this step switches to a toolchain that can build the pinned tool.
+        run: GOTOOLCHAIN=go1.27.1 make staticcheck
 
       - name: test
         run: make test
