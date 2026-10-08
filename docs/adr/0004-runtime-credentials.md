@@ -87,6 +87,21 @@ the first turn fails against another.
 
 ## Consequences
 
+* **Every path that talks to an agent server resolves credentials by runtime name, and
+  the name is derived from the declaration, not assumed.** The runtime factory and the
+  activation prober always did; the startup reachability probe did not, and on
+  2026-10-08 that produced a live 401: a table declaring `local` with
+  `auth.password_env` and no process-wide pair was refused with
+  `opencode at http://127.0.0.1:4096 is not answering: … HTTP 401`, while the turns it
+  would have authorised were configured correctly. Two things had to be true for that:
+  the probe built its client from `FLOWHUB_OPENCODE_USER`/`PASSWORD` (the environment
+  pair only), and it probed under the fallback name `default` rather than under the
+  declaration that owns the address. It now resolves through `ResolveCredential` named
+  `defaultRuntimeNameFor(cfg, projects)` — the first declared block whose URL is
+  `FLOWHUB_OPENCODE_URL`, else `default` — so the probe, the activation check and the
+  turn all present the same pair. A test asserts both that the right pair is accepted
+  and that a wrong one is still refused, so the probe cannot "pass" by dropping the
+  header.
 * **Rotating a password needs a restart.** The file is read once, when the table is
   loaded, exactly as the environment pair always was. Stated in the README and the
   operations manual; the alternative was rejected above.
