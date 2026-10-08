@@ -1,0 +1,67 @@
+# The gate AGENTS.md asks a contributor to run locally, run again on every change.
+#
+# It uses the Go version the module declares (`go.mod`) rather than the toolchain this
+# repository happens to be developed with, so a green run also proves the module builds
+# with the version it asks for. The runner image supplies what the rest of the suite
+# needs: a C toolchain for `make test-race` (the race detector needs cgo), and jq, curl
+# and openssl for `make smoke`, which starts the real binary on a loopback port and
+# asserts the HTTP responses, the audit trail, the payload schema, the credential
+# containment and the drain-on-shutdown log line.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate
+    # Pinned rather than `ubuntu-latest`, so an image migration is a decision in this
+    # repository instead of a silent change on the next run.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          # The module is standard-library only, so it has no go.sum and there is
+          # nothing for setup-go's dependency cache to key on — asking for it warns
+          # "Dependencies file is not found". Turn it back on if a dependency appears.
+          cache: false
+
+      - name: build
+        run: make build
+
+      - name: fmt-check
+        run: make fmt-check
+
+      - name: lint
+        run: make lint
+
+      - name: staticcheck
+        # The Makefile pins `staticcheck@v0.8.1` so local runs match CI, and that tool
+        # needs Go >= 1.26 to build — a property of the linter, not of this module,
+        # which declares 1.24. Everything else in this job runs on the declared floor;
+        # only this step switches to a toolchain that can build the pinned tool.
+        run: GOTOOLCHAIN=go1.27.1 make staticcheck
+
+      - name: test
+        run: make test
+
+      - name: test-race
+        run: make test-race
+
+      - name: smoke
+        run: make smoke
