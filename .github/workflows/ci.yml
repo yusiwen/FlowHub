@@ -7,6 +7,12 @@
 # and openssl for `make smoke`, which starts the real binary on a loopback port and
 # asserts the HTTP responses, the audit trail, the payload schema, the credential
 # containment and the drain-on-shutdown log line.
+#
+# Every action is pinned by commit SHA with the release it is named in a trailing
+# comment: a tag can be moved, and these steps run with a token that can read this
+# repository. To bump one, read the release's diff and change the SHA and the comment
+# together. `actions/cache` is `v6.1.0`, `actions/checkout` is `v7.0.1` and
+# `actions/setup-go` is `v7.0.0` as of this writing.
 name: ci
 
 on:
@@ -31,15 +37,36 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # The module is standard-library only, so it has no go.sum and there is
-          # nothing for setup-go's dependency cache to key on — asking for it warns
-          # "Dependencies file is not found". Turn it back on if a dependency appears.
+          # The module is standard-library only, so it has no go.sum for setup-go's
+          # dependency cache to key on — asking for it warns "Dependencies file is not
+          # found". The two explicit caches below cover what is actually re-downloaded;
+          # turn this back on if a dependency ever appears.
           cache: false
+
+      # `make staticcheck` runs `go run honnef.co/go/tools/cmd/staticcheck@v0.8.1`, and
+      # the go1.27.1 toolchain that tool needs, and Go keeps both in the module cache:
+      # without this they are fetched on every run. The key follows the two files that
+      # pin those versions, so bumping either invalidates the entry.
+      - name: cache the linter module and its toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-mod-${{ hashFiles('Makefile', '.github/workflows/ci.yml') }}
+          restore-keys: ${{ runner.os }}-go-mod-
+
+      # setup-go's own cache is off, so the compiled standard library would be rebuilt
+      # on every run without this.
+      - name: cache the go build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-go-build-${{ hashFiles('**/*.go', 'go.mod', 'Makefile') }}
+          restore-keys: ${{ runner.os }}-go-build-
 
       - name: build
         run: make build
@@ -65,3 +92,39 @@ jobs:
 
       - name: smoke
         run: make smoke
+
+  # `gate` builds for the runner's own platform. `make releases` also cross-compiles
+  # darwin/arm64, and until this job existed nothing compiled it anywhere: a
+  # macOS-only compile error would have surfaced first on a maintainer's machine. The
+  # module is pure Go with CGO_ENABLED=0, so it cross-compiles from Linux.
+  cross-compile:
+    name: cross-compile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: cross-compile linux/amd64, linux/arm64 and darwin/arm64
+        run: make all
+
+      # A cross-compile that silently produced the host binary, or an archive that was
+      # never written, would otherwise pass. The four magic bytes settle it: ELF for
+      # both Linux targets, Mach-O 64-bit little-endian for darwin/arm64.
+      - name: assert each artifact is the format it claims
+        run: |
+          set -euo pipefail
+          for spec in linux-amd64:7f454c46 linux-arm64:7f454c46 darwin-arm64:cffaedfe; do
+            name="${spec%%:*}"
+            want="${spec##*:}"
+            got="$(od -An -tx1 -N4 "bin/flowhub-$name" | tr -d ' \n')"
+            if [ "$got" != "$want" ]; then
+              echo "bin/flowhub-$name: magic bytes $got, want $want" >&2
+              exit 1
+            fi
+            echo "bin/flowhub-$name: $got"
+          done
