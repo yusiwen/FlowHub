@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 )
 
@@ -470,15 +469,4 @@ func (m *Map) HasInlinePassword() bool {
 		}
 	}
 	return false
-}
-
-// sortedCredentialNames lists the resolved credentials' runtime names, for tests and
-// diagnostics.
-func (m *Map) sortedCredentialNames() []string {
-	names := make([]string, 0, len(m.credentials))
-	for name := range m.credentials {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
 }
