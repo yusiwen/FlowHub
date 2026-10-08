@@ -100,8 +100,8 @@ func run() error {
 	// what it knows — rather than surfacing later as a delivery that can never be
 	// decoded. Adding a source is one Register call plus its package.
 	sources := source.NewRegistry()
-	if err := sources.Register(youtrack.SourceName, func(policy rules.Policy) source.Source {
-		return youtrack.New(policy)
+	if err := sources.Register(youtrack.SourceName, func(policy rules.Policy, instructions string) source.Source {
+		return youtrack.New(policy, instructions)
 	}); err != nil {
 		return err
 	}
@@ -133,7 +133,10 @@ func run() error {
 	// so the phrase the dispatcher matches can come from the file without the
 	// environment forgetting what the operator typed.
 	resolved := projects.Policy(cfg.Source, sourcePolicyDefaults(cfg))
-	src, err := sources.Build(cfg.Source, resolved.Policy)
+	// The source's own prompt_file travels with the adapter: it is standing guidance
+	// for every turn this source produces, so it cannot ride on a per-turn context
+	// (which carries the *project's* file instead).
+	src, err := sources.Build(cfg.Source, resolved.Policy, projects.SourcePromptExtra(cfg.Source))
 	if err != nil {
 		return err
 	}

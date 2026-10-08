@@ -12,7 +12,7 @@ import (
 
 func decode(t *testing.T, body string) *event.Event {
 	t.Helper()
-	decoded, err := New(rules.Policy{}).Parse(&source.Request{Body: []byte(body)})
+	decoded, err := New(rules.Policy{}, "").Parse(&source.Request{Body: []byte(body)})
 	if err != nil {
 		t.Fatalf("Parse(%s): %v", body, err)
 	}
@@ -149,7 +149,7 @@ func TestParseCopiesTheSubjectAndTheActor(t *testing.T) {
 // expects. The policy's own tests build events by hand, so only this test would
 // catch an adapter that classified a payload differently from what it used to.
 func TestDecodeFeedsTheTriggerPolicy(t *testing.T) {
-	src := New(rules.Policy{})
+	src := New(rules.Policy{}, "")
 
 	tests := []struct {
 		name string

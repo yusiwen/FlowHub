@@ -56,7 +56,7 @@ type harness struct {
 func newHarness(t *testing.T, mutate func(*Options)) *harness {
 	t.Helper()
 	opts := Options{
-		Source:       youtrack.New(rules.Policy{}),
+		Source:       youtrack.New(rules.Policy{}, ""),
 		HookPath:     "/hooks/youtrack",
 		HookKey:      testKey,
 		TokenHeader:  "X-YouTrack-Token",

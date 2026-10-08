@@ -14,20 +14,29 @@ import (
 // audit record and in the log.
 const SourceName = "youtrack"
 
-// Source is the YouTrack adapter. Its only state is the trigger policy, which the
+// Source is the YouTrack adapter. Its state is the trigger policy — which the
 // environment may override and which the prompt has to name exactly (a prompt that
 // tells the maintainer to type a phrase the trigger does not recognise is worse
-// than no prompt at all).
+// than no prompt at all) — and the source's own `sources.youtrack.prompt_file`,
+// read when the configuration was loaded.
 type Source struct {
 	policy rules.Policy
+	// instructions is the source-level prompt_file's content. It applies to every
+	// turn this source produces, which is the point of declaring it at the source
+	// level rather than per project; a per-project file arrives per turn instead
+	// (rules.PromptContext.Instructions).
+	instructions string
 }
 
 // New builds the adapter. A zero policy means "the measured defaults".
-func New(policy rules.Policy) *Source {
+//
+// instructions is the source's own `prompt_file`, already read and validated by the
+// configuration loader; an empty string means no file was declared.
+func New(policy rules.Policy, instructions string) *Source {
 	if strings.TrimSpace(policy.Trigger) == "" {
 		policy = rules.Policy{}
 	}
-	return &Source{policy: policy.Defaults()}
+	return &Source{policy: policy.Defaults(), instructions: strings.TrimSpace(instructions)}
 }
 
 // Name implements source.Source.

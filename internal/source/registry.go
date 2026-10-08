@@ -9,13 +9,17 @@ import (
 	"github.com/yusiwen/flowhub/internal/rules"
 )
 
-// Factory builds one source adapter from the trigger policy the configuration
-// resolved for it.
+// Factory builds one source adapter from the configuration that belongs to it: the
+// trigger policy the file resolved, and the source's own `prompt_file` content.
 //
 // It is a function rather than an interface so that a source's own constructor
-// (which may take more than a policy) stays its own business: the registry's only
-// job is to answer "can this binary build the source this file names?".
-type Factory func(policy rules.Policy) Source
+// (which may take more than these) stays its own business: the registry's only job
+// is to answer "can this binary build the source this file names?".
+//
+// The prompt text is passed in rather than read by the adapter because reading and
+// validating it is the configuration file's job: a `prompt_file` that is missing,
+// empty or oversized has to refuse the start before any adapter exists.
+type Factory func(policy rules.Policy, instructions string) Source
 
 // Registry is the compile-time list of the sources this binary can build.
 //
@@ -80,8 +84,9 @@ func (r *Registry) Has(name string) bool {
 }
 
 // Build constructs one adapter, or explains that the name is unknown and what is
-// known instead.
-func (r *Registry) Build(name string, policy rules.Policy) (Source, error) {
+// known instead. instructions is the source's own `prompt_file`, or "" when the
+// configuration declared none.
+func (r *Registry) Build(name string, policy rules.Policy, instructions string) (Source, error) {
 	normalized := normalizeName(name)
 	if r == nil {
 		return nil, fmt.Errorf("source %s: this binary has no source registry", name)
@@ -97,7 +102,7 @@ func (r *Registry) Build(name string, policy rules.Policy) (Source, error) {
 		sort.Strings(known)
 		return nil, fmt.Errorf("source %s is not one this binary can build (it knows: %v)", name, known)
 	}
-	return factory(policy), nil
+	return factory(policy, instructions), nil
 }
 
 // normalizeName keeps a name comparable to what a configuration file writes: source
