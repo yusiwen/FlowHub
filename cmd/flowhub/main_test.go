@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -210,7 +211,14 @@ func TestProberNeedsOnlyLivenessWhenNoProfileIsClaimed(t *testing.T) {
 // the runtime factory the dispatcher uses for every turn, and the activation prober
 // that decides whether a host may take work. If only one of them sent the
 // credentials, a remote runtime would enrol and then fail every turn.
+//
+// Since the credentials surface gained a shared file and per-runtime blocks, both
+// builders resolve through projectmap.ResolveCredential, so this test pins the
+// process-wide default reaching both paths.
 func TestAgentCallsCarryTheConfiguredCredentials(t *testing.T) {
+	t.Setenv("FLOWHUB_OPENCODE_USER", "flowhub")
+	t.Setenv("FLOWHUB_OPENCODE_PASSWORD", "hunter2")
+
 	var seen []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, password, ok := r.BasicAuth()
@@ -231,15 +239,11 @@ func TestAgentCallsCarryTheConfiguredCredentials(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := config.Config{
-		OpenCodeURL:      server.URL,
-		OpenCodeUser:     "flowhub",
-		OpenCodePassword: "hunter2",
-		TaskDeadline:     time.Minute,
-	}
+	projects := emptyProjects(t)
+	cfg := config.Config{OpenCodeURL: server.URL, TaskDeadline: time.Minute}
 
 	// The runtime the dispatcher builds for each host.
-	runtime := newRuntimeFactory(cfg, emptyProjects(t), slog.New(slog.NewTextHandler(io.Discard, nil)))("builder-a", server.URL)
+	runtime := newRuntimeFactory(cfg, projects, slog.New(slog.NewTextHandler(io.Discard, nil)))("builder-a", server.URL)
 	if _, err := runtime.Health(context.Background()); err != nil {
 		t.Fatalf("Health: %v", err)
 	}
@@ -247,7 +251,7 @@ func TestAgentCallsCarryTheConfiguredCredentials(t *testing.T) {
 	// The prober that decides whether the host can take work at all, with a claimed
 	// profile and model so it reads the agent registry and the model catalogue too:
 	// every path to a remote server has to carry the credentials.
-	if err := (opencodeProber{cfg: cfg, timeout: 2 * time.Second}).Probe(context.Background(), runtimes.Claim{
+	if err := (opencodeProber{cfg: cfg, projects: projects, timeout: 2 * time.Second}).Probe(context.Background(), runtimes.Claim{
 		Name: "builder-a", Advertise: server.URL, AgentProfile: "devops",
 		Models: map[string]string{"devops": "deepseek/deepseek-flash"},
 	}); err != nil {
@@ -261,6 +265,126 @@ func TestAgentCallsCarryTheConfiguredCredentials(t *testing.T) {
 		if credentials != "flowhub:hunter2" {
 			t.Fatalf("credentials = %q, want flowhub:hunter2", credentials)
 		}
+	}
+}
+
+// TestRuntimeCredentialsComeFromTheCredentialsFile is the acceptance test for the
+// shared file: a runtime whose `auth` block only names a user takes its password from
+// `credentials_file`, and **both** client builders use it — a file that reached only
+// one of them would enrol a host and then fail every turn.
+func TestRuntimeCredentialsComeFromTheCredentialsFile(t *testing.T) {
+	t.Setenv("FLOWHUB_OPENCODE_USER", "")
+	t.Setenv("FLOWHUB_OPENCODE_PASSWORD", "")
+
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if user, password, ok := r.BasicAuth(); ok {
+			seen = append(seen, user+":"+password)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/global/health":
+			_, _ = w.Write([]byte(`{"healthy":true,"version":"1.18.31"}`))
+		case "/agent":
+			_, _ = w.Write([]byte(`[{"name":"devops","mode":"primary"}]`))
+		case "/provider":
+			_, _ = w.Write([]byte(`{"all":[{"id":"deepseek","models":{"deepseek-flash":{}}}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	credentials := filepath.Join(dir, "credentials.json")
+	if err := os.WriteFile(credentials, []byte(`{"runtimes": {"builder-a": {"user": "flowhub", "password": "from-file"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	body := `{"version": 2, "credentials_file": "credentials.json",
+	  "runtimes": {"builder-a": {"url": "` + server.URL + `", "auth": {"user": "flowhub"}}},
+	  "projects": [{"source": "youtrack", "project": "TEST", "repo": {"path": "/tmp/test"}, "runtime": "builder-a"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+	if problems := declaredAuthProblems(projects); len(problems) != 0 {
+		t.Fatalf("declaredAuthProblems = %v, want none", problems)
+	}
+
+	cfg := config.Config{OpenCodeURL: server.URL, TaskDeadline: time.Minute}
+	runtime := newRuntimeFactory(cfg, projects, slog.New(slog.NewTextHandler(io.Discard, nil)))("builder-a", server.URL)
+	if _, err := runtime.Health(context.Background()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if err := (opencodeProber{cfg: cfg, projects: projects, timeout: 2 * time.Second}).Probe(context.Background(), runtimes.Claim{
+		Name: "builder-a", Advertise: server.URL, AgentProfile: "devops",
+		Models: map[string]string{"devops": "deepseek/deepseek-flash"},
+	}); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+
+	if len(seen) < 4 {
+		t.Fatalf("only %d request(s) carried credentials, want every path to send them", len(seen))
+	}
+	for _, got := range seen {
+		if got != "flowhub:from-file" {
+			t.Fatalf("credentials = %q, want flowhub:from-file", got)
+		}
+	}
+}
+
+// TestAWorldReadableConfigRefusesToStartWhenItHoldsAPassword pins the permission
+// gate: a file that carries an inline password is itself a secret, and a group- or
+// world-readable one refuses the start. A file that only names a variable is exempt,
+// because refusing it would break deployments that hold no secret at all.
+func TestAWorldReadableConfigRefusesToStartWhenItHoldsAPassword(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	load := func(body string, mode os.FileMode) *projectmap.Map {
+		t.Helper()
+		path := filepath.Join(dir, "config.json")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		projects, err := projectmap.Load(path)
+		if err != nil {
+			t.Fatalf("projectmap.Load: %v", err)
+		}
+		return projects
+	}
+	inline := `{"version": 2, "runtimes": {"local": {"url": "http://127.0.0.1:4096", "auth": {"user": "opencode", "password": "s3cret"}}},
+	  "projects": [{"source": "youtrack", "project": "TEST", "repo": {"path": "/tmp/test"}, "runtime": "local"}]}`
+	viaEnv := `{"version": 2, "runtimes": {"local": {"url": "http://127.0.0.1:4096", "auth": {"user": "opencode", "password_env": "LOCAL_PASSWORD"}}},
+	  "projects": [{"source": "youtrack", "project": "TEST", "repo": {"path": "/tmp/test"}, "runtime": "local"}]}`
+
+	projects := load(inline, 0o600)
+	if problems := configFileSecretProblems(filepath.Join(dir, "config.json"), projects); len(problems) != 0 {
+		t.Fatalf("a 0600 file holding a password was refused: %v", problems)
+	}
+	if !projects.HasInlinePassword() {
+		t.Fatal("HasInlinePassword = false for a file that carries one")
+	}
+
+	worldReadable := load(inline, 0o644)
+	if problems := configFileSecretProblems(filepath.Join(dir, "config.json"), worldReadable); len(problems) == 0 {
+		t.Fatal("a 0644 file holding a password was accepted")
+	}
+
+	noSecret := load(viaEnv, 0o644)
+	if noSecret.HasInlinePassword() {
+		t.Fatal("HasInlinePassword = true for a file that only names a variable")
+	}
+	if problems := configFileSecretProblems(filepath.Join(dir, "config.json"), noSecret); len(problems) != 0 {
+		t.Fatalf("a 0644 file naming a variable was refused: %v", problems)
 	}
 }
 

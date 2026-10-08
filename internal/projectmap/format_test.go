@@ -250,7 +250,7 @@ func TestRuntimeBlocksCarryPolicyAndRefuseWhatCannotBeHonoured(t *testing.T) {
 		"a breadth above the maximum": `{"max_concurrent": 65}`,
 		"a bare host":                 `{"url": "builder-a.lan:4096"}`,
 		"an unparsable deadline":      `{"url": "http://h:1", "deadline": "soon"}`,
-		"half a credential pair":      `{"url": "http://h:1", "auth": {"user": "flowhub"}}`,
+		"two password sources":        `{"url": "http://h:1", "auth": {"user": "flowhub", "password_env": "X", "password_file": "p.pass"}}`,
 		"an empty user":               `{"url": "http://h:1", "auth": {"password_env": "X"}}`,
 	}
 	for name, block := range cases {
