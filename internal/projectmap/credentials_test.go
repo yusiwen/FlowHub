@@ -133,15 +133,28 @@ func TestCredentialSourcesResolveInPriorityOrder(t *testing.T) {
 
 // TestCredentialsFileCanNameAnUndeclaredRuntime is the typo detector: an entry for a
 // runtime the configuration never declares silently disables a credential, so it is
-// reported instead.
+// reported instead — with one exemption, `default`, which is the runtime built from
+// FLOWHUB_OPENCODE_URL and therefore has no block that could carry its `auth`.
 func TestCredentialsFileCanNameAnUndeclaredRuntime(t *testing.T) {
 	f := newCredentialFixture(t)
-	f.write(t, "credentials.json", `{"runtimes": {"locl": {"user": "u", "password": "p"}}}`, 0o600)
+	f.write(t, "credentials.json", `{"runtimes": {
+	  "locl":    {"user": "u", "password": "p"},
+	  "default": {"user": "opencode", "password": "from-the-file"}
+	}}`, 0o600)
 	m := f.config(t, `{"version": 2, "credentials_file": "credentials.json"`+projectSuffix)
 
 	problems := m.RuntimeCredentialProblems(env(nil))
-	if len(problems) != 1 || !strings.Contains(problems[0], "locl") {
-		t.Fatalf("RuntimeCredentialProblems = %v, want one problem naming locl", problems)
+	if !hasProblem(problems, "locl") {
+		t.Fatalf("RuntimeCredentialProblems = %v, want a problem naming locl", problems)
+	}
+	if hasProblem(problems, DefaultRuntimeName) {
+		t.Fatalf("RuntimeCredentialProblems = %v, want no problem for the fallback runtime", problems)
+	}
+	// The exemption is not cosmetic: the pair has to resolve, or it would be an entry
+	// that parses and does nothing.
+	credential, ok := m.ResolveCredential(DefaultRuntimeName, env(nil))
+	if !ok || credential.Password != "from-the-file" || credential.User != "opencode" {
+		t.Fatalf("ResolveCredential(%q) = %+v (ok=%v), want the file's pair", DefaultRuntimeName, credential, ok)
 	}
 }
 
