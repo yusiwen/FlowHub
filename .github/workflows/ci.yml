@@ -26,15 +26,20 @@ concurrency:
 jobs:
   gate:
     name: gate
-    runs-on: ubuntu-latest
+    # Pinned rather than `ubuntu-latest`, so an image migration is a decision in this
+    # repository instead of a silent change on the next run.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache: true
+          # The module is standard-library only, so it has no go.sum and there is
+          # nothing for setup-go's dependency cache to key on — asking for it warns
+          # "Dependencies file is not found". Turn it back on if a dependency appears.
+          cache: false
 
       - name: build
         run: make build
