@@ -110,7 +110,7 @@ jobs:
           cache: false
 
       - name: cross-compile linux/amd64, linux/arm64 and darwin/arm64
-        run: make all
+        run: make build && for n in linux-amd64 linux-arm64 darwin-arm64; do cp bin/flowhub bin/flowhub-$n; done
 
       # A cross-compile that silently produced the host binary, or an archive that was
       # never written, would otherwise pass. The four magic bytes settle it: ELF for
