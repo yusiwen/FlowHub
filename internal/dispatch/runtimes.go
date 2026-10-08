@@ -18,7 +18,11 @@ import (
 // the environment (`FLOWHUB_OPENCODE_URL`). A host that was never enrolled still
 // records a runtime on every task, so the binding is uniform and the removal
 // checks have something to compare.
-const DefaultRuntimeName = "default"
+// DefaultRuntimeName is the runtime that exists without being enrolled, built from
+// FLOWHUB_OPENCODE_URL. It is spelled once, in projectmap, because the credentials
+// loader needs the same name to allow a credentials entry for it (a runtime the
+// routing table never declares).
+const DefaultRuntimeName = projectmap.DefaultRuntimeName
 
 // pickRuntime decides which host serves a task.
 //

@@ -65,6 +65,13 @@ type Credential struct {
 	Source string
 }
 
+// DefaultRuntimeName is the runtime `main` builds for `FLOWHUB_OPENCODE_URL` when no
+// host is enrolled, and the name the credentials loader allows an entry for even
+// though the routing table never declares it. `internal/dispatch` (which imports this
+// package) spells its own constant as a reference to this one, so the name has one
+// definition.
+const DefaultRuntimeName = "default"
+
 // ErrNoCredential reports that no source supplied a password for a runtime that
 // names a user. It is a sentinel so a caller can tell "half a pair" apart from "no
 // auth configured at all".
@@ -254,6 +261,13 @@ func (m *Map) RuntimeCredentialProblems(getenv func(string) string) []string {
 		declared[name] = true
 	}
 	for _, name := range sortedKeys(m.credentials) {
+		// The fallback runtime is named by the binary, not by the file, so a
+		// credentials entry for it is legitimate even though no `runtimes.default`
+		// block exists. Every other name has to be declared: there a missing block is
+		// almost always a typo, which is what this check is for.
+		if name == DefaultRuntimeName {
+			continue
+		}
 		if !declared[name] {
 			problems = append(problems, fmt.Sprintf(
 				"credentials_file %s: runtimes.%s names a runtime the configuration does not declare (a typo here silently disables the credential)",

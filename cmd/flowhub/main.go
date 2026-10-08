@@ -436,6 +436,49 @@ func sourcePolicyDefaults(cfg config.Config) projectmap.PolicyDefaults {
 	}
 }
 
+// buildDefaultRuntime builds the runtime that exists without being enrolled:
+// `FLOWHUB_OPENCODE_URL`, named `dispatch.DefaultRuntimeName`.
+//
+// It resolves its credentials through `projectmap.ResolveCredential` exactly as
+// `newRuntimeFactory` does, because it is the runtime the liveness probe uses when no
+// host is enrolled — and a probe that authenticates differently from the turns it
+// authorises is how a correctly configured runtime is refused at startup with a 401
+// while the turns themselves would have worked (found live on 2026-10-08).
+//
+// The *name* matters as much as the lookup. A routing table usually declares its host
+// under its own name (say `local`) rather than under `default`, and the `auth` block
+// lives there; probing as `default` then finds no credentials at all and sends no
+// header, even though the URL is the one the dispatcher will use. The name is
+// therefore taken from the declaration whose URL is this address — the runtime that
+// will actually carry the work — and only then from the fallback name.
+func buildDefaultRuntime(cfg config.Config, projects *projectmap.Map, logger *slog.Logger) agent.Runtime {
+	credential, _ := projects.ResolveCredential(defaultRuntimeNameFor(cfg, projects), os.Getenv)
+	client := agentruntime.New(agentruntime.Options{
+		BaseURL:  cfg.OpenCodeURL,
+		Username: credential.User,
+		Password: credential.Password,
+		Timeout:  cfg.TaskDeadline,
+	})
+	return agentruntime.NewRuntime(client, agentruntime.RuntimeOptions{
+		Name: dispatch.DefaultRuntimeName, Log: logger, FirstResponse: cfg.FirstResponse,
+	})
+}
+
+// defaultRuntimeNameFor answers which runtime's credentials belong to
+// `FLOWHUB_OPENCODE_URL`: the first declared block whose URL is that address, or
+// `default` when the table declares none of it.
+func defaultRuntimeNameFor(cfg config.Config, projects *projectmap.Map) string {
+	want := strings.TrimSpace(cfg.OpenCodeURL)
+	if want != "" {
+		for _, name := range projects.Runtimes() {
+			if block, ok := projects.RuntimeBlock(name); ok && strings.TrimSpace(block.URL) == want {
+				return name
+			}
+		}
+	}
+	return dispatch.DefaultRuntimeName
+}
+
 // newRuntimeFactory returns the constructor the dispatcher uses to build one
 // runtime adapter per host.
 //
@@ -700,15 +743,11 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 			"pause_file", cfg.ResolvedPauseFile())
 	}
 
-	client := agentruntime.New(agentruntime.Options{
-		BaseURL:  cfg.OpenCodeURL,
-		Username: cfg.OpenCodeUser,
-		Password: cfg.OpenCodePassword,
-		Timeout:  cfg.TaskDeadline,
-	})
-	defaultRuntime := agentruntime.NewRuntime(client, agentruntime.RuntimeOptions{
-		Name: dispatch.DefaultRuntimeName, Log: logger, FirstResponse: cfg.FirstResponse,
-	})
+	// The fallback runtime is built the same way the factory builds one, so the
+	// liveness probe and the turns it authorises use the same credentials. Building
+	// it from cfg.OpenCodeUser/Password directly is how a runtime whose `auth` block
+	// names a variable ended up refused at startup with a 401 (found 2026-10-08).
+	defaultRuntime := buildDefaultRuntime(cfg, projects, logger)
 	factory := newRuntimeFactory(cfg, projects, logger)
 	// Refuse to start when nothing can serve a turn: a dispatcher that accepts
 	// deliveries and then fails every one of them is worse than a refused start.
