@@ -52,7 +52,12 @@ jobs:
       # the go1.27.1 toolchain that tool needs, and Go keeps both in the module cache:
       # without this they are fetched on every run. The key follows the two files that
       # pin those versions, so bumping either invalidates the entry.
+      #
+      # The `if:` is not decoration: a pull request opened by Dependabot runs with a
+      # read-only GITHUB_TOKEN, so the cache's *save* would fail and annotate the run.
+      # Restoring is still fine there; it is the save that needs a write permission.
       - name: cache the linter module and its toolchain
+        if: github.actor != 'dependabot[bot]'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/go/pkg/mod
@@ -62,6 +67,7 @@ jobs:
       # setup-go's own cache is off, so the compiled standard library would be rebuilt
       # on every run without this.
       - name: cache the go build cache
+        if: github.actor != 'dependabot[bot]'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/go-build
@@ -128,3 +134,42 @@ jobs:
             fi
             echo "bin/flowhub-$name: $got"
           done
+
+  # `cross-compile` proves the darwin code *builds*; it cannot run it, because a Mach-O
+  # file does not execute on Linux. The code has macOS-only behaviour that only a run
+  # reaches, and it is not theoretical: `localworktree` canonicalises paths with
+  # `EvalSymlinks` because `/tmp` is a symlink to `/private/tmp` on macOS and the agent
+  # server keys a session by the literal directory string. With that canonicalisation
+  # removed, the suite fails on macOS and is expected to pass on Linux, which is exactly
+  # the blind spot this job closes.
+  #
+  # `make test` only. The race detector needs cgo on macOS and `make smoke` needs jq,
+  # openssl and a loopback port: neither adds coverage the Linux gate does not already
+  # have, and both cost minutes.
+  test-darwin:
+    name: test-darwin
+    # macos-14 is deprecated and `macos-latest` currently means macOS 26, so this is
+    # pinned deliberately, like the Ubuntu label above.
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: cache the go build cache
+        if: github.actor != 'dependabot[bot]'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: macOS-go-build-${{ hashFiles('**/*.go', 'go.mod', 'Makefile') }}
+          restore-keys: macOS-go-build-
+
+      - name: build
+        run: make build
+
+      - name: test
+        run: make test
