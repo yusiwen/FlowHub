@@ -455,3 +455,39 @@ func TestExpandSecretValue(t *testing.T) {
 		})
 	}
 }
+
+// TestTheReportNamesTheCredentialsFileWithoutAnAuthBlock covers the shape that needs no
+// `auth` block at all: a `credentials_file` entry carries the user *and* the password,
+// so a runtime that declares neither still authenticates — and the report has to say so,
+// because "where does this password come from" is the one question `-print-config`
+// exists to answer. Found on 2026-10-08, when a live machine used exactly this shape and
+// the report showed no auth line for the runtime that was in fact authenticating.
+func TestTheReportNamesTheCredentialsFileWithoutAnAuthBlock(t *testing.T) {
+	f := newCredentialFixture(t)
+	f.write(t, "credentials.json", `{"runtimes": {"local": {"user": "opencode", "password": "FILE-SECRET"}}}`, 0o600)
+	m := f.config(t, `{"version": 2, "credentials_file": "credentials.json",
+	  "runtimes": {"local": {"url": "http://h:1"}}`+projectSuffix)
+
+	var rendered strings.Builder
+	for _, value := range m.Provenance(PolicyDefaults{}) {
+		rendered.WriteString(value.Scope + " " + value.Field + "=" + value.Value + "\n")
+	}
+	if !strings.Contains(rendered.String(), "runtimes.local auth=") {
+		t.Fatalf("the report omits the auth line for a credentials-file-only runtime:\n%s", rendered.String())
+	}
+	if !strings.Contains(rendered.String(), "credentials_file:") {
+		t.Fatalf("the report does not name the credentials file as the source:\n%s", rendered.String())
+	}
+	if strings.Contains(rendered.String(), "FILE-SECRET") {
+		t.Fatalf("the report contains the password:\n%s", rendered.String())
+	}
+
+	// The control: a runtime with no auth block and no credentials entry still renders
+	// nothing, so the line above is not printed for every runtime.
+	plain := f.config(t, `{"version": 2, "runtimes": {"local": {"url": "http://h:1"}}`+projectSuffix)
+	for _, value := range plain.Provenance(PolicyDefaults{}) {
+		if value.Scope == "runtimes.local" && value.Field == "auth" {
+			t.Fatalf("an auth line appeared for a runtime with no credentials: %+v", value)
+		}
+	}
+}
