@@ -1,0 +1,58 @@
+# The gate AGENTS.md asks a contributor to run locally, run again on every change.
+#
+# It uses the Go version the module declares (`go.mod`) rather than the toolchain this
+# repository happens to be developed with, so a green run also proves the module builds
+# with the version it asks for. The runner image supplies what the rest of the suite
+# needs: a C toolchain for `make test-race` (the race detector needs cgo), and jq, curl
+# and openssl for `make smoke`, which starts the real binary on a loopback port and
+# asserts the HTTP responses, the audit trail, the payload schema, the credential
+# containment and the drain-on-shutdown log line.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: make build
+
+      - name: fmt-check
+        run: make fmt-check
+
+      - name: lint
+        run: make lint
+
+      - name: staticcheck
+        run: make staticcheck
+
+      - name: test
+        run: make test
+
+      - name: test-race
+        run: make test-race
+
+      - name: smoke
+        run: make smoke
