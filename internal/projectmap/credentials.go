@@ -451,13 +451,27 @@ func (m *Map) CredentialReport() []Provenance {
 // password came from. It never renders the password itself, whatever the source.
 func (m *Map) renderAuth(name string) (string, bool) {
 	block, declared := m.runtimes[name]
-	if !declared || block.Auth == nil {
+	hasBlock := declared && block.Auth != nil
+	// A `credentials_file` entry is a source in its own right: a runtime needs no
+	// `auth` block to use one, because the pair is already complete (user and password)
+	// inside the file. Reporting only blocks would leave that operator without an
+	// answer to "where does this password come from" — the one question the report
+	// exists for.
+	_, hasStored := m.credentials[strings.TrimSpace(name)]
+	if !hasBlock && !hasStored {
 		return "", false
 	}
-	user := strings.TrimSpace(block.Auth.User)
+	user := ""
+	if hasBlock {
+		user = strings.TrimSpace(block.Auth.User)
+	}
 	credential, ok := m.ResolveCredential(name, os.Getenv)
 	if !ok {
 		return fmt.Sprintf("user=%s password from <unresolved>", user), true
+	}
+	if user == "" {
+		// No block names a user, so the credentials file's own user is the answer.
+		user = credential.User
 	}
 	// The environment pair is a process-wide default, so it is only this runtime's
 	// source when nothing more specific answered; ResolveCredential already applied
