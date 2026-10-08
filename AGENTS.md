@@ -306,6 +306,19 @@ documents. The rules below are load-bearing; do not relax them casually.
     a product on purpose, because their job is that product's own host: `main`'s
     wiring, and `internal/provision` plus the activation prober, which install and
     verify opencode's files and read its agent registry and model catalogue.
+15. **The environment file supplies defaults, and the environment always wins.**
+    `~/.config/flowhub/.env` (or `FLOWHUB_ENV_FILE`; `-` disables it) is read by
+    `internal/config/envfile.go` and applied **before the subcommand dispatch**, so
+    `runtime init --check` sees what a start would see — that position is load-bearing
+    and a later move would silently stop the subcommands from getting the file.
+    Precedence is real environment → file → compiled default, and it must not be
+    inverted: `FLOWHUB_ADDR=… ./bin/flowhub` has to mean what it says, and a file the
+    operator forgot is not allowed to change it. `skipped_already_set` in the startup
+    log and `env_file_skipped:` in `-print-config` exist to explain exactly that
+    (see ADR 0005). The file holds the URL key and the token, so it carries the same
+    `0600` floor as the credentials file in rule 3, a malformed line refuses with its
+    line number, a duplicate key is refused rather than guessed, and **only variable
+    names may reach a log or a report** — never a value.
 
 ## Code Conventions
 

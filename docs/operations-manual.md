@@ -288,7 +288,46 @@ that names it. Both are appended to the adapter's built-in prompt under
 can switch off the untrusted-input rule, the reply tool or the
 `<!-- flowhub-auto -->` marker.
 
-### 5.2 The minimum that works
+### 5.2 Keep the environment in a file (development machines)
+
+Exporting the same variables in every new shell is avoidable. FlowHub reads
+`~/.config/flowhub/.env` at startup (`$XDG_CONFIG_HOME/flowhub/.env` when that is
+set), beside the routing table:
+
+```bash
+cat > ~/.config/flowhub/.env <<'EOF'
+# FlowHub settings for this machine. Mode 0600: it holds the URL key and the token.
+FLOWHUB_HOOK_KEY=<hex>
+FLOWHUB_TOKEN=<hex>
+FLOWHUB_ALLOWED_SOURCES=127.0.0.1
+EOF
+chmod 600 ~/.config/flowhub/.env
+./bin/flowhub            # no export needed
+```
+
+Rules that decide whether the start is allowed:
+
+* **The real environment always wins.** `FLOWHUB_ADDR=… ./bin/flowhub` uses that
+  address even when the file names another one; the startup log's
+  `skipped_already_set=` list names the file entries the environment overrode, and
+  `-print-config` prints the same as `env_file_skipped:`.
+* **`chmod 600`.** The file holds the URL key and the token, so group/other access
+  refuses the start with the fix in the message.
+* `FLOWHUB_ENV_FILE` points somewhere else; `-` (or `none`, `off`) disables the file.
+  A path you name that does not exist stops the start; an absent default path is fine.
+* Syntax is a subset: `KEY=VALUE`, `# comments`, blank lines, an optional `export `,
+  and surrounding quotes stripped. No `${VAR}`, no includes, no line continuations.
+  A malformed line refuses with its line number, and a duplicate key is refused rather
+  than guessed at.
+* Read once at startup, like the credentials file — rotating a value needs a restart.
+* It is applied before the subcommand dispatch, so `flowhub runtime init --check` sees
+  the same values.
+
+A service host should usually keep `EnvironmentFile=` in the unit (§10.1) and leave
+`FLOWHUB_ENV_FILE=-` here. Keeping both is safe too: the environment beats the file, so
+the unit's values are authoritative either way.
+
+### 5.3 The minimum that works
 
 ```json
 {
@@ -345,10 +384,10 @@ What each value means, and how to get it right:
 | `max_concurrent` | How many **distinct tasks** a host serves at once, `1`..`64`. A single task is never in two turns at once. |
 
 By default no secret goes in this file: locks live in the environment. A runtime's
-Basic Auth password has four possible sources — see §5.3 — and only the inline one
+Basic Auth password has four possible sources — see §5.4 — and only the inline one
 puts a secret here, which then requires mode `0600`.
 
-### 5.3 Credentials for the agent server
+### 5.4 Credentials for the agent server
 
 If `opencode serve` was started with `OPENCODE_SERVER_PASSWORD` set, every call to it
 must carry Basic Auth; `/global/health` answers `401` without it. Pick **one** source
@@ -388,7 +427,7 @@ Rules that decide whether the start is allowed:
   you configured a password some other way and see the refusal, run
   `flowhub -print-config` — it names the source in force, never the value.
 
-### 5.4 Validate it
+### 5.5 Validate it
 
 ```bash
 ./bin/flowhub -print-config
@@ -490,7 +529,7 @@ FLOWHUB_CONFIG_FILE=~/.config/flowhub/config.json \
 The dispatcher is off by default, so the process only records. Note that
 `-print-config` says nothing about whether the routing table's paths are usable;
 the start is where that is decided. With `FLOWHUB_DISPATCH=1` a bad entry is a
-refusal (see §5.3); with dispatch off the receiver starts and records even if the
+refusal (see §5.5); with dispatch off the receiver starts and records even if the
 mapping is incomplete — but then nothing will ever be dispatched, so fix the
 refusals before Phase 2.
 
