@@ -148,9 +148,12 @@ jobs:
   # have, and both cost minutes.
   test-darwin:
     name: test-darwin
-    # macos-14 is deprecated and `macos-latest` currently means macOS 26, so this is
-    # pinned deliberately, like the Ubuntu label above.
-    runs-on: macos-15
+    # macos-14 is deprecated, `macos-latest` currently means macOS 26, and the arm64
+    # labels carry GitHub's "capacity constraints … longer queue times" notice on every
+    # run — a platform message no workflow edit can clear. The Intel image runs the same
+    # macOS path semantics, which is what this job is for; the arm64 *compile* is covered
+    # by `cross-compile` above. Pinned deliberately, like the Ubuntu label.
+    runs-on: macos-15-intel
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
