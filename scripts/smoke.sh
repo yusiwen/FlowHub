@@ -54,6 +54,11 @@ BASE="http://127.0.0.1:$PORT"
 URL="$BASE/hooks/youtrack/$KEY"
 
 echo "== start =="
+# A test must not read the operator's own environment file. This run asserts its own
+# key, token and data directory, so a ~/.config/flowhub/.env with other values — or
+# merely a permissive mode, which is refused — would make the result depend on the
+# machine it ran on. `FLOWHUB_ENV_FILE=-` disables the file (ADR 0005).
+FLOWHUB_ENV_FILE=- \
 FLOWHUB_ADDR="127.0.0.1:$PORT" \
 FLOWHUB_HOOK_KEY="$KEY" \
 FLOWHUB_TOKEN="$TOKEN" \
