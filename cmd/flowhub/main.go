@@ -62,25 +62,42 @@ var (
 )
 
 func main() {
-	// A subcommand is dispatched before anything else, and in particular before
-	// the receiver configuration is loaded. `flowhub runtime init` runs on a
-	// machine that has none of the receiver's environment variables, and it must
-	// not fail because they are absent. The exit status is the subcommand's: a
-	// capability check is a gate, so "not ready" has to be distinguishable from
-	// "you typed it wrong".
+	// The environment file is applied before anything else, including the subcommand
+	// dispatch below. A host that keeps its settings in ~/.config/flowhub/.env must not
+	// have to export them a second time for `flowhub runtime init --check`, which reads
+	// the same variables.
+	//
+	// A failure here is fatal even for a subcommand: continuing with the file unapplied
+	// would run with settings the operator did not configure, and "the file was not
+	// read" is exactly the silent no-op this project refuses everywhere else. The
+	// message names the file, never a value.
+	envResult, envErr := config.ApplyEnvFile(config.EnvFileOptions{})
+
+	// A subcommand is dispatched before the receiver configuration is loaded.
+	// `flowhub runtime init` runs on a machine that has none of the receiver's
+	// environment variables, and it must not fail because they are absent. The exit
+	// status is the subcommand's: a capability check is a gate, so "not ready" has to
+	// be distinguishable from "you typed it wrong".
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		if envErr != nil {
+			fmt.Fprintf(os.Stderr, "flowhub: %v\n", envErr)
+			os.Exit(1)
+		}
 		// The build identity travels into the manifest, so a host can tell which
 		// binary wrote the files it is running.
 		provision.Version = versionLine()
 		os.Exit(provision.Main(os.Args[1], os.Args[2:], os.Stdout, os.Stderr))
 	}
-	if err := run(); err != nil {
+	if err := run(envResult, envErr); err != nil {
 		fmt.Fprintf(os.Stderr, "flowhub: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(envResult config.EnvFileResult, envErr error) error {
+	if envErr != nil {
+		return envErr
+	}
 	var (
 		showVersion = flag.Bool("version", false, "print version and exit")
 		printConfig = flag.Bool("print-config", false, "print the effective configuration (secrets masked) and exit")
@@ -151,6 +168,10 @@ func run() error {
 	}
 
 	if *printConfig {
+		// The environment file is reported first: it supplied the defaults for
+		// everything below, and a reader has to know whether it was read before they
+		// wonder why a value is what it is. Names only, never values.
+		fmt.Print(envFileReport(envResult, envErr))
 		fmt.Print(cfg.Report())
 		fmt.Print(projects.Report())
 		// Every effective value is printed with the level that supplied it, which is
@@ -235,6 +256,18 @@ func run() error {
 		defer logCloser.Close()
 	}
 	slog.SetDefault(logger)
+
+	// The environment file is reported by name and by variable *names*, never values.
+	// The skipped list is the part that matters when a file entry appears to do
+	// nothing: the real environment already had it, and the environment wins.
+	if envResult.Found {
+		logger.Info("environment file applied",
+			"path", envResult.Path,
+			"applied", strings.Join(envResult.Applied, ","),
+			"skipped_already_set", strings.Join(envResult.Skipped, ","))
+	} else if envResult.Path != "" {
+		logger.Debug("no environment file", "path", envResult.Path)
+	}
 
 	if errors.Is(projectsErr, projectmap.ErrNotFound) {
 		logger.Warn("no project mapping configured: deliveries are recorded but never routed",
@@ -783,6 +816,34 @@ func checkRuntimesReachable(ctx context.Context, cfg config.Config, inventory *r
 		return fmt.Errorf("FLOWHUB_DISPATCH=1 but none of the %d enrolled runtime(s) answered; the hosts or the network between them need attention", len(active))
 	}
 	return nil
+}
+
+// envFileReport renders what the environment file did, for `-print-config`.
+//
+// It exists because the file changes what every other line means: a value that looks
+// like a compiled default may have come from here. The rendered text names the file
+// and the variables, never a value — the keys in this file are the URL key and the
+// token, and a report is a document people paste into tickets.
+func envFileReport(result config.EnvFileResult, err error) string {
+	var b strings.Builder
+	switch {
+	case err != nil:
+		return "" // reported as the start's failure, not as a line in the report
+	case result.Path == "":
+		fmt.Fprintf(&b, "env_file:           disabled (%s)\n", config.EnvFileVariable)
+	case !result.Found:
+		fmt.Fprintf(&b, "env_file:           %s (absent)\n", result.Path)
+	default:
+		fmt.Fprintf(&b, "env_file:           %s (%s)\n",
+			result.Path, orNone(result.Applied))
+		if len(result.Skipped) > 0 {
+			// The real environment won for these. Saying so is what stops "I put it in
+			// the file and nothing happened" from becoming a debugging session.
+			fmt.Fprintf(&b, "env_file_skipped:   %s (already set in the environment)\n",
+				strings.Join(result.Skipped, ","))
+		}
+	}
+	return b.String()
 }
 
 func logStartup(logger *slog.Logger, cfg config.Config, projects *projectmap.Map, addr string) {
