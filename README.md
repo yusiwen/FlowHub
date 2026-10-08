@@ -68,6 +68,63 @@ Triggers → Settings`):
 The service must be reachable from YouTrack. During development you can drive it
 directly with `curl` (see below) instead of exposing a public domain.
 
+### The environment file
+
+Exporting the same six variables in every new shell is avoidable: FlowHub reads
+`~/.config/flowhub/.env` at startup (`$XDG_CONFIG_HOME/flowhub/.env` when that is
+set), beside the routing table.
+
+```bash
+mkdir -p ~/.config/flowhub
+cat > ~/.config/flowhub/.env <<'EOF'
+# FlowHub settings for this machine. Mode 0600: this file holds the URL key
+# and the token.
+FLOWHUB_HOOK_KEY=<hex>
+FLOWHUB_TOKEN=<hex>
+FLOWHUB_ALLOWED_SOURCES=127.0.0.1
+EOF
+chmod 600 ~/.config/flowhub/.env
+./bin/flowhub            # no export needed
+```
+
+**A value in the real environment always wins over the file.** That is what keeps
+`FLOWHUB_ADDR=127.0.0.1:9000 ./bin/flowhub` honest, and it is why the startup log
+reports both lists:
+
+```
+msg="environment file applied" path=/home/you/.config/flowhub/.env applied=FLOWHUB_HOOK_KEY,FLOWHUB_TOKEN,FLOWHUB_ALLOWED_SOURCES skipped_already_set=FLOWHUB_ADDR
+```
+
+`skipped_already_set` names the variables the file carried but the environment had
+already set — the answer to "I put it in the file and nothing changed".
+`-print-config` prints the same information as `env_file:` / `env_file_skipped:`.
+
+The syntax is deliberately a subset, because a parser with surprises is how a
+variable silently becomes something you did not write:
+
+| Works | Does not work |
+| --- | --- |
+| `KEY=VALUE`, blank lines, `# comment` | `${VAR}` interpolation, `$(…)`, includes |
+| `export KEY=VALUE` | line continuations, multi-line values |
+| surrounding `'single'` or `"double"` quotes | quoting *inside* a value |
+| a `#` inside a value | a `#` after whitespace starting a comment |
+| an empty value (`KEY=`) | the same key twice (refused: which line did you mean?) |
+
+A line it cannot parse refuses the start **with its line number**, and an unquoted
+value keeps its spaces (`A=b c` is `b c`; this is a file, not a shell). The file is
+read once, at startup, exactly like the credentials file — reloading it means
+restarting.
+
+Two related settings, so the precedence is in one place:
+
+* `FLOWHUB_ENV_FILE` points somewhere else; `-` (or `none`, `off`) disables the file
+  entirely, which is how a deployment says "environment only" on purpose.
+* the file is applied **before** the subcommand dispatch, so
+  `flowhub runtime init --check` sees the same values as a real start.
+* `~/.config/flowhub/credentials.json` (ADR 0004) is still the right home for an
+  agent server's password; the environment file is for the settings, not for a
+  credential that should be scoped to one runtime.
+
 ### Local delivery test
 
 ```bash
@@ -242,6 +299,7 @@ Flags: `-version`, `-print-config`.
 | `FLOWHUB_SHUTDOWN_TIMEOUT` | `10s` | Graceful drain budget on `SIGINT`/`SIGTERM` |
 | `FLOWHUB_CONFIG_FILE` | `~/.config/flowhub/config.json` | The configuration file: sources, runtimes, and the `(source, project)` → local repository table. `$XDG_CONFIG_HOME/flowhub/config.json` when that is set. A leading `~` is expanded, and the path is made absolute at startup. A missing file only warns (the receiver still records); a file that exists but fails validation stops startup |
 | `FLOWHUB_PROJECTS_FILE` | *(alias)* | The old name of `FLOWHUB_CONFIG_FILE`, still read. The file is no longer only a routing table, so the new spelling is preferred; setting both uses `FLOWHUB_CONFIG_FILE` |
+| `FLOWHUB_ENV_FILE` | `~/.config/flowhub/.env` | An environment file applied at startup, whose values are **defaults**: a variable already set in the environment wins. `-` (or `none`, `off`) disables it. A named path that does not exist stops startup; an absent default path does not. The file must be mode `0600`, because it holds the URL key and the token |
 | `FLOWHUB_SOURCE` | `youtrack` | Which registered event source this receiver serves. It selects the adapter that decodes deliveries and the `sources.<name>` block that supplies the trigger policy |
 | `FLOWHUB_YOUTRACK_HOOK_KEY` | *(unset)* | Lock 1 (URL key) for the YouTrack source. `FLOWHUB_HOOK_KEY` is the same variable under its old name; a second source gets its own, which is why the locks are per source |
 | `FLOWHUB_YOUTRACK_TOKEN` | *(unset)* | Lock 2 (header token) for YouTrack. `FLOWHUB_TOKEN` is the alias |
