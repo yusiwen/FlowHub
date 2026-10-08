@@ -192,7 +192,14 @@ documents. The rules below are load-bearing; do not relax them casually.
    *add* instructions: the untrusted-input warning, the reply tool, the sign-off and
    the `<!-- flowhub-auto -->` marker are the adapter's contract and stay in code,
    because a text file that could delete the marker would break the loop prevention
-   in rule 10. Startup validates the file, every path,
+   in rule 10. **The two levels reach the turn by different routes, and both must
+   stay wired.** The source's file is read by the loader and handed to the adapter
+   through `source.Factory(policy, instructions)`; the project's travels per turn in
+   `rules.PromptContext.Instructions`. The source file was read and validated but
+   never passed on until 2026-10-08 — a `prompt_file` that parses and then does
+   nothing is exactly the silent no-op this project refuses, so a change to either
+   route needs the prompt-level test that asserts the text appears. Startup validates
+   the file, every path,
    git work tree and `origin` before any
    file is created, and refuses otherwise. Do not add a "use the only configured
    repository" fallback: silently editing the wrong repository is the worst

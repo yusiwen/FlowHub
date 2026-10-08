@@ -11,7 +11,7 @@
   "_comment_credentials_file": "Optional, and commented out below so this template loads as-is: add `\"credentials_file\": \"credentials.json\"` to hold the agent servers' Basic Auth pairs in one file instead of an environment variable per host. The file is JSON keyed by runtime name — {\"runtimes\": {\"local\": {\"user\": \"opencode\", \"password\": \"...\"}}} — and a runtime whose `auth` block names only a user takes its password from it, while a per-runtime `auth` source wins over it. The path resolves like `prompt_file`: relative to this file, with a leading `~` expanded. It is read once at load time (rotating a password needs a restart), `{env:NAME}` inside an entry is expanded then, and the file must be mode 0600 — a file group or other can read refuses the start rather than leaving a secret exposed.",
 
   "sources": {
-    "_comment": "Keyed by the adapter's own name. `enabled` defaults to true, and a source the file never mentions is enabled: the hook key is the lock, and a record-only receiver should not need the file at all. `policy` holds what starting work means for this tracker; every field is optional and the environment is the outermost default. `prompt_file` is parsed but refused as not implemented yet — the adapter's built-in prompt is used, and a declared file that silently did nothing would be worse.",
+    "_comment": "Keyed by the adapter's own name. `enabled` defaults to true, and a source the file never mentions is enabled: the hook key is the lock, and a record-only receiver should not need the file at all. `policy` holds what starting work means for this tracker; every field is optional and the environment is the outermost default.",
     "youtrack": {
       "enabled": true,
       "policy": {
