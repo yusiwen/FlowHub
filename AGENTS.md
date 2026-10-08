@@ -149,6 +149,20 @@ documents. The rules below are load-bearing; do not relax them casually.
    fixed the same day; the redaction runs even when lock 1 is disabled. The
    service answers the "is the app sending the literal `secret`?" question
    through `MatchesConfigured` / `LooksLikeLiteralSecret` fingerprints instead.
+   **An agent server's Basic Auth password follows the same rule (ADR 0004).** It
+   comes from the environment (`FLOWHUB_OPENCODE_PASSWORD`, or
+   `auth.password_env`), from a per-runtime `auth.password_file`, from the shared
+   top-level `credentials_file`, or — only when the operator explicitly chooses it
+   — inline as `auth.password`. A block names **exactly one** source: two is a
+   load-time refusal, because the operator would otherwise rotate the one that is
+   not in force. Precedence is per-runtime block, then shared file, then the
+   process-wide environment pair, and the same `projectmap.ResolveCredential` is
+   used by the runtime factory *and* the activation prober — two independent
+   lookups is how a probe passes while the first turn fails. A file that holds a
+   secret (`credentials_file`, `password_file`, or the configuration file when it
+   carries an inline `password`) must be mode `0600`: group or other access refuses
+   the start with the `chmod 600` fix in the message. Never print a password:
+   `-print-config` names the source, and a test asserts the value stays out.
 4. **Parsing is lenient.** Nothing but `event` is required, unknown fields are
    ignored, and `changedFields[].value/oldValue` stay `json.RawMessage`: the
    released app, its `main` branch and the official docs disagree.

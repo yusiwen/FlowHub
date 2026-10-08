@@ -345,12 +345,49 @@ cp config/config.example.json ~/.config/flowhub/config.json   # then edit it
 }
 ```
 
-The file has three parts and one rule: **no secret is ever written in it.** Locks
-and key material stay in the environment (`FLOWHUB_YOUTRACK_HOOK_KEY`,
-`FLOWHUB_YOUTRACK_TOKEN`, `FLOWHUB_YOUTRACK_ALLOWED_SOURCES`), and a runtime's
-password is named by the variable that holds it (`"auth": {"user": "opencode",
-"password_env": "FLOWHUB_BUILDER_A_PASSWORD"}`), so the file stays safe to copy,
-diff, back up and review.
+The file has three parts and one rule: **no secret is ever written in it unless you
+choose to.** Locks and key material stay in the environment
+(`FLOWHUB_YOUTRACK_HOOK_KEY`, `FLOWHUB_YOUTRACK_TOKEN`,
+`FLOWHUB_YOUTRACK_ALLOWED_SOURCES`). A runtime's password has four sources, and a
+block names exactly one of them:
+
+| Source | Written as | Where the secret lives |
+| --- | --- | --- |
+| an environment variable | `"auth": {"user": "opencode", "password_env": "FLOWHUB_BUILDER_A_PASSWORD"}` | the process environment (the default, and the only spelling before the others existed) |
+| a shared credentials file | `"credentials_file": "credentials.json"` at the top level, plus `"auth": {"user": "opencode"}` | that file, keyed by runtime name |
+| one file per runtime | `"auth": {"user": "opencode", "password_file": "builder-a.pass"}` | that file |
+| inline | `"auth": {"user": "opencode", "password": "…"}` | the configuration file itself |
+
+```json
+{
+  "version": 2,
+  "credentials_file": "credentials.json"
+}
+```
+
+```json
+// credentials.json — beside the configuration file, mode 0600
+{
+  "runtimes": {
+    "builder-a": { "user": "opencode", "password": "…" },
+    "builder-b": { "user": "opencode", "password": "{env:TEAM_OPENCODE_PASSWORD}" }
+  }
+}
+```
+
+A `credentials_file` and a `password_file` are read **once, when the table is
+loaded**, so rotating a password takes a restart — the same rule an environment
+variable already had. `{env:VAR}` inside a credentials entry is expanded at load
+time, and an unset or empty variable refuses the start rather than becoming an
+empty password.
+
+**A file that holds a secret must be mode `0600`.** A `credentials_file`, any
+`password_file`, and the configuration file *when it carries an inline `password`*
+are refused at startup if group or other can read or write them, and the message
+names the `chmod 600` fix. A configuration file that only names variables and paths
+carries no secret and is not checked, so an existing `0644` table keeps working.
+(The check reads permission bits; a macOS ACL that *grants* access is outside them,
+so this is a floor rather than a proof.)
 
 **Version 1 files still load.** A file with no `version` key can only have meant
 YouTrack, so it is translated on read and reported as
@@ -481,7 +518,7 @@ even though YouTrack knows the answer. Measured evidence:
 | `runtime` / `runtimes` | The eligibility set for a new task. A name that is not a runtime name (`^[a-z0-9][a-z0-9._-]{0,62}$`) is refused when the file is loaded, because it could never be enrolled |
 | `runtime_policy` | `spread` or `first-healthy`, per project or for the whole file; anything else is refused at load |
 | `sources.<name>` | `enabled`, the trigger `policy`, an author allowlist a project may narrow, and `prompt_file` (extra instructions, appended — see below) |
-| `runtimes.<name>` | `url`, `auth` (a username plus the *name* of the variable holding the password), `agent`, `model`, `deadline`, `max_concurrent` (`1`..`64`, how many distinct tasks the host may serve at once) |
+| `runtimes.<name>` | `url`, `auth` (a username plus exactly one password source: `password`, `password_env`, `password_file`, or the shared `credentials_file`), `agent`, `model`, `deadline`, `max_concurrent` (`1`..`64`, how many distinct tasks the host may serve at once) |
 
 ### Startup validation (fail-closed)
 
@@ -496,7 +533,10 @@ before any file is created:
 * a `prompt_file` that is missing, empty, a directory, or over 32 KiB;
 * a `runtimes.<name>` block that cannot be honoured: a URL that is not http(s), a
   `max_concurrent` outside `1..64`, an unparsable `deadline`, a user without a
-  `password_env` (or the reverse), or a `password_env` naming an empty variable;
+  password source (or a password source without a user), a `password_env` naming an
+  empty variable, a `password_file` that is missing or empty, more than one password
+  source in one block, or a `credentials_file` that is unreadable, unparseable,
+  empty, names a runtime the file does not declare, or is readable by group or other;
 * a duplicate `(source, project)`, or an `agent` name that is not a plain
   identifier, or a `model` that is not spelled `provider/model-id`;
 * `repo.path` missing, relative, not a directory, or not a git work tree — checked

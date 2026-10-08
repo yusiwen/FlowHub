@@ -8,6 +8,8 @@
 
   "version": 2,
 
+  "_comment_credentials_file": "Optional, and commented out below so this template loads as-is: add `\"credentials_file\": \"credentials.json\"` to hold the agent servers' Basic Auth pairs in one file instead of an environment variable per host. The file is JSON keyed by runtime name — {\"runtimes\": {\"local\": {\"user\": \"opencode\", \"password\": \"...\"}}} — and a runtime whose `auth` block names only a user takes its password from it, while a per-runtime `auth` source wins over it. The path resolves like `prompt_file`: relative to this file, with a leading `~` expanded. It is read once at load time (rotating a password needs a restart), `{env:NAME}` inside an entry is expanded then, and the file must be mode 0600 — a file group or other can read refuses the start rather than leaving a secret exposed.",
+
   "sources": {
     "_comment": "Keyed by the adapter's own name. `enabled` defaults to true, and a source the file never mentions is enabled: the hook key is the lock, and a record-only receiver should not need the file at all. `policy` holds what starting work means for this tracker; every field is optional and the environment is the outermost default. `prompt_file` is parsed but refused as not implemented yet — the adapter's built-in prompt is used, and a declared file that silently did nothing would be worse.",
     "youtrack": {
@@ -32,7 +34,7 @@
     "local": {
       "_comment_url": "Where the host's agent server listens. Omit it and the runtime is only usable if the inventory enrols it. FLOWHUB_OPENCODE_URL is the outermost default.",
       "url": "http://127.0.0.1:4096",
-      "_comment_auth": "HTTP Basic Auth, which is what makes a runtime reachable across a network instead of only over loopback. The secret stays in the environment and this block only names the variable; an empty variable, or a user without a password_env (or the reverse), refuses the start. FLOWHUB_OPENCODE_USER/PASSWORD are the outermost default.",
+      "_comment_auth": "HTTP Basic Auth, which is what makes a runtime reachable across a network instead of only over loopback. `user` plus EXACTLY ONE password source: `password` (inline — the file is then itself a secret and must be mode 0600), `password_env` (the name of a variable; the secret stays in the environment), `password_file` (a file holding one secret), or the shared `credentials_file` at the top level, keyed by this runtime's name — which is what `{\"user\": \"opencode\"}` alone means. Naming two sources, an empty variable, a missing or empty file, or a file group/other can read refuses the start. FLOWHUB_OPENCODE_USER/PASSWORD remain the outermost default.",
       "auth": { "user": "opencode", "password_env": "FLOWHUB_LOCAL_OPENCODE_PASSWORD" },
       "_comment_agent": "The agent profile inside that product. Never the product name: asking opencode for an agent called \"opencode\" makes its server fall back to its own default agent, which is a looser one.",
       "agent": "devops",
