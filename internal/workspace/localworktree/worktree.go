@@ -628,9 +628,6 @@ func canonical(path string) string {
 	if strings.TrimSpace(path) == "" {
 		return path
 	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		return resolved
-	}
 	return path
 }
 
