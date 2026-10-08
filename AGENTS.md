@@ -353,6 +353,10 @@ Report the exact commands you ran and their results. If a check could not be run
 
 The same targets run in CI (`.github/workflows/ci.yml`) on every push to `master` and
 every pull request into it, so a local pass is the first gate rather than the only one.
-That job builds and tests with the Go version `go.mod` declares, and switches to
-`go1.27.1` for `staticcheck` alone, because the Makefile's pinned linter needs a newer
-toolchain than the module does.
+Three jobs: `gate` runs the whole suite on Linux, building and testing with the Go
+version `go.mod` declares and switching to `go1.27.1` for `staticcheck` alone (the
+Makefile's pinned linter needs a newer toolchain than the module does); `cross-compile`
+builds linux/amd64, linux/arm64 and darwin/arm64 and asserts each artifact's format; and
+`test-darwin` runs `make test` on macOS, where path handling differs (`/tmp` is a symlink
+to `/private/tmp`, which `localworktree` canonicalises). The action pins are kept current
+by Dependabot (`.github/dependabot.yml`).

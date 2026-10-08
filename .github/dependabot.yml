@@ -1,0 +1,26 @@
+# Dependabot keeps the action pins in `.github/workflows/ci.yml` from rotting.
+#
+# Every action there is pinned by commit SHA, because a tag can be moved and these steps
+# run with a token that can read this repository. That removes the surprise but also the
+# notification: without this file a security release upstream goes unnoticed until
+# someone happens to look. Dependabot reads the `# vX.Y.Z` comment next to each SHA,
+# notices a newer release, and opens one pull request that updates the SHA and the
+# comment together, with the upstream release notes in the body. The pull request then
+# runs the gate like any other change, so the bump is verified before it lands.
+#
+# `groups` keeps that to a single pull request per run instead of one per action. When
+# this module grows a dependency (it is standard-library only today, so it has no
+# go.sum), add a second entry with `package-ecosystem: gomod`.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+    labels: ["dependencies"]
