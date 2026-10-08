@@ -417,8 +417,10 @@ effective:          projects[youtrack:TEST] model=deepseek/v4 (level: projects[y
 A source (`sources.<name>.prompt_file`) and a project
 (`projects[].prompt_file`) may each name a file of extra instructions, resolved
 relative to the configuration file. Both are **appended** to the adapter's built-in
-prompt, in their own `## Project instructions` section, and both are read when the
-configuration is loaded:
+prompt, under one `## Operator instructions` section — the source's text under
+`### This source` (it applies to every project that adapter serves) and the
+project's under `### This project` — and both are read when the configuration is
+loaded:
 
 * a missing, empty, directory or larger-than-32-KiB file **refuses the start** — a
   configured file that silently had no effect is the failure mode this project
@@ -429,6 +431,9 @@ configuration is loaded:
   `<!-- flowhub-auto -->` marker stay in the adapter's code, because a text file that
   could delete the marker would break the loop prevention that stops FlowHub from
   answering its own replies.
+* the source's text reaches the adapter when it is built (`sources.Build`), the
+  project's travels with each turn's prompt context. A source file therefore cannot
+  be overridden by a project's, and neither can disable the other.
 
 `runtimes.<name>.max_concurrent` is how many **distinct tasks** one host may serve
 at the same time, `1` by default and at most `64`. It is not "how many prompts one
@@ -1093,21 +1098,24 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 Siwen Yu.
   `read` permission request measured first, then a pattern check in the arbiter.
 * Reconciliation polling: a delivery lost while FlowHub was down is lost, because
   the published webhook app does not retry. A periodic sweep of issues in the
-  start states would close that gap.
+  start states would close that gap. This is the one gap that needs FlowHub to
+  hold a YouTrack credential of its own.
 * FlowHub posting the reply itself (today the agent posts it through the YouTrack
-  MCP server, so FlowHub holds no YouTrack credential).
-* More than one dispatch worker, which needs per-task locking first.
-* Phase 3: alerting, key rotation, and optional HMAC signing through a custom
+  MCP server, so FlowHub holds no YouTrack credential). The dispatcher has no
+  YouTrack client at all, which is why reconciliation above is not a small change.
+* Phase 3: alerting and key rotation, and optional HMAC signing through a custom
   workflow rule.
-* Further event sources (Gitea, Drone), further agent runtimes, and running them on
-  other hosts: proposed in
-  [`docs/adr/0001-pluggable-sources-and-runtimes.md`](./docs/adr/0001-pluggable-sources-and-runtimes.md)
-  (the seam; a **v2 configuration format** with `sources`, addressed `runtimes` and
-  the project table; a pinned base commit per task) and
-  [`docs/adr/0002-data-plane-runtime-installation.md`](./docs/adr/0002-data-plane-runtime-installation.md)
-  (`flowhub runtime init` / `invite`, the admin API, the artifact manifest).
-  ADR 0002 steps 1–5 are implemented (`init` / `--check` / `doctor --push`,
-  `invite`, the admin API, the artifact manifest, the activation check); the
-  per-project runtime list and the `spread` / `first-healthy` policy of ADR 0001
-  step 5 are not — today the dispatcher takes the first healthy runtime in name
-  order for a new task, and a task that is already bound stays where it is.
+* Further event sources (Gitea, Drone) and further agent runtimes. The seam and
+  the addressing exist
+  ([`docs/adr/0001-pluggable-sources-and-runtimes.md`](./docs/adr/0001-pluggable-sources-and-runtimes.md),
+  [`docs/adr/0002-data-plane-runtime-installation.md`](./docs/adr/0002-data-plane-runtime-installation.md));
+  what is missing is a second adapter, not the plumbing. ADR 0001 step 1 (the
+  source seam) and step 5 (addressed runtimes, the pinned baseline and the
+  `runtime`/`runtimes` eligibility set with its `spread` / `first-healthy` policy)
+  are implemented, and ADR 0002 steps 1–5 are implemented (`init` / `--check` /
+  `doctor --push`, `invite`, the admin API, the artifact manifest, the activation
+  check).
+
+**Implemented, and no longer on this list** (see the sections above): per-project
+runtime lists and the `spread` / `first-healthy` selection policy, and per-task
+serialization with up to `runtimes.<name>.max_concurrent` distinct tasks per host.
