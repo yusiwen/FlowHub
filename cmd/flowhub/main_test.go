@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -458,3 +459,41 @@ func TestTheSourcePromptFileReachesThePrompt(t *testing.T) {
 		t.Fatalf("the source instructions were not rendered under their own heading:\n%s", prompt)
 	}
 }
+
+// TestTheEnvFileReportNamesVariablesNeverValues keeps the report safe to paste: the
+// environment file holds the URL key and the token, so the report may say which
+// variables it supplied and which the real environment overrode, and nothing else.
+func TestTheEnvFileReportNamesVariablesNeverValues(t *testing.T) {
+	result := config.EnvFileResult{
+		Path:    "/etc/flowhub/.env",
+		Found:   true,
+		Applied: []string{"FLOWHUB_HOOK_KEY", "FLOWHUB_TOKEN"},
+		Skipped: []string{"FLOWHUB_ADDR"},
+	}
+	rendered := envFileReport(result, nil)
+
+	for _, want := range []string{
+		"/etc/flowhub/.env",
+		"FLOWHUB_HOOK_KEY",
+		"FLOWHUB_TOKEN",
+		"FLOWHUB_ADDR",
+		"already set in the environment",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the report is missing %q:\n%s", want, rendered)
+		}
+	}
+
+	// The three states a reader has to be able to tell apart.
+	if got := envFileReport(config.EnvFileResult{Path: "/etc/flowhub/.env"}, nil); !strings.Contains(got, "absent") {
+		t.Errorf("an absent file was not reported as absent: %q", got)
+	}
+	if got := envFileReport(config.EnvFileResult{}, nil); !strings.Contains(got, "disabled") {
+		t.Errorf("a disabled file was not reported as disabled: %q", got)
+	}
+	if got := envFileReport(config.EnvFileResult{}, errEnvFileProbe); got != "" {
+		t.Errorf("a failure belongs to the start's error, not to a report line: %q", got)
+	}
+}
+
+var errEnvFileProbe = errors.New("environment file refused")
