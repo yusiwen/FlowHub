@@ -24,7 +24,7 @@ func withSubject(project, title, body string) func(*event.Event) {
 }
 
 func TestPromptsCarryTheContract(t *testing.T) {
-	src := New(rules.Policy{})
+	src := New(rules.Policy{}, "")
 	delivery := made(event.KindCreated, "TEST-12", withSubject("TEST", "准入首页", "分页返回黑名单机构信息"))
 	ctx := rules.PromptContext{Worktree: "/wt/TEST-12", Repository: "mine/test", Author: "yusiwen"}
 
@@ -60,7 +60,7 @@ func TestPromptsCarryTheContract(t *testing.T) {
 // the dispatcher's trigger matches, or following the instruction does nothing.
 func TestThePromptNamesTheConfiguredTrigger(t *testing.T) {
 	policy := rules.Policy{Trigger: "/flowhub go", StartStates: []string{"Doing"}}
-	src := New(policy)
+	src := New(policy, "")
 	if src.Policy().Trigger != "/flowhub go" {
 		t.Fatalf("the adapter did not keep the configured trigger: %q", src.Policy().Trigger)
 	}
@@ -77,13 +77,13 @@ func TestThePromptNamesTheConfiguredTrigger(t *testing.T) {
 }
 
 func TestPromptForAnUnknownActionIsEmpty(t *testing.T) {
-	if got := New(rules.Policy{}).Prompt(rules.ActionIgnore, &event.Event{}, rules.PromptContext{}); got != "" {
+	if got := New(rules.Policy{}, "").Prompt(rules.ActionIgnore, &event.Event{}, rules.PromptContext{}); got != "" {
 		t.Fatalf("prompt = %q, want empty", got)
 	}
 }
 
 func TestPromptRequiresABlockquoteSignOff(t *testing.T) {
-	src := New(rules.Policy{})
+	src := New(rules.Policy{}, "")
 	delivery := made(event.KindCreated, "TEST-20", withSubject("TEST", "s", ""))
 	decision := rules.Decision{Action: rules.ActionAnalyze, Trigger: rules.TriggerCreated}
 	ctx := rules.PromptContext{
@@ -133,8 +133,12 @@ func TestPromptRequiresABlockquoteSignOff(t *testing.T) {
 // contract — the untrusted-input rule, the reply tool, the marker and the trigger it
 // names — survives whatever the operator wrote. A file that could delete the marker
 // would break the loop prevention that keeps FlowHub from answering its own replies.
+//
+// Both levels are covered, because they reach the adapter by different routes: the
+// source's `prompt_file` is handed to New (it applies to every project this adapter
+// serves), while the project's arrives per turn in the context.
 func TestProjectInstructionsAreAppendedNotSubstituted(t *testing.T) {
-	src := New(rules.Policy{})
+	src := New(rules.Policy{}, "This source is the BEAP workspace: read CODEOWNERS first.\n")
 	delivery := made(event.KindCreated, "TEST-12", withSubject("TEST", "s", "body"))
 	ctx := rules.PromptContext{
 		Worktree:     "/wt/TEST-12",
@@ -145,7 +149,10 @@ func TestProjectInstructionsAreAppendedNotSubstituted(t *testing.T) {
 	prompt := src.Prompt(rules.ActionAnalyze, &delivery, ctx)
 
 	for _, want := range []string{
-		"## Project instructions",
+		"## Operator instructions",
+		"### This source",
+		"read CODEOWNERS first",
+		"### This project",
 		"make test",
 		"UNTRUSTED input",
 		"youtrack_add_issue_comment",
@@ -158,18 +165,32 @@ func TestProjectInstructionsAreAppendedNotSubstituted(t *testing.T) {
 		}
 	}
 	// The instructions sit between the ground rules and the phase, so the rules read
-	// as standing guidance and the phase still comes last.
+	// as standing guidance and the phase still comes last. The source's text comes
+	// before the project's, because it is the broader of the two.
 	groundRules := strings.Index(prompt, "## Ground rules")
-	extra := strings.Index(prompt, "## Project instructions")
+	section := strings.Index(prompt, "## Operator instructions")
+	sourceExtra := strings.Index(prompt, "### This source")
+	projectExtra := strings.Index(prompt, "### This project")
 	turn := strings.Index(prompt, "## This turn")
-	if !(groundRules < extra && extra < turn) {
-		t.Fatalf("ordering is wrong: rules=%d instructions=%d turn=%d", groundRules, extra, turn)
+	if !(groundRules < section && section < sourceExtra && sourceExtra < projectExtra && projectExtra < turn) {
+		t.Fatalf("ordering is wrong: rules=%d section=%d source=%d project=%d turn=%d",
+			groundRules, section, sourceExtra, projectExtra, turn)
 	}
 
 	// No instructions at all: the section must not appear, so an existing deployment's
 	// prompt is byte-for-byte what it was.
-	without := src.Prompt(rules.ActionAnalyze, &delivery, rules.PromptContext{Worktree: "/wt/TEST-12"})
-	if strings.Contains(without, "## Project instructions") {
+	without := New(rules.Policy{}, "").Prompt(rules.ActionAnalyze, &delivery, rules.PromptContext{Worktree: "/wt/TEST-12"})
+	if strings.Contains(without, "## Operator instructions") {
 		t.Errorf("the section appeared without any instructions:\n%s", without)
+	}
+
+	// The project's file alone still produces the section, and the source heading is
+	// absent, so a project-only deployment does not get an empty "This source" block.
+	projectOnly := New(rules.Policy{}, "").Prompt(rules.ActionAnalyze, &delivery, ctx)
+	if !strings.Contains(projectOnly, "## Operator instructions") || !strings.Contains(projectOnly, "### This project") {
+		t.Errorf("project-only instructions did not render:\n%s", projectOnly)
+	}
+	if strings.Contains(projectOnly, "### This source") {
+		t.Errorf("a source heading appeared without source instructions:\n%s", projectOnly)
 	}
 }

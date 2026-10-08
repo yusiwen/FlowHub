@@ -16,9 +16,11 @@ import (
 
 	"github.com/yusiwen/flowhub/internal/config"
 	"github.com/yusiwen/flowhub/internal/dispatch"
+	"github.com/yusiwen/flowhub/internal/event"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/rules"
 	"github.com/yusiwen/flowhub/internal/runtimes"
+	"github.com/yusiwen/flowhub/internal/source"
 	"github.com/yusiwen/flowhub/internal/source/youtrack"
 )
 
@@ -84,7 +86,7 @@ func TestWebhookOptionsNeverHoldATypedNilDispatcher(t *testing.T) {
 	if absent != nil {
 		t.Fatal("precondition: a nil pointer must compare equal to nil")
 	}
-	if opts := webhookOptions(config.Config{}, absent, youtrack.New(rules.Policy{})); opts.Dispatcher != nil {
+	if opts := webhookOptions(config.Config{}, absent, youtrack.New(rules.Policy{}, "")); opts.Dispatcher != nil {
 		t.Fatal("webhookOptions put a nil dispatcher behind the interface")
 	}
 }
@@ -98,7 +100,7 @@ func TestWebhookOptionsCarryTheReceiverLocks(t *testing.T) {
 		ReplayWindow: time.Minute,
 		LogHeaders:   true,
 	}
-	opts := webhookOptions(cfg, &dispatch.Dispatcher{}, youtrack.New(rules.Policy{}))
+	opts := webhookOptions(cfg, &dispatch.Dispatcher{}, youtrack.New(rules.Policy{}, ""))
 	if opts.HookKey != "k" || opts.Token != "t" || opts.Dispatcher == nil {
 		t.Fatalf("options = %+v", opts)
 	}
@@ -402,4 +404,57 @@ func emptyProjects(t *testing.T) *projectmap.Map {
 		t.Fatalf("projectmap.Load: %v", err)
 	}
 	return projects
+}
+
+// TestTheSourcePromptFileReachesThePrompt pins the wiring main performs for a
+// source-level `prompt_file`: `sources.Register` plus `sources.Build` with the text
+// the loader read.
+//
+// It exists because the feature was read, validated, and then never passed on — the
+// source adapter was built with the policy alone, so a configured `prompt_file` had
+// no effect at all (found 2026-10-08, fixed with source.Factory's `instructions`
+// parameter). A test that only exercised `youtrack.New` directly cannot catch that
+// class of defect: the call site is what was wrong.
+func TestTheSourcePromptFileReachesThePrompt(t *testing.T) {
+	dir := t.TempDir()
+	prompts := filepath.Join(dir, "prompts")
+	if err := os.MkdirAll(prompts, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prompts, "youtrack.md"), []byte("Ask before touching the billing module.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	body := `{"version": 2,
+	  "sources": {"youtrack": {"prompt_file": "prompts/youtrack.md"}},
+	  "projects": [{"source": "youtrack", "project": "TEST", "repo": {"path": "/tmp/test"}}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+
+	// Exactly the two calls main makes.
+	sources := source.NewRegistry()
+	if err := sources.Register(youtrack.SourceName, func(policy rules.Policy, instructions string) source.Source {
+		return youtrack.New(policy, instructions)
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	resolved := projects.Policy("youtrack", projectmap.PolicyDefaults{})
+	src, err := sources.Build("youtrack", resolved.Policy, projects.SourcePromptExtra("youtrack"))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	delivery := event.Event{Subject: event.Subject{Key: "TEST-1", Project: "TEST", Title: "t"}}
+	prompt := src.Prompt(rules.ActionAnalyze, &delivery, rules.PromptContext{Worktree: "/wt/TEST-1"})
+	if !strings.Contains(prompt, "Ask before touching the billing module.") {
+		t.Fatalf("the source prompt file did not reach the prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "### This source") {
+		t.Fatalf("the source instructions were not rendered under their own heading:\n%s", prompt)
+	}
 }
