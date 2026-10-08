@@ -168,6 +168,13 @@ func run() error {
 		for _, problem := range projects.RuntimeProblems() {
 			fmt.Printf("runtime_problem:    %s\n", problem)
 		}
+		for _, problem := range projects.RuntimeCredentialProblems(os.Getenv) {
+			fmt.Printf("credential_problem: %s\n", problem)
+		}
+		for _, credential := range projects.CredentialReport() {
+			fmt.Printf("effective:          %s %s=%s (level: %s)\n",
+				credential.Scope, credential.Field, credential.Value, credential.Level)
+		}
 		if cfg.Dispatch {
 			for _, problem := range workspace.ValidateEntries(localworktree.Validator{}, projects.WorkspaceEntries(cfg.WorktreeBase)) {
 				fmt.Printf("dispatch_problem:   %s\n", problem)
@@ -201,6 +208,9 @@ func run() error {
 			return fmt.Errorf("refusing to start, dispatch is not possible:\n  - %s", strings.Join(problems, "\n  - "))
 		}
 		if problems := declaredAuthProblems(projects); len(problems) > 0 {
+			return fmt.Errorf("refusing to start, configuration %s:\n  - %s", cfg.ConfigFile, strings.Join(problems, "\n  - "))
+		}
+		if problems := configFileSecretProblems(cfg.ConfigFile, projects); len(problems) > 0 {
 			return fmt.Errorf("refusing to start, configuration %s:\n  - %s", cfg.ConfigFile, strings.Join(problems, "\n  - "))
 		}
 		if problems, _ := dispatch.RuntimeProblems(projects, inventory); len(problems) > 0 {
@@ -274,7 +284,7 @@ func run() error {
 	// it is opt-in: an operator who does not enrol hosts from here never exposes
 	// it. It reads and writes the inventory the dispatcher is already using, so a
 	// change applies without a restart.
-	adminServer, err := startControlAPI(ctx, cfg, inventory, dispatcher, logger)
+	adminServer, err := startControlAPI(ctx, cfg, projects, inventory, dispatcher, logger)
 	if err != nil {
 		return err
 	}
@@ -403,19 +413,17 @@ func sourcePolicyDefaults(cfg config.Config) projectmap.PolicyDefaults {
 // liveness probes bound themselves with a much shorter context.
 func newRuntimeFactory(cfg config.Config, projects *projectmap.Map, logger *slog.Logger) func(name, url string) agent.Runtime {
 	return func(name, url string) agent.Runtime {
-		// The environment pair is the outermost default; a `runtimes.<name>.auth`
-		// block overrides it by naming the variable that holds the password, which is
-		// how the file stays free of secrets.
-		user, password := cfg.OpenCodeUser, cfg.OpenCodePassword
-		if block, ok := projects.RuntimeBlock(name); ok && block.Auth != nil {
-			user = strings.TrimSpace(block.Auth.User)
-			password = os.Getenv(strings.TrimSpace(block.Auth.PasswordEnv))
-		}
+		// One resolution path for every caller: the runtime's own `auth` block (an
+		// inline password, a variable name, or a password file), then the shared
+		// credentials file, then the environment pair. A runtime-specific declaration
+		// deliberately wins over the process-wide default, which is the opposite of
+		// what a silent override would do.
+		credential, _ := projects.ResolveCredential(name, os.Getenv)
 		return agentruntime.NewRuntime(
 			agentruntime.New(agentruntime.Options{
 				BaseURL:  url,
-				Username: user,
-				Password: password,
+				Username: credential.User,
+				Password: credential.Password,
 				Timeout:  runtimeDeadline(cfg, projects, name),
 			}),
 			agentruntime.RuntimeOptions{Name: name, Log: logger, FirstResponse: cfg.FirstResponse},
@@ -436,23 +444,39 @@ func runtimeDeadline(cfg config.Config, projects *projectmap.Map, name string) t
 	return cfg.TaskDeadline
 }
 
-// declaredAuthProblems reports a `runtimes.<name>.auth` block whose password
-// variable is empty: the file names the variable, and a name that holds nothing is
-// half a credential pair, which fails every turn instead of refusing the start.
+// declaredAuthProblems reports a `runtimes.<name>.auth` block whose password cannot
+// be resolved from the level that block names: an environment variable that is empty,
+// a password file that is missing or too permissive, or a credentials file with no
+// entry for this runtime. Half a credential pair fails every turn, late, so it
+// refuses the start — the same gate the environment-only version enforced.
+//
+// A block that names more than one password source, or a credentials file that
+// cannot be read, is reported by RuntimeCredentialProblems; both are consulted here
+// so a start is refused whichever way the problem is shaped.
 func declaredAuthProblems(projects *projectmap.Map) []string {
-	var problems []string
-	for _, name := range projects.Runtimes() {
-		block, ok := projects.RuntimeBlock(name)
-		if !ok || block.Auth == nil {
-			continue
-		}
-		variable := strings.TrimSpace(block.Auth.PasswordEnv)
-		if strings.TrimSpace(os.Getenv(variable)) == "" {
-			problems = append(problems, fmt.Sprintf(
-				"runtimes.%s.auth.password_env names %s, which is empty: export it on this host, or remove the auth block", name, variable))
-		}
+	return projects.RuntimeCredentialProblems(os.Getenv)
+}
+
+// configFileSecretProblems enforces the configuration file's own permissions, but
+// only when that file holds a secret.
+//
+// `runtimes.<name>.auth.password` writes the password into the file the operator
+// copies between machines and may commit; a group- or world-readable file then
+// leaks it. A file that only names variables and paths carries no secret, and
+// refusing it would break every existing deployment for no gain — so the check is
+// conditional rather than blanket.
+//
+// An unreadable file is reported as unreadable, never as "no secret inside": the two
+// need different fixes.
+func configFileSecretProblems(path string, projects *projectmap.Map) []string {
+	if !projects.HasInlinePassword() {
+		return nil
 	}
-	return problems
+	if err := projectmap.CheckSecretPermissions("configuration file", path); err != nil {
+		return []string{fmt.Sprintf(
+			"%v; this file holds an inline `password`, so it is itself a secret — move the password to `password_env`, `password_file` or `credentials_file` to drop this requirement", err)}
+	}
+	return nil
 }
 
 // declaredRuntimes renders the file's `runtimes` table for the dispatcher.
@@ -495,9 +519,10 @@ func declaredRuntimes(cfg config.Config, projects *projectmap.Map) []dispatch.De
 // check that pretended to be runtime-neutral would have to invent a speculative
 // interface for them. The dispatcher, which must stay neutral, does not use this.
 type opencodeProber struct {
-	cfg     config.Config
-	timeout time.Duration
-	log     *slog.Logger
+	cfg      config.Config
+	projects *projectmap.Map
+	timeout  time.Duration
+	log      *slog.Logger
 }
 
 func (p opencodeProber) Probe(ctx context.Context, claim runtimes.Claim) error {
@@ -505,10 +530,16 @@ func (p opencodeProber) Probe(ctx context.Context, claim runtimes.Claim) error {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	// The credential is resolved per claimed runtime, through the same function the
+	// dispatcher's factory uses: an enrolled host may have its own `auth` block, its
+	// own entry in the credentials file, or fall back to the environment pair. Two
+	// independent lookups is how a check passes against one pair while the turn later
+	// fails against another.
+	credential, _ := p.projects.ResolveCredential(claim.Name, os.Getenv)
 	client := agentruntime.New(agentruntime.Options{
 		BaseURL:  claim.Advertise,
-		Username: p.cfg.OpenCodeUser,
-		Password: p.cfg.OpenCodePassword,
+		Username: credential.User,
+		Password: credential.Password,
 		Timeout:  timeout,
 	})
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -576,7 +607,7 @@ func orNone(values []string) string {
 
 // startControlAPI starts the control listener, or returns (nil, nil) when it is
 // not configured.
-func startControlAPI(ctx context.Context, cfg config.Config, inventory *runtimes.Inventory, dispatcher *dispatch.Dispatcher, logger *slog.Logger) (*http.Server, error) {
+func startControlAPI(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, dispatcher *dispatch.Dispatcher, logger *slog.Logger) (*http.Server, error) {
 	if !cfg.ControlAPIEnabled() {
 		logger.Info("control API is off: runtimes are configured through the environment only",
 			"hint", "set FLOWHUB_ADMIN_ADDR and FLOWHUB_ADMIN_TOKEN to invite and enrol agent hosts")
@@ -589,7 +620,7 @@ func startControlAPI(ctx context.Context, cfg config.Config, inventory *runtimes
 	control := &runtimes.Server{
 		Inventory:  inventory,
 		AdminToken: cfg.AdminToken,
-		Prober:     opencodeProber{cfg: cfg, timeout: 5 * time.Second, log: logger},
+		Prober:     opencodeProber{cfg: cfg, projects: projects, timeout: 5 * time.Second, log: logger},
 		BoundTasks: boundTasks,
 		Log:        logger,
 	}

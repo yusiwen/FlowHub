@@ -196,6 +196,16 @@ type Map struct {
 	byIndex map[string]*Entry
 	// policy is the table-wide default selection policy.
 	policy string
+
+	// credentials holds the Basic Auth pairs read from `credentials_file`, keyed by
+	// runtime name. It is read once, when the table is loaded, so a password rotation
+	// needs a restart — the same rule the environment variables already had.
+	credentials map[string]storedCredential
+	// credentialsPath is the resolved location, kept for messages and the report.
+	credentialsPath string
+	// credentialProblems are the shape errors found while reading the credentials
+	// file, reported by RuntimeCredentialProblems alongside the per-runtime checks.
+	credentialProblems []string
 }
 
 // PolicyDefaults is the outermost level for a source's trigger policy: today the
@@ -451,6 +461,11 @@ func (m *Map) load(file *v2File, path string, translated bool) (*Map, error) {
 	m.runtimes = file.Runtimes
 	m.runtimeOrder = sortedRuntimeNames(file.Runtimes)
 
+	// The credentials file is read before the per-runtime checks below, because those
+	// checks ask whether a runtime's pair resolves — and a pair that lives in the
+	// shared file must count as resolved.
+	m.credentials, m.credentialsPath, m.credentialProblems = m.loadCredentials(file.CredentialsFile)
+
 	policy, err := normalisePolicy(file.RuntimePolicy)
 	if err != nil {
 		return nil, fmt.Errorf("configuration file %s: %w", path, err)
@@ -523,8 +538,13 @@ func validateRuntimeBlock(name string, block v2Runtime) error {
 		if strings.TrimSpace(block.Auth.User) == "" {
 			return fmt.Errorf("runtimes.%s.auth: a user is required (it decides the Basic Auth header)", name)
 		}
-		if strings.TrimSpace(block.Auth.PasswordEnv) == "" {
-			return fmt.Errorf("runtimes.%s.auth: password_env is required: the secret stays in the environment and the file only names the variable", name)
+		if sources := authPasswordSources(block.Auth); len(sources) > 1 {
+			// Two sources for one secret is the mistake that survives every later
+			// reading: the operator changes the one that is not in force and nothing
+			// happens. The shared credentials file is not a source here, because a
+			// runtime's own declaration deliberately wins over it.
+			return fmt.Errorf("runtimes.%s.auth names %d password sources (%s): name exactly one of password, password_env or password_file",
+				name, len(sources), strings.Join(sources, ", "))
 		}
 	}
 	if block.MaxConcurrent != nil {
