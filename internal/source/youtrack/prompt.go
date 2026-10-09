@@ -115,6 +115,24 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 		}
 	}
 
+	if permitted := cleanCommands(ctx.Permitted); len(permitted) > 0 {
+		// The authorisation is stated before the phase, because it changes what the
+		// agent can do in that phase: a command it was refused for earlier now runs,
+		// and a model that does not know that keeps reporting the refusal.
+		b.WriteString("\n## Authorised commands\n")
+		b.WriteString("A human authorised these exact commands for this task. They were refused when they were\n")
+		b.WriteString("first tried; the authorisation covers these strings and nothing else — not other flags,\n")
+		b.WriteString("another subcommand, or anything the policy forbids outright:\n\n")
+		b.WriteString("```\n")
+		for _, command := range permitted {
+			b.WriteString(command)
+			b.WriteString("\n")
+		}
+		b.WriteString("```\n")
+		b.WriteString("If a refusal is what stopped your previous turn, continue the work now instead of\n")
+		b.WriteString("reporting it again. If you still cannot proceed, say what is missing.\n")
+	}
+
 	switch {
 	case ctx.Nudge:
 		b.WriteString("\n## This turn\n")
@@ -146,11 +164,16 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 	fmt.Fprintf(&b, "Post exactly one comment on issue %s with the `youtrack_add_issue_comment` tool.\n", d.IssueID)
 	b.WriteString("Write it for the maintainer reading the issue: what you found or changed, what you verified, and what\n")
 	b.WriteString("you need from them. Keep it short. Do not post any other comment.\n")
+	// The agent is the only thing the maintainer talks to, so it has to name the exact
+	// phrases that move the work on: the trigger comes from the policy rather than
+	// being written out here, so a configured trigger cannot drift away from what the
+	// agent tells people to type, and the permit phrase is named whenever a refusal is
+	// what the reply is about — otherwise the human reads "I was refused" with no idea
+	// that anything can be done about it.
+	b.WriteString("If a refusal stopped you from doing the work, say so in the comment — quote the exact command\n")
+	fmt.Fprintf(&b, "and the reason — and tell the maintainer they can reply `%s` on the issue to authorise exactly\n", rules.PermitTrigger)
+	b.WriteString("those commands and let you carry on. A refusal you did not report is a refusal nobody can lift.\n")
 	if action != rules.ActionExecute {
-		// The agent is the only thing the maintainer talks to, so it has to name
-		// the exact command that starts the implementation; it comes from the
-		// policy rather than being written out here, so a configured trigger
-		// cannot drift away from what the agent tells people to type.
 		fmt.Fprintf(&b, "Before the sign-off, tell the maintainer how to proceed: comment `%s` on the issue, or move it to %s.\n",
 			p.Trigger, strings.Join(p.StartStates, " / "))
 	}
@@ -176,6 +199,22 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 	b.WriteString("That marker lets the automation recognise its own replies; without it the reply is treated as a human\n")
 	b.WriteString("instruction and starts another turn.\n")
 	return b.String()
+}
+
+// cleanCommands renders the authorised commands for the prompt, dropping blanks and
+// repeats. Quoting is not needed: each one is copied verbatim into a fenced block.
+func cleanCommands(commands []string) []string {
+	var out []string
+	seen := make(map[string]bool, len(commands))
+	for _, command := range commands {
+		command = strings.TrimSpace(command)
+		if command == "" || seen[command] {
+			continue
+		}
+		seen[command] = true
+		out = append(out, command)
+	}
+	return out
 }
 
 func authorOrUnknown(actor string) string {

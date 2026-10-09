@@ -237,3 +237,41 @@ func TestTheFollowUpPromptAsksForTheCommentAndSaysWhy(t *testing.T) {
 		}
 	}
 }
+
+// TestThePromptStatesTheAuthorisedCommands pins the section a permitted turn carries.
+// It has to be there for a reason that is easy to miss: the agent was refused this
+// command a turn ago, and a model that does not know the authorisation exists reports
+// the same refusal again instead of doing the work.
+func TestThePromptStatesTheAuthorisedCommands(t *testing.T) {
+	src := New(rules.Policy{}, "")
+	delivery := made(event.KindUpdated, "TEST-12", withSubject("TEST", "准入首页", "分页返回黑名单机构信息"))
+	ctx := rules.PromptContext{
+		Worktree: "/wt/TEST-12", Author: "yusiwen",
+		Permitted: []string{"mvn -q verify", "mvn -q verify", "  "},
+	}
+	prompt := src.Prompt(rules.ActionAnalyze, &delivery, ctx)
+	for _, want := range []string{
+		"## Authorised commands",
+		"mvn -q verify",
+		"continue the work now",
+		// The reply section names the keyword, or the human reads "I was refused" with
+		// no idea that anything can be done about it.
+		rules.PermitTrigger,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt is missing %q", want)
+		}
+	}
+	// Duplicates and blanks are dropped: the same command listed twice reads like two
+	// authorisations.
+	if got := strings.Count(prompt, "mvn -q verify"); got != 1 {
+		t.Fatalf("the authorised command appears %d times, want once", got)
+	}
+
+	// The control: a turn with no authorisation must not mention one, or every reply
+	// tells the maintainer about a permission that does not exist.
+	plain := src.Prompt(rules.ActionAnalyze, &delivery, rules.PromptContext{Worktree: "/wt/TEST-12"})
+	if strings.Contains(plain, "## Authorised commands") {
+		t.Fatal("a turn with no authorisation claims one")
+	}
+}
