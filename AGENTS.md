@@ -356,6 +356,23 @@ documents. The rules below are load-bearing; do not relax them casually.
     Do not turn the follow-up into a retry loop, and do not let a silent turn update
     `LastReply`: that text is what recognises our own comment coming back when the marker
     is lost.
+17. **A human's authorisation moves the allowlist and nothing else.** `/opencode permit`
+    is answered by `internal/rules` and acted on by the dispatcher: the authorised set is
+    the literal commands the task's **most recent** turn was refused for — recorded from
+    the turn's own rejected permission decisions, never parsed out of the human's comment
+    and never inferred — and it accumulates on the task row until the task is `done` or
+    `/opencode revoke` clears it. `granted` is consulted *after* the deny list, the
+    worktree check, the phase rule and the download exception (`internal/agent/opencode`),
+    so authorising a command can only turn "not on the allowlist" into "allowed": `git
+    push`, `rm`, `sudo`, a `curl` off the attachment host, a path outside the worktree,
+    redirection and command substitution stay refused, and a read-only turn does not
+    become writable. The **continuation turn reuses the action the refusals stopped**, in
+    the same session, or an implementation would resume as an analysis. The permit phrase
+    is anchored and blocked by the same three reply-recognition layers as the trigger, and
+    the actor must pass the project's author allowlist: the agent posts as the human, so a
+    model that writes the keyword itself must authorise nothing. Both phrases are answered
+    **before** the turn budget, because revoking must never be blocked and a permit is a
+    human answering a refusal they have just read (ADR 0007).
 
 ## Code Conventions
 
