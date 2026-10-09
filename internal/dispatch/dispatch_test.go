@@ -58,6 +58,20 @@ type fakeOpencode struct {
 	// sequence.
 	hold        chan struct{}
 	releaseOnce sync.Once
+
+	// inFlight counts the prompts currently being served, and maxInFlight the most
+	// that were ever served at once. It is how "one task is never in two turns at once"
+	// is asserted without a sleep: a held turn stays in flight, so a second turn for
+	// the same task would raise the maximum even if its prompt arrived much later.
+	inFlight    int
+	maxInFlight int
+}
+
+// maxConcurrentPrompts reports the most prompts served simultaneously.
+func (f *fakeOpencode) maxConcurrentPrompts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxInFlight
 }
 
 // release unblocks every held prompt, exactly once. Tests defer it so a failed
@@ -101,6 +115,12 @@ func (f *fakeOpencode) start() *httptest.Server {
 		if len(f.prompts) > 1 {
 			f.continued++
 		}
+		// The turn is in flight from here until the handler returns; a second turn for
+		// the same task would overlap with it.
+		f.inFlight++
+		if f.inFlight > f.maxInFlight {
+			f.maxInFlight = f.inFlight
+		}
 		parts := []agentruntime.Part{}
 		if f.askPermission {
 			parts = append(parts, agentruntime.Part{
@@ -127,6 +147,7 @@ func (f *fakeOpencode) start() *httptest.Server {
 			<-hold
 			f.mu.Lock()
 		}
+		f.inFlight--
 		id := len(f.messages)
 		f.messages = append(f.messages,
 			agentruntime.Message{Info: agentruntime.MessageInfo{ID: "u", Role: "user", Time: agentruntime.MessageTime{Created: int64(id)}}},
@@ -227,9 +248,13 @@ func newTestDispatcher(t *testing.T, fake *fakeOpencode, server *httptest.Server
 		Source:         youtrack.New(rules.Policy{}, ""),
 		Registry:       reg,
 		Projects:       projects,
-		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Agent:          "flowhub-default-agent",
-		Deadline:       5 * time.Second,
+		// The declared policy has to travel with the table, exactly as `main` does it:
+		// without it every host runs at a breadth of one and the per-task serialization
+		// these tests are about cannot be observed.
+		Declared: DeclaredRuntimes(projects, time.Minute),
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agent:    "flowhub-default-agent",
+		Deadline: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -713,17 +738,7 @@ func newScheduledDispatcherWith(t *testing.T, fake *fakeOpencode, server *httpte
 	// The file's runtime blocks travel to the dispatcher the way main's
 	// declaredRuntimes does it: enrolment answers where a host is, the file answers
 	// what to ask of it (the breadth included).
-	var declared []DeclaredRuntime
-	for _, name := range projects.Runtimes() {
-		block, _ := projects.RuntimeBlock(name)
-		declared = append(declared, DeclaredRuntime{
-			Name:          name,
-			URL:           strings.TrimSpace(block.URL),
-			Agent:         strings.TrimSpace(block.Agent),
-			Model:         strings.TrimSpace(block.Model),
-			MaxConcurrent: block.MaxConcurrentTasks(),
-		})
-	}
+	declared := DeclaredRuntimes(projects, time.Minute)
 	fake.directory = repo
 	dispatcher, err := New(Options{
 		NewRuntime:     runtimeFactory(5 * time.Second),
@@ -906,16 +921,7 @@ func TestASecondDeliveryForATaskWaitsForItsTurn(t *testing.T) {
 	dispatcher.Dispatch(first)
 	dispatcher.Dispatch(second)
 
-	waitFor(t, 5*time.Second, func() bool {
-		entry := runtimeEntry(t, dispatcher, "builder-a")
-		return entry != nil && entry["running"] == 1 && entry["queued"] == 1
-	})
-	// The first turn is held open, so a second prompt can never arrive: the scheduler
-	// keeps the second delivery of the same task waiting.
-	time.Sleep(300 * time.Millisecond)
-	if got := fake.promptCount(); got != 1 {
-		t.Fatalf("prompts in flight = %d, want 1: one task is in one turn at a time", got)
-	}
+	waitUntilOneTurnIsInFlight(t, fake, dispatcher, "builder-a")
 
 	fake.release()
 	waitFor(t, 10*time.Second, func() bool {
@@ -928,6 +934,10 @@ func TestASecondDeliveryForATaskWaitsForItsTurn(t *testing.T) {
 	if task.Turns != 2 {
 		t.Fatalf("turns = %d, want both deliveries recorded", task.Turns)
 	}
+	// Asserted over the whole run, not just before the release: the high-water mark
+	// catches an overlap whenever it happened, which is what makes the property
+	// independent of when a prompt happens to arrive.
+	assertNoOverlappingTurns(t, fake, "one task is in one turn at a time")
 }
 
 // TestATaskWithNoRowYetGoesToExactlyOneRuntime: two deliveries of one burst reach the
@@ -940,7 +950,15 @@ func TestATaskWithNoRowYetGoesToExactlyOneRuntime(t *testing.T) {
 	server := fake.start()
 	defer server.Close()
 	defer fake.release()
-	dispatcher, reg := newScheduledDispatcher(t, fake, server, `,"runtimes":["builder-a","builder-b"],"runtime_policy":"spread"`)
+	// Breadth two, so "one task is one turn at a time" is a property this test can
+	// actually observe: with a breadth-one host it would hold by construction and the
+	// mutation that breaks it could never show up here.
+	dispatcher, reg := newScheduledDispatcherWith(t, fake, server, func(repo, base string) string {
+		return `{"version":2,
+		  "runtimes":{"builder-a":{"url":"` + server.URL + `","agent":"devops","max_concurrent":2},
+		              "builder-b":{"url":"` + server.URL + `","agent":"devops","max_concurrent":2}},
+		  "projects":[{"source":"youtrack","project":"TEST","repo":{"path":"` + repo + `","default_branch":"main"},"worktrees":"` + base + `","runtimes":["builder-a","builder-b"],"runtime_policy":"spread"}]}`
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -949,7 +967,7 @@ func TestATaskWithNoRowYetGoesToExactlyOneRuntime(t *testing.T) {
 	dispatcher.Dispatch(delivery("TEST-63", "issueCreated", issueCreatedBody("TEST-63")))
 	dispatcher.Dispatch(delivery("TEST-63", "issueCreated", issueCreatedBody("TEST-63")))
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitForReason(t, 5*time.Second, "one task running on one host with the second delivery queued behind it", func() bool {
 		runtimes, _ := dispatcher.Snapshot()["runtimes"].(map[string]map[string]any)
 		if len(runtimes) != 1 {
 			return false
@@ -963,10 +981,12 @@ func TestATaskWithNoRowYetGoesToExactlyOneRuntime(t *testing.T) {
 	})
 	// Only one prompt may exist even though the second delivery is already here: the
 	// first turn is held open and the second waits for it.
-	time.Sleep(300 * time.Millisecond)
-	if got := fake.promptCount(); got != 1 {
-		t.Fatalf("prompts in flight = %d, want 1: one task is one turn at a time", got)
-	}
+	// Wait for the first turn to actually reach the server, then let the run finish; the
+	// overlap counter is what the assertion reads, so no sampling window is needed.
+	waitForReason(t, 5*time.Second, "the first turn to reach the server", func() bool {
+		return fake.promptCount() >= 1
+	})
+	assertNoOverlappingTurns(t, fake, "one task is one turn at a time")
 
 	fake.release()
 	waitFor(t, 10*time.Second, func() bool {
@@ -983,6 +1003,9 @@ func TestATaskWithNoRowYetGoesToExactlyOneRuntime(t *testing.T) {
 	if got := fake.continuedCount(); got != 1 {
 		t.Fatalf("continued = %d, want the second delivery to continue the session", got)
 	}
+	// Over the whole run: the two deliveries must never have been in flight together,
+	// even though the second one legitimately runs after the first finishes.
+	assertNoOverlappingTurns(t, fake, "one task is one turn at a time")
 	task, _ := reg.Get(youtrack.SourceName, "TEST-63")
 	if task.Runtime == "" {
 		t.Fatal("the task has no runtime binding")
@@ -1025,6 +1048,37 @@ func TestRouteRefusesABoundTaskWhoseRuntimeIsGone(t *testing.T) {
 	}
 }
 
+// waitUntilOneTurnIsInFlight waits for the two things the assertion below needs to be
+// observed rather than assumed: the worker marks a task running *before* its prompt
+// reaches the server, so waiting only on the scheduler counters races the HTTP round
+// trip. On a loaded runner that race was lost often enough to flake the macOS gate
+// twice (#17).
+func waitUntilOneTurnIsInFlight(t *testing.T, fake *fakeOpencode, dispatcher *Dispatcher, runtimeName string) {
+	t.Helper()
+	waitForReason(t, 5*time.Second, "the first turn to reach the server", func() bool {
+		return fake.promptCount() >= 1
+	})
+	waitForReason(t, 5*time.Second, "one task running with the second delivery queued behind it (a task is never in two turns at once)", func() bool {
+		entry := runtimeEntry(t, dispatcher, runtimeName)
+		return entry != nil && entry["running"] == 1 && entry["queued"] == 1
+	})
+	assertNoOverlappingTurns(t, fake, "one task is in one turn at a time")
+}
+
+// waitForReason is waitFor with a message that names the property being waited for, so
+// a timeout says what was expected instead of only that something did not happen.
+func waitForReason(t *testing.T, timeout time.Duration, reason string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for: %s", reason)
+}
+
 // waitFor polls a condition, failing the test if it never becomes true.
 func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
 	t.Helper()
@@ -1036,4 +1090,18 @@ func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("the condition was never met")
+}
+
+// assertNoOverlappingTurns is the property these tests exist for, stated as an
+// observable instead of a sample: a task must never have two turns in flight at once.
+//
+// The fake counts prompts currently being served, so a second turn for the same task
+// raises the maximum whether it starts immediately or much later — the held first turn
+// cannot be released until the test says so, which is what makes this deterministic
+// where "count the prompts after 300ms" was not (#17).
+func assertNoOverlappingTurns(t *testing.T, fake *fakeOpencode, reason string) {
+	t.Helper()
+	if got := fake.maxConcurrentPrompts(); got != 1 {
+		t.Fatalf("prompts overlapped = %d, want 1: %s", got, reason)
+	}
 }
