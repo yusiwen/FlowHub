@@ -132,7 +132,10 @@ func (a *Arbiter) decideBash(req PermissionRequest) Decision {
 	}
 
 	for _, segment := range segments {
-		if a.Phase == PhaseExecution && matchesAny(a.ExecutionAllow, segment) {
+		// A configured wrapper is stripped before anything is judged, and the
+		// remainder is judged by the same lists as an unwrapped command would be.
+		target, wrapper := a.stripWrappers(segment)
+		if a.Phase == PhaseExecution && matchesAny(a.ExecutionAllow, target) {
 			continue
 		}
 		// A segment that *starts* with curl is judged by the attachment exception
@@ -147,6 +150,17 @@ func (a *Arbiter) decideBash(req PermissionRequest) Decision {
 				Reason: fmt.Sprintf("command segment %q is on the deny list (%s); run it yourself if it is really needed", segment, deny),
 			}
 		}
+		if wrapper != "" {
+			// The wrapper is trusted, its payload is not: `rtk rm -rf /` strips to
+			// `rm -rf /` and is refused here, which is what keeps the wrapper list
+			// from widening anything.
+			if matched, deny := firstMatch(a.Deny, target); matched {
+				return Decision{
+					Reply:  ReplyReject,
+					Reason: fmt.Sprintf("command segment %q is on the deny list (%s) once the wrapper %q is stripped; run it yourself if it is really needed", segment, deny, wrapper),
+				}
+			}
+		}
 	}
 
 	if escapes, why := escapesWorktree(command); escapes {
@@ -154,9 +168,16 @@ func (a *Arbiter) decideBash(req PermissionRequest) Decision {
 	}
 
 	for _, segment := range segments {
-		if matchesAny(a.ExecutionAllow, segment) {
+		target, wrapper := a.stripWrappers(segment)
+		if matchesAny(a.ExecutionAllow, target) {
 			if a.Phase == PhaseExecution {
 				continue
+			}
+			if wrapper != "" {
+				return Decision{
+					Reply:  ReplyReject,
+					Reason: fmt.Sprintf("command segment %q changes files (as %q) and is only allowed in the execution phase", segment, target),
+				}
 			}
 			return Decision{
 				Reply:  ReplyReject,
@@ -169,23 +190,38 @@ func (a *Arbiter) decideBash(req PermissionRequest) Decision {
 			}
 			continue
 		}
-		if !a.matchesAny(segment) {
+		if !a.matchesAny(target) {
+			if wrapper == "" {
+				// Nothing is configured, yet dropping the first word would leave a
+				// command this policy allows. That is the signature of a plugin that
+				// rewrote the command in place, and the model cannot see it happen —
+				// so the reason has to name it, or the turn becomes a retry loop.
+				if unknown, rest, ok := a.looksWrapped(segment); ok {
+					return Decision{Reply: ReplyReject, Reason: rewriteReason(segment, unknown, rest)}
+				}
+				return Decision{
+					Reply:  ReplyReject,
+					Reason: fmt.Sprintf("command segment %q is not on the read-only allowlist; rephrase using inspection commands, or ask a human", segment),
+				}
+			}
 			return Decision{
 				Reply:  ReplyReject,
-				Reason: fmt.Sprintf("command segment %q is not on the read-only allowlist; rephrase using inspection commands, or ask a human", segment),
+				Reason: fmt.Sprintf("command segment %q is not on the read-only allowlist with the wrapper %q stripped (%q); rephrase using inspection commands, or ask a human", segment, wrapper, target),
 			}
 		}
 	}
 
 	// The patterns array must agree with the command: a pattern the policy has
 	// not seen means the metadata and the request disagree, which is not a state
-	// to guess in.
+	// to guess in. It is subject to the same wrapper stripping, because the server
+	// reports the segments it received — the rewritten ones.
 	for _, pattern := range req.Patterns {
 		pattern = strings.TrimSpace(pattern)
 		if pattern == "" {
 			continue
 		}
-		if matchesAny(a.ExecutionAllow, pattern) {
+		target, wrapper := a.stripWrappers(pattern)
+		if matchesAny(a.ExecutionAllow, target) {
 			if a.Phase == PhaseExecution {
 				continue
 			}
@@ -200,7 +236,13 @@ func (a *Arbiter) decideBash(req PermissionRequest) Decision {
 			}
 			continue
 		}
-		if !a.matchesAny(pattern) {
+		if !a.matchesAny(target) {
+			if wrapper != "" {
+				return Decision{
+					Reply:  ReplyReject,
+					Reason: fmt.Sprintf("request pattern %q is not on the read-only allowlist with the wrapper %q stripped (%q)", pattern, wrapper, target),
+				}
+			}
 			return Decision{
 				Reply:  ReplyReject,
 				Reason: fmt.Sprintf("request pattern %q is not on the read-only allowlist", pattern),

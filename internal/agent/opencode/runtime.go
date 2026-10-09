@@ -28,6 +28,9 @@ type Runtime struct {
 	// FirstResponse bounds how long a turn may take to produce its first assistant
 	// message. Zero uses the runner's default, capped at a third of the deadline.
 	FirstResponse time.Duration
+	// shellWrappers are the prefixes this host's plugins may put in front of a
+	// command; the arbiter strips them before judging what remains.
+	shellWrappers []string
 }
 
 // RuntimeOptions configures a Runtime.
@@ -39,6 +42,11 @@ type RuntimeOptions struct {
 	Log *slog.Logger
 	// FirstResponse is the bound described on Runtime.FirstResponse.
 	FirstResponse time.Duration
+	// ShellWrappers are the command prefixes this host's plugins are trusted to put
+	// in front of a command before the permission request is raised. The operator
+	// declares them (`runtimes.<name>.shell_wrappers`, or FLOWHUB_SHELL_WRAPPERS);
+	// nothing is stripped without one. See wrapper.go for why this exists.
+	ShellWrappers []string
 }
 
 // NewRuntime builds a runtime for one server.
@@ -51,7 +59,10 @@ func NewRuntime(client *Client, opts RuntimeOptions) *Runtime {
 	if name == "" {
 		name = "opencode"
 	}
-	return &Runtime{name: name, client: client, log: log, FirstResponse: opts.FirstResponse}
+	return &Runtime{
+		name: name, client: client, log: log, FirstResponse: opts.FirstResponse,
+		shellWrappers: append([]string(nil), opts.ShellWrappers...),
+	}
 }
 
 // Name implements agent.Runtime.
@@ -88,6 +99,7 @@ func (r *Runtime) Run(ctx context.Context, turn agent.Turn) (agent.Result, error
 		arbiter = NewExecutionArbiter()
 	}
 	arbiter.AllowTools = toolSet(turn.AllowedTools)
+	arbiter.Wrappers = append([]string(nil), r.shellWrappers...)
 	// The attachment exception is the source's policy, applied by this runtime's
 	// arbiter: which host serves a tracker's attachments is the adapter's fact.
 	arbiter.CurlHosts = append([]string(nil), turn.Downloads.Hosts...)
