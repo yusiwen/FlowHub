@@ -71,6 +71,32 @@ type Arbiter struct {
 	// stripped and what remains is judged by the lists above, so trusting one can
 	// never admit a command the policy refuses. Empty by default: see wrapper.go.
 	Wrappers []string
+	// Granted are whole command segments a human authorised for this turn, by
+	// answering a refusal in the tracker. They are matched literally and consulted
+	// *after* the deny list, the worktree check, the phase rule and the download
+	// exception, so a grant can only ever turn "not on the allowlist" into "allowed"
+	// — never `git push`, never a path outside the worktree, never an edit in a
+	// read-only turn. Empty by default.
+	Granted []string
+}
+
+// granted reports whether a human authorised this command for this turn.
+//
+// Both spellings are checked: the segment as it arrived, and the target left after a
+// configured wrapper is stripped. A human authorises the string they read in the
+// agent's comment, and on a host whose plugin rewrote the command that string is the
+// rewritten one — while the policy judges what follows the wrapper.
+func (a *Arbiter) granted(segment, target string) bool {
+	for _, allowed := range a.Granted {
+		allowed = strings.TrimSpace(allowed)
+		if allowed == "" {
+			continue
+		}
+		if strings.TrimSpace(segment) == allowed || strings.TrimSpace(target) == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // DefaultArbiter returns the read-only policy used for unattended runs.

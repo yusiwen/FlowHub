@@ -1,6 +1,10 @@
 package opencode
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/yusiwen/flowhub/internal/agent"
+)
 
 func bashRequest(command string, patterns ...string) PermissionRequest {
 	if len(patterns) == 0 {
@@ -156,4 +160,16 @@ func indexOf(haystack, needle string) int {
 		}
 	}
 	return -1
+}
+
+// TestTheNeutralRejectSpellingMatchesThisProduct pins the one value the dispatcher
+// reads out of a permission decision: it tells "the agent was refused this command"
+// from "the agent ran it" by `agent.DecisionReject`, and that set is what a human's
+// permit authorises. A rename on either side would silently stop reporting refusals,
+// so the two spellings are asserted to agree instead of assumed to.
+func TestTheNeutralRejectSpellingMatchesThisProduct(t *testing.T) {
+	if agent.DecisionReject != string(ReplyReject) {
+		t.Fatalf("agent.DecisionReject = %q but this product rejects with %q",
+			agent.DecisionReject, ReplyReject)
+	}
 }

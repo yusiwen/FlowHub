@@ -79,12 +79,25 @@ type Turn struct {
 	AllowedTools []string
 	// Downloads constrains attachment downloads for this turn.
 	Downloads Downloads
+	// Granted are whole command segments a human authorised for this turn by
+	// answering a refusal in the tracker. They are literal — one exact string each —
+	// and a runtime may only treat them as an exception to its own allowlist: never
+	// above its deny list, and never against the phase this turn is in.
+	Granted []string
 	// Metadata is free-form and stored with the session, if the runtime stores any.
 	Metadata map[string]any
 	// Deadline bounds the whole turn. A deadline is not a failure: the session may
 	// still be running and can be inspected later.
 	Deadline time.Duration
 }
+
+// DecisionReject is the reply a runtime reports when it refused a permission request.
+//
+// It is the neutral spelling of a value each runtime owns, and the dispatcher needs it
+// to tell "the agent was refused this command" from "the agent ran it": the refused
+// commands are what a human's permit authorises. A runtime whose own spelling differs
+// must map it here rather than leak its own value into the neutral result.
+const DecisionReject = "reject"
 
 // Tokens is the token usage over one turn.
 type Tokens struct {
