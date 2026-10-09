@@ -32,7 +32,9 @@ func (d Decision) Allowed() bool { return d.Reply == ReplyOnce || d.Reply == Rep
 //   - the deny list runs before the allowlist, so a forbidden command yields a
 //     clear reason instead of a generic one;
 //   - paths outside the worktree are rejected: the ruleset's external_directory
-//     does not police a command run inside a shell.
+//     does not police a command run inside a shell;
+//   - a leading *wrapper* the operator named is stripped before the judgement and
+//     the remainder is judged by the same lists (wrapper.go).
 //
 // Build and test commands are on the default allowlist because they are the
 // agent's job, and they are also arbitrary code execution: the containment that
@@ -64,6 +66,11 @@ type Arbiter struct {
 	// CurlOutputPrefix is the only directory a download may write into, relative
 	// to the worktree.
 	CurlOutputPrefix string
+	// Wrappers are the command prefixes this host is trusted to put in front of a
+	// command, as a plugin that rewrites tool input would. A leading wrapper is
+	// stripped and what remains is judged by the lists above, so trusting one can
+	// never admit a command the policy refuses. Empty by default: see wrapper.go.
+	Wrappers []string
 }
 
 // DefaultArbiter returns the read-only policy used for unattended runs.
