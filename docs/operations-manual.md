@@ -731,6 +731,45 @@ Either way, expect the agent's first retry to still fail if you changed nothing:
 FlowHub prints the wrapper name in the refusal precisely so the fact reaches you
 rather than looking like a model that cannot follow instructions.
 
+### 8.7 When the agent is blocked by a permission refusal
+
+An unattended turn may only run commands the shell allowlist recognises. Anything else
+is refused, and the agent is required to post a comment saying so — naming the command
+and the reason. That comment is where you come in.
+
+```
+agent:  I could not run `mvn -q verify`. It was refused: not on the read-only allowlist.
+        Reply /opencode permit to authorise it.
+you:    /opencode permit
+```
+
+What that does, exactly:
+
+| | |
+| --- | --- |
+| **What is authorised** | The commands the task's **most recent** turn was refused for — the literal strings, taken from the permission decisions FlowHub recorded, not from your text. |
+| **Literal** | `mvn -q verify` does not authorise `mvn -q verify -DskipTests`. A different flag is a different command and needs its own permit. |
+| **How long** | Until the task finishes (`done`), or until `/opencode revoke`. A second permit **adds** to the authorised set. |
+| **What it does not touch** | The deny list, the worktree boundary, the phase rule and the attachment-download exception. `git push`, `rm`, `sudo`, `curl` to another host, paths outside the worktree, redirection and command substitution stay refused, and a read-only turn does not become writable. |
+| **What happens next** | FlowHub continues in the **same session**, in the phase the refusals stopped (an implementation resumes as an implementation), and the prompt lists the authorised commands so the agent knows to carry on instead of reporting the refusal again. |
+
+```bash
+# What is authorised for a task, and what it was stopped by:
+jq -c 'select(.task_key=="BEAP_BE-46") | {state,last_action,grant,refusals}' \
+  /var/lib/flowhub/registry.jsonl | tail -1
+```
+
+The log lines are `a human authorised refused commands; the task continues` (with the
+commands and who permitted them) and `a human revoked the authorised commands`.
+
+**Two things worth knowing.** The permit runs a turn, so it counts against
+`FLOWHUB_MAX_TURNS` — but the permit and revoke phrases themselves are always
+recognised, even at the limit, because a retraction must never be blocked. And the only
+gate on who may permit is the project's `authors` allowlist, exactly as for
+`/opencode start`: **on a project that declares no authors, anyone who can comment on
+the issue can authorise a command.** Declare `authors` on every project you dispatch
+for.
+
 ---
 
 ## 9. Multi-host: enrol a runtime
@@ -956,7 +995,8 @@ every record keeps the full raw body.
 `(source, issue key)`. Per task it records the repository, worktree, base commit,
 session id, agent, state (`analyzing → awaiting_input → executing → done`,
 `failed` on a broken turn **or on a turn that finished without posting a comment**),
-plan state, turn count, cost and last reply.
+plan state, turn count, cost and last reply, plus `last_action`, `refusals` (what the
+most recent turn was stopped by) and `grant` (what a human has authorised so far).
 
 `awaiting_input` with a plan state of `draft` means "a comment was posted and a
 plan exists". It is never written for a silent turn: a row claiming a plan the
@@ -1075,6 +1115,7 @@ tail -5 /var/lib/flowhub/webhook-$(date -u +%F).jsonl | jq -c '{accepted,reason,
 | Failed at `FLOWHUB_FIRST_RESPONSE` with no message | the agent server rejected the prompt — usually a model the provider no longer offers | re-run `flowhub runtime init --check`; the profile must name a model the server lists |
 | Every turn runs the wrong behaviour | the agent registry is cached; a *new* agent file is only picked up by a new server process | restart `opencode serve` |
 | The agent asks for a permission forever | a request the server keeps listing | see `README.md`; a 404 is treated as already resolved, and a handled request is never listed again |
+| The agent says a command was refused | the shell allowlist did not recognise it | reply `/opencode permit` on the issue: §8.7 |
 | Push fails on the first real task | `runtime init --check` ran as a different user than the service | re-run the check as the service user; it reports the identity it ran as |
 | Bash refused with a command the model never typed (`rtk git status`) | an opencode plugin rewrote the command before the permission request | §8.6 — trust the prefix with `shell_wrappers`, or disable the plugin |
 | Turn finishes with *the turn finished without posting a comment* | every tool call was refused, so the model gave up with no text — the dispatcher then asked once more and that also produced nothing | read the `permission answered` lines above it; these are the rejection reasons. The task is now `failed`, and the fix is to remove the refusal (e.g. a `shell_wrappers` entry) before triggering again |
@@ -1141,6 +1182,9 @@ instead of the value.
 - [ ] `curl /agent` lists `devops`
 - [ ] YouTrack: Webhook Triggers installed, attached to the project, URL is a domain, no comma
 - [ ] `~/.config/flowhub/config.json` written; `prompt_file` lines removed or files created
+- [ ] **`authors` declared on every project you dispatch for.** It is the only gate on
+      `/opencode start` and on `/opencode permit` (§8.7): with no allowlist, anyone who
+      can comment on the issue can start work and authorise a refused command.
 - [ ] `flowhub -print-config` shows no `problem:`
 - [ ] `make build && make test && make smoke` → `SMOKE PASSED`
 - [ ] **Phase 1**: receiver running, one `curl` delivery accepted, audit shows `url_key=ok header_token=ok source_ip=ok`
@@ -1148,5 +1192,6 @@ instead of the value.
 - [ ] **Phase 2**: `DISPATCH_OFF` created, `FLOWHUB_DISPATCH=1`, pause removed deliberately
 - [ ] first analysis turn posts exactly one comment with the marker
 - [ ] `/opencode start` produces a plan, then an implementation on `flowhub/<ISSUE-KEY>`
+- [ ] a refusal is reported in a comment, and `/opencode permit` continues the task (§8.7)
 - [ ] the agent's own comment is ignored (turn count unchanged)
 - [ ] service unit installed; logs and rotation verified; cost cap and `MAX_TURNS` set

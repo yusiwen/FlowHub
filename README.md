@@ -726,7 +726,15 @@ What a maintainer sees, once `FLOWHUB_DISPATCH=1`:
    its own replies; the blockquote is how a *reader* can tell an automated reply
    from a human one, and the trigger it names comes from the decision rather than
    from the model's own account of why it replied.
-5. **If the agent cannot finish the work, it still posts that comment** — and it is
+5. **If a command was refused, the maintainer answers with `/opencode permit`.** FlowHub
+   authorises exactly the commands the last turn was refused for — the ones the comment
+   named — and continues the task in the same session, in the phase the refusals stopped.
+   The authorisation is literal (`mvn -q verify` does not authorise `mvn -q verify
+   -DskipTests`), it lasts until the task ends, `/opencode revoke` clears it, and it never
+   touches the deny list: `git push`, `rm`, `curl` to another host and paths outside the
+   worktree stay refused, and a read-only turn does not become writable. See
+   [`docs/adr/0007`](./docs/adr/0007-human-permitted-commands.md).
+6. **If the agent cannot finish the work, it still posts that comment** — and it is
    told so twice over: the agent definition says a refusal is a fact to report and
    that no turn may end in silence, and the dispatcher will not accept a silent
    finish (one bounded follow-up on the same session, then `failed`). This matters
@@ -744,6 +752,8 @@ the network. The event comes from the source adapter
 | Task already at `FLOWHUB_MAX_TURNS` | ignore, and ask for a human |
 | `/opencode start` comment, or the configured state change, **and** no plan yet | plan |
 | `/opencode start` comment, or the configured state change, **with** a plan | execute |
+| `/opencode permit` comment, **and** the last turn was refused something | the action of that last turn, re-run with exactly the refused commands authorised |
+| `/opencode revoke` comment | ignore, and the authorisation is cleared — a retraction runs no turn |
 | `issueCreated` (unless `FLOWHUB_SKIP_ANALYZE_ON_CREATE=1`) | analyze |
 | Anything else, including a project with no repository mapped | ignore |
 
@@ -760,7 +770,9 @@ One task is one tracker item, identified by its source *and* its key — a YouTr
 update can only touch its own. The registry
 (`<DataDir>/registry.jsonl`, append-only) records, per task: the repository, the
 worktree, the opencode session id, the agent, the state, the plan state, the
-number of turns, the accumulated cost, and the agent's last reply text. State
+number of turns, the accumulated cost, the agent's last reply text, the commands the
+last turn was refused for (`refusals`) and any authorisation a human has given
+(`grant`). State
 moves `analyzing → awaiting_input → executing → done`, with `failed` for a turn
 that broke — **or for a turn that finished without posting a comment**. That second
 case is deliberate: `awaiting_input` means "the analysis is posted and a human must
