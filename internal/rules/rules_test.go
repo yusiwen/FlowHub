@@ -208,3 +208,84 @@ func TestBasisNamesTheRealTrigger(t *testing.T) {
 		t.Fatalf("Basis copied too much of the comment: %d runes", len([]rune(got)))
 	}
 }
+
+// TestAPermitAuthorisesTheRefusedCommandsAndNothingElse pins the decision the human's
+// keyword produces. Two things matter: it only fires when there is something to
+// authorise (the refused set is the whole scope of the authorisation, so a permit with
+// nothing to point at must be ignored rather than guessed at), and the action it
+// produces is the one that continues the work.
+func TestAPermitAuthorisesTheRefusedCommands(t *testing.T) {
+	p := Policy{}.Defaults()
+	refused := []registry.Refusal{{Command: "mvn -q verify", Reason: "not on the read-only allowlist"}}
+
+	decision := p.Decide(made(event.KindCommented, "TEST-1", withComment(PermitTrigger)), TaskView{Refusals: refused})
+	if decision.Action != ActionPermit {
+		t.Fatalf("action = %s (%s), want permit", decision.Action, decision.Reason)
+	}
+	if decision.Trigger != TriggerComment {
+		t.Fatalf("trigger = %q, want the comment that caused it", decision.Trigger)
+	}
+	// The sign-off quotes the phrase the human typed, so a reader can see what it reacted to.
+	if basis := p.Basis(decision, made(event.KindCommented, "TEST-1", withComment(PermitTrigger))); !strings.Contains(basis, PermitTrigger) {
+		t.Fatalf("basis = %q, want it to name the permit comment", basis)
+	}
+
+	empty := p.Decide(made(event.KindCommented, "TEST-1", withComment(PermitTrigger)), TaskView{})
+	if empty.Action != ActionIgnore {
+		t.Fatalf("a permit with nothing refused produced %s, want it ignored", empty.Action)
+	}
+	if !strings.Contains(empty.Reason, "nothing to authorise") {
+		t.Fatalf("reason = %q, want it to say why", empty.Reason)
+	}
+}
+
+func TestARevokeIsRecognised(t *testing.T) {
+	p := Policy{}.Defaults()
+	decision := p.Decide(made(event.KindCommented, "TEST-1", withComment(RevokeTrigger)), TaskView{})
+	if decision.Action != ActionRevoke {
+		t.Fatalf("action = %s (%s), want revoke", decision.Action, decision.Reason)
+	}
+	// Revoking is not gated on anything, not even the refused set: a human retracting an
+	// authorisation must always be able to.
+	atLimit := p.Decide(made(event.KindCommented, "TEST-1", withComment(RevokeTrigger)), TaskView{Turns: 99})
+	if atLimit.Action != ActionRevoke {
+		t.Fatalf("a revoke at the turn limit produced %s, want it honoured", atLimit.Action)
+	}
+}
+
+// TestThePermitPhraseIsAnchoredAndNeverOurOwnComment: the agent tells the maintainer
+// which keyword to type, so the phrase appears in its replies constantly. Only a
+// comment that *starts* with it may act, and never one that carries our marker — the
+// agent posts as the same tracker user as the human, so a model that writes the keyword
+// itself must authorise nothing.
+func TestThePermitPhraseIsAnchoredAndNeverOurOwnComment(t *testing.T) {
+	p := Policy{}.Defaults()
+	view := TaskView{Refusals: []registry.Refusal{{Command: "mvn -q verify"}}}
+
+	for _, text := range []string{
+		"you can reply " + PermitTrigger + " to authorise it",
+		"> " + PermitTrigger,
+		"Permit me: " + PermitTrigger,
+		"`" + PermitTrigger + "`",
+	} {
+		if decision := p.Decide(made(event.KindCommented, "TEST-1", withComment(text)), view); decision.Action == ActionPermit {
+			t.Errorf("%q was read as a permit", text)
+		}
+	}
+	// The anchored form acts, and trailing words are allowed exactly as they are after
+	// the start trigger — a human may write "permit, go ahead". Trailing text cannot
+	// widen anything: the authorised set always comes from what the turn was refused
+	// for, never from what the human wrote after the keyword.
+	for _, text := range []string{"  " + PermitTrigger, PermitTrigger + ", go ahead"} {
+		if decision := p.Decide(made(event.KindCommented, "TEST-1", withComment(text)), view); decision.Action != ActionPermit {
+			t.Errorf("%q was not recognised as a permit: %s", text, decision.Reason)
+		}
+	}
+
+	// Our own reply, marker and all, grants nothing even when the phrase is first.
+	self := PermitTrigger + "\n\n" + SelfMarker
+	decision := p.Decide(made(event.KindCommented, "TEST-1", withComment(self)), view)
+	if decision.Action != ActionIgnore {
+		t.Fatalf("our own comment produced %s, want ignore", decision.Action)
+	}
+}

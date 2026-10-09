@@ -29,6 +29,12 @@ const (
 	ActionPlan Action = "plan"
 	// ActionExecute implements the plan inside the task worktree.
 	ActionExecute Action = "execute"
+	// ActionPermit records that a human authorised the commands the task's most
+	// recent turn was refused for, and continues the work they stopped.
+	ActionPermit Action = "permit"
+	// ActionRevoke clears that authorisation. It runs no turn: revoking is a
+	// retraction, and there is nothing for the agent to do about it.
+	ActionRevoke Action = "revoke"
 )
 
 // DefaultSelfMarkers identify FlowHub's own comments. The HTML comment is the
@@ -71,6 +77,12 @@ type PromptContext struct {
 	// adapter's own prompt, never a replacement, because the marker and the sign-off
 	// that keep FlowHub from answering its own replies belong to the adapter.
 	Instructions string
+	// Permitted are the whole command segments a human has authorised for this task,
+	// matched literally by the runtime's shell policy. It reaches every turn of the
+	// task while the authorisation is in force, because the agent has to know that a
+	// command it was refused for earlier will now run — otherwise it keeps reporting
+	// the refusal instead of doing the work.
+	Permitted []string
 	// Nudge marks a bounded follow-up turn sent because the previous one finished
 	// without posting the reply the contract requires. The dispatcher decides when
 	// that happens; the source writes what the follow-up says, because "post the
@@ -88,6 +100,10 @@ type TaskView struct {
 	Plan      registry.PlanState
 	Turns     int
 	LastReply string
+	// Refusals are the commands the most recent turn was refused for. A bare permit
+	// authorises exactly these, so an empty set means there is nothing to authorise
+	// and the comment is ignored rather than guessed at.
+	Refusals []registry.Refusal
 }
 
 // Policy is the trigger configuration.
@@ -108,6 +124,18 @@ type Policy struct {
 	// WriteAccess tells the prompt that the execution turn may change files.
 	WriteAccess bool
 }
+
+// The two phrases that answer a refusal. They are constants rather than policy
+// fields, unlike the start trigger: the start trigger is the human's main verb and a
+// deployment may rename it, while these two are structural — the agent's own comment
+// names them, and a renamed phrase would have to be explained to the model again.
+const (
+	// PermitTrigger authorises exactly the commands the task's most recent turn was
+	// refused for, and continues the work those refusals stopped.
+	PermitTrigger = "/opencode permit"
+	// RevokeTrigger clears that authorisation.
+	RevokeTrigger = "/opencode revoke"
+)
 
 // Defaults fills the zero fields with the measured, working values.
 func (p Policy) Defaults() Policy {
@@ -163,6 +191,27 @@ func (p Policy) Decide(e event.Event, task TaskView) Decision {
 			return Decision{Action: ActionIgnore, Reason: "our own comment (" + why + ")"}
 		}
 	}
+
+	// The permit phrases are answered *before* the turn budget, and that order is
+	// deliberate: revoking must never be blocked, and a permit is a human answering a
+	// refusal they have just read, which is the opposite of the runaway loop the
+	// budget exists to stop. Both still need a reason to act — a permit with nothing
+	// refused does nothing and says so.
+	if e.IsComment() {
+		switch {
+		case permitPattern().MatchString(e.Comment):
+			if len(task.Refusals) == 0 {
+				return Decision{Action: ActionIgnore, Reason: "the comment asked for a permit, but no command was refused for this task, so there is nothing to authorise"}
+			}
+			return Decision{
+				Action: ActionPermit, Trigger: TriggerComment,
+				Reason: fmt.Sprintf("comment matched %s; it authorises the %d command(s) the last turn was refused for", PermitTrigger, len(task.Refusals)),
+			}
+		case revokePattern().MatchString(e.Comment):
+			return Decision{Action: ActionRevoke, Trigger: TriggerComment, Reason: "comment matched " + RevokeTrigger}
+		}
+	}
+
 	if task.Turns >= p.MaxTurns {
 		return Decision{
 			Action: ActionIgnore,
@@ -258,6 +307,20 @@ func normalizeSpace(text string) string {
 
 func startPattern(trigger string) *regexp.Regexp {
 	return regexp.MustCompile(`(?i)^\s*` + regexp.QuoteMeta(trigger) + `\b`)
+}
+
+// permitPattern and revokePattern are anchored for the same reason the start
+// trigger is: the agent's own reply tells the maintainer which keyword to type, and a
+// phrase merely *mentioned* in a comment must not act. The marker and the last-reply
+// probe are the other two layers, and they matter most here — the agent posts as the
+// same tracker user as the human, so a model that writes the phrase itself must not
+// be able to authorise anything.
+func permitPattern() *regexp.Regexp {
+	return regexp.MustCompile(`(?i)^\s*` + regexp.QuoteMeta(PermitTrigger) + `\b`)
+}
+
+func revokePattern() *regexp.Regexp {
+	return regexp.MustCompile(`(?i)^\s*` + regexp.QuoteMeta(RevokeTrigger) + `\b`)
 }
 
 // analyzePattern matches a bare /opencode comment, which means "look at this
