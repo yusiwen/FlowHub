@@ -71,6 +71,15 @@ type PromptContext struct {
 	// adapter's own prompt, never a replacement, because the marker and the sign-off
 	// that keep FlowHub from answering its own replies belong to the adapter.
 	Instructions string
+	// Nudge marks a bounded follow-up turn sent because the previous one finished
+	// without posting the reply the contract requires. The dispatcher decides when
+	// that happens; the source writes what the follow-up says, because "post the
+	// comment you owe" is phrased in terms of the tracker's own reply tool.
+	//
+	// It exists because a silent finish is indistinguishable from success from the
+	// outside: the maintainer sees no comment, and the task would otherwise be
+	// recorded as if a reply had been posted.
+	Nudge bool
 }
 
 // TaskView is what the registry already knows about the issue.

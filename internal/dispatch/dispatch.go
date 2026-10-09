@@ -877,7 +877,9 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	// stays inside the runtime, because a source must not be able to widen it.
 	tools := d.opts.Source.Tools()
 
-	prompt := d.opts.Source.Prompt(decision.Action, &delivery, rules.PromptContext{
+	// The context is built once and reused by the follow-up turn: same issue, same
+	// worktree, same basis. Only what the prompt *says* differs.
+	promptCtx := rules.PromptContext{
 		Worktree: task.Worktree,
 		// The prompt and the arbiter read one value: telling the agent to write
 		// somewhere the runtime would reject is worse than saying nothing.
@@ -890,7 +892,8 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		// The routing entry's own instructions, read from its prompt_file when the
 		// configuration was loaded.
 		Instructions: match.Entry.PromptExtra,
-	})
+	}
+	prompt := d.opts.Source.Prompt(decision.Action, &delivery, promptCtx)
 	if prompt == "" {
 		d.log.Error("no prompt was built for the action", "action", decision.Action, "issue", rec.IssueID)
 		return
@@ -928,7 +931,8 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		"runtime", binding.Name, "agent", agentName, "model", model,
 		"session", task.SessionID, "max_concurrent", d.breadthFor(binding))
 
-	result, err := binding.Runtime.Run(ctx, agent.Turn{
+	deadline := binding.deadline(d.opts.Deadline)
+	turn := agent.Turn{
 		Directory:    task.Worktree,
 		Prompt:       prompt,
 		Agent:        agentName,
@@ -942,12 +946,47 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 			Prefix: tools.Download.Prefix,
 		},
 		Metadata: map[string]any{"task_key": rec.IssueID, "action": string(decision.Action)},
-		Deadline: binding.deadline(d.opts.Deadline),
-	})
+		Deadline: deadline,
+	}
+
+	result, err := binding.Runtime.Run(ctx, turn)
+
+	// The contract is one comment per turn, and a turn that posts none has told the
+	// maintainer nothing at all. Left alone that is invisible from the outside: the
+	// issue stays silent while the registry records a reply that does not exist
+	// (issue #27), and the next delivery reads that row as "a plan was posted".
+	//
+	// So the dispatcher asks once more, in the *same* session, with a prompt whose
+	// only job is the comment. One ask, not a retry loop: a model that cannot comply
+	// twice is failing, and the state below says so.
+	replied := anyToolCompleted(result.Tools, tools.Reply)
+	if silentFinish(result, err, replied) {
+		d.log.Warn("the turn finished without posting a comment; asking once more",
+			"issue", rec.IssueID, "session", result.SessionID,
+			"reply_tools", strings.Join(tools.Reply, "/"))
+		promptCtx.Nudge = true
+		if nudgePrompt := d.opts.Source.Prompt(decision.Action, &delivery, promptCtx); nudgePrompt != "" {
+			nudge := turn
+			nudge.Prompt = nudgePrompt
+			nudge.SessionID = result.SessionID
+			// The follow-up may only post a comment, and one delivery must not be able
+			// to hold a worker for two full turn budgets.
+			nudge.Deadline = nudgeDeadline(deadline)
+			nudged, nudgeErr := binding.Runtime.Run(ctx, nudge)
+			d.log.Info("follow-up turn finished",
+				"issue", rec.IssueID, "session", nudged.SessionID,
+				"finished", nudged.Finished, "timed_out", nudged.TimedOut,
+				"replied", anyToolCompleted(nudged.Tools, tools.Reply),
+				"cost", nudged.Cost, "tokens", nudged.Tokens.Total,
+				"elapsed", nudged.Elapsed.Round(time.Millisecond))
+			result = mergeTurns(result, nudged, nudgeErr)
+			err = nudgeErr
+			replied = anyToolCompleted(result.Tools, tools.Reply)
+		}
+	}
 
 	// Record the turn even when it failed: the audit is the only place the
 	// operator can see what happened.
-	replied := anyToolCompleted(result.Tools, tools.Reply)
 	attrs := []any{
 		"issue", rec.IssueID, "action", decision.Action, "phase", phase, "runtime", binding.Name,
 		"session", result.SessionID, "finished", result.Finished, "timed_out", result.TimedOut,
@@ -976,6 +1015,12 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 			"hint", "check the "+strings.Join(tools.Reply, "/")+" call and the MCP server")
 	}
 
+	// A finished turn that posted nothing asserts nothing. `awaiting_input` means
+	// "analysis is posted and a human must answer", and a plan state of `draft` means
+	// "a plan exists" — neither is true when the issue has no comment at all. Writing
+	// them anyway is how a task whose agent said nothing came to be read, on the next
+	// delivery, as "a plan is waiting for approval" and went straight to an execution
+	// turn with edit rights (issue #27). Fail instead, so the row matches the issue.
 	state := registry.StateAwaitingInput
 	switch {
 	case err != nil || (!result.Finished && !result.TimedOut):
@@ -983,11 +1028,13 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	case result.TimedOut:
 		// A timeout is not a failure: the session may still be running.
 		state = registry.StateExecuting
+	case !replied:
+		state = registry.StateFailed
 	case decision.Action == rules.ActionExecute:
 		state = registry.StateDone
 	}
 	plan := task.Plan
-	if decision.Action == rules.ActionAnalyze || decision.Action == rules.ActionPlan {
+	if replied && (decision.Action == rules.ActionAnalyze || decision.Action == rules.ActionPlan) {
 		// The turn produced analysis or a plan; a human decides what happens next.
 		plan = registry.PlanDraft
 	}
@@ -1031,6 +1078,79 @@ func anyToolCompleted(calls []agent.ToolCall, replyTools []string) bool {
 		}
 	}
 	return false
+}
+
+// silentFinish reports whether a turn ended cleanly and posted no reply — the state
+// that must never be recorded as an answer (issue #27).
+//
+// A turn that errored, never finished, or timed out is excluded: those have their own
+// states, and re-prompting a session whose prompt the server rejected would only fail
+// again. A result with no session id is excluded too, because there is nothing to
+// continue.
+func silentFinish(result agent.Result, err error, replied bool) bool {
+	return err == nil && result.Finished && !result.TimedOut && !replied && result.SessionID != ""
+}
+
+// MinNudgeDeadline keeps a short task deadline from making the follow-up turn so
+// tight that it cannot post a comment.
+const MinNudgeDeadline = 2 * time.Minute
+
+// nudgeDeadline bounds the follow-up turn: a fraction of the ordinary budget, because
+// that turn may only post a comment. Without it one delivery could hold a worker for
+// two full turn budgets.
+//
+// The floor is a floor on the *fraction*, not a raise: a deployment whose ordinary
+// turn budget is shorter than MinNudgeDeadline keeps its own (shorter) bound, because
+// the follow-up must never get more time than a real turn.
+func nudgeDeadline(ordinary time.Duration) time.Duration {
+	if ordinary <= 0 {
+		return MinNudgeDeadline
+	}
+	bound := ordinary / 3
+	if bound < MinNudgeDeadline {
+		bound = MinNudgeDeadline
+	}
+	if bound > ordinary {
+		bound = ordinary
+	}
+	return bound
+}
+
+// mergeTurns folds the follow-up turn into the first one, so the audit and the
+// registry record one delivery: the costs add up and every permission decision from
+// both turns is kept. The second turn decides the outcome — it is the one that either
+// posted the comment or did not.
+func mergeTurns(first, second agent.Result, err error) agent.Result {
+	merged := first
+	merged.SessionID = second.SessionID
+	merged.Finished = second.Finished
+	merged.TimedOut = second.TimedOut
+	merged.ErrorText = second.ErrorText
+	merged.Elapsed = first.Elapsed + second.Elapsed
+	merged.Cost = first.Cost + second.Cost
+	merged.Tokens = addTokens(first.Tokens, second.Tokens)
+	// A follow-up that produced no text must not erase what the first turn said: that
+	// text is what recognises our own comment coming back when the marker is lost.
+	if strings.TrimSpace(second.Text) != "" {
+		merged.Text = second.Text
+	}
+	merged.Tools = append(append([]agent.ToolCall(nil), first.Tools...), second.Tools...)
+	merged.Permissions = append(append([]agent.PermissionDecision(nil), first.Permissions...), second.Permissions...)
+	if err != nil && merged.ErrorText == "" {
+		merged.ErrorText = err.Error()
+	}
+	return merged
+}
+
+func addTokens(first, second agent.Tokens) agent.Tokens {
+	sum := first
+	sum.Input += second.Input
+	sum.Output += second.Output
+	sum.Reasoning += second.Reasoning
+	sum.Total += second.Total
+	sum.CacheRead += second.CacheRead
+	sum.CacheWrite += second.CacheWrite
+	return sum
 }
 
 // shortCommit renders a commit id for a log line: long enough to be unambiguous in
