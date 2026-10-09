@@ -95,9 +95,37 @@ type Task struct {
 	// its replies through an MCP server as the same tracker user as the human, so
 	// identity cannot separate them: a comment that repeats this text is
 	// recognised as our own by content instead.
-	LastReply string    `json:"last_reply,omitempty"`
+	LastReply string `json:"last_reply,omitempty"`
+	// LastAction is the action of the most recent turn, so a human's permit can
+	// continue where the agent was stopped instead of guessing from the plan state.
+	LastAction string `json:"last_action,omitempty"`
+	// Refusals are the permission requests the most recent turn was refused for.
+	// They are replaced every turn because they are what a bare `/opencode permit`
+	// authorises: the commands the human has just read about, and nothing else.
+	Refusals []Refusal `json:"refusals,omitempty"`
+	// Grant is the authorisation a human gave by name, applying to this task's later
+	// turns until the task is done or the permit is revoked. Nil means none.
+	Grant     *Grant    `json:"grant,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Refusal is one permission request the arbiter refused, kept so that a human's
+// authorisation is exactly the command they read in the agent's comment rather than
+// something the automation inferred.
+type Refusal struct {
+	Command string `json:"command"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// Grant is the shell authorisation a human gave one task by commenting the permit
+// phrase. It is a list of *literal* command segments: authorising `rtk git status`
+// does not authorise `rtk git status --porcelain`, and it never authorises anything
+// the runtime's deny list refuses.
+type Grant struct {
+	Commands []string  `json:"commands"`
+	By       string    `json:"by,omitempty"`
+	At       time.Time `json:"at"`
 }
 
 // Registry is a concurrency-safe, file-backed task table.
