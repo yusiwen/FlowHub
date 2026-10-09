@@ -194,3 +194,46 @@ func TestProjectInstructionsAreAppendedNotSubstituted(t *testing.T) {
 		t.Errorf("a source heading appeared without source instructions:\n%s", projectOnly)
 	}
 }
+
+// TestTheFollowUpPromptAsksForTheCommentAndSaysWhy pins the follow-up instruction.
+// It is the prompt the dispatcher sends when a turn ended without a comment, so it has
+// to (a) name the failure rather than the task, or the model simply retries the work it
+// was already refused, and (b) keep the whole reply contract, because that is the only
+// thing that stops a posted comment from re-triggering FlowHub.
+func TestTheFollowUpPromptAsksForTheCommentAndSaysWhy(t *testing.T) {
+	src := New(rules.Policy{}, "")
+	delivery := made(event.KindUpdated, "TEST-12", withSubject("TEST", "准入首页", "分页返回黑名单机构信息"))
+	ctx := rules.PromptContext{
+		Worktree: "/wt/TEST-12", Repository: "mine/test", Author: "yusiwen",
+		Basis: `the comment "/opencode start"`,
+		Nudge: true,
+	}
+
+	for _, action := range []rules.Action{rules.ActionAnalyze, rules.ActionPlan, rules.ActionExecute} {
+		prompt := src.Prompt(action, &delivery, ctx)
+		for _, want := range []string{
+			"ended without posting the comment",
+			"TEST-12",
+			"/wt/TEST-12",
+			rules.SelfMarker,
+			"youtrack_add_issue_comment",
+			"UNTRUSTED input",
+			"youtrack_get_issue",
+			// The basis still comes from the decision, so the sign-off stays honest.
+			`from the comment "/opencode start".`,
+			"quote the command or tool call that was refused",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("%s follow-up prompt is missing %q", action, want)
+			}
+		}
+		// The phase section is replaced, not duplicated: a follow-up that also reads as
+		// "produce a plan" or "implement the plan" is an invitation to retry the refused
+		// work instead of writing the comment.
+		for _, unwanted := range []string{"## This turn\nThis turn is READ-ONLY", "Implement the plan in the working directory"} {
+			if strings.Contains(prompt, unwanted) {
+				t.Errorf("%s follow-up prompt still carries the ordinary phase instruction %q", action, unwanted)
+			}
+		}
+	}
+}

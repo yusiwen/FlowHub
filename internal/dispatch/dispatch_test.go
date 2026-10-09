@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yusiwen/flowhub/internal/agent"
 	agentruntime "github.com/yusiwen/flowhub/internal/agent/opencode"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
@@ -44,6 +46,10 @@ type fakeOpencode struct {
 	askPermission bool
 	// postComment controls whether the turn "posts" its reply.
 	postComment bool
+	// commentFromPrompt makes the fake post its reply only from the Nth prompt on, so
+	// a test can produce a silent first turn followed by a follow-up that answers. Zero
+	// means every prompt posts, which is the ordinary case.
+	commentFromPrompt int
 	// ruleset records what the session was created with.
 	ruleset []agentruntime.PermissionRule
 	// sessionBody and promptBody keep the whole request so an entry's agent and
@@ -128,7 +134,7 @@ func (f *fakeOpencode) start() *httptest.Server {
 				State: &agentruntime.ToolState{Status: "completed", Output: "ok"},
 			})
 		}
-		if f.postComment {
+		if f.postComment && (f.commentFromPrompt == 0 || len(f.prompts) >= f.commentFromPrompt) {
 			parts = append(parts, agentruntime.Part{
 				Type: "tool", Tool: "youtrack_add_issue_comment",
 				State: &agentruntime.ToolState{Status: "completed"},
@@ -490,6 +496,15 @@ func TestQueueOverflowDropsInsteadOfBlocking(t *testing.T) {
 	}
 }
 
+// TestTurnWithoutAReplyIsRecordedAsSuch pins what happens when a turn posts nothing
+// at all — the live shape measured 2026-10-09, where three bash refusals left the
+// model with no output and the issue with no comment.
+//
+// Two things must be true. The dispatcher asks exactly once more, in the same session,
+// and then gives up: an unbounded retry would turn a model that cannot comply into a
+// loop. And the task is recorded as FAILED, not as "awaiting input" with a plan draft —
+// that row meant "a plan exists", which the next delivery read as approval to start an
+// execution turn with edit rights (issue #27).
 func TestTurnWithoutAReplyIsRecordedAsSuch(t *testing.T) {
 	fake := newFakeOpencode(t)
 	fake.postComment = false
@@ -503,10 +518,78 @@ func TestTurnWithoutAReplyIsRecordedAsSuch(t *testing.T) {
 	if !ok {
 		t.Fatal("the task was not recorded")
 	}
-	// The registry still records the turn; the missing reply is surfaced in the
-	// application log, which is where an operator looks.
 	if task.Turns != 1 {
-		t.Fatalf("turns = %d", task.Turns)
+		t.Fatalf("turns = %d, want the delivery counted once however many prompts it took", task.Turns)
+	}
+	if task.State != registry.StateFailed {
+		t.Fatalf("state = %q, want failed: a turn that posted nothing answered nothing", task.State)
+	}
+	if task.Plan != registry.PlanNone {
+		t.Fatalf("plan = %q, want none: no plan was ever posted", task.Plan)
+	}
+	if task.SessionID == "" {
+		t.Fatal("the session was not recorded, so the task cannot be continued")
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.prompts) != 2 {
+		t.Fatalf("prompts = %d, want exactly two: the turn and one follow-up", len(fake.prompts))
+	}
+	if fake.sessions != 1 {
+		t.Fatalf("sessions = %d, want the follow-up to reuse the first session", fake.sessions)
+	}
+	if fake.continued != 1 {
+		t.Fatalf("continued = %d, want the follow-up to arrive on the existing session", fake.continued)
+	}
+}
+
+// TestASilentTurnIsAskedOnceMoreAndThenAnswered is the other half: when the follow-up
+// does post the comment, the task is recorded as answered. Without this the state fix
+// above would be indistinguishable from "always fail".
+func TestASilentTurnIsAskedOnceMoreAndThenAnswered(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.commentFromPrompt = 2
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-47", "issueCreated", issueCreatedBody("TEST-47")))
+
+	fake.mu.Lock()
+	if len(fake.prompts) != 2 {
+		fake.mu.Unlock()
+		t.Fatalf("prompts = %d, want two", len(fake.prompts))
+	}
+	followUp := fake.prompts[1]
+	fake.mu.Unlock()
+
+	// The follow-up is a different instruction, not a repeat: it has to name the
+	// failure, because a model that reads it as "do the task again" retries the same
+	// refused commands and ends silently a second time.
+	for _, want := range []string{"ended without posting the comment", "TEST-47", "no further work should"} {
+		if !strings.Contains(followUp, want) {
+			t.Errorf("the follow-up prompt is missing %q", want)
+		}
+	}
+	// It still carries the reply contract: the marker is what stops the comment from
+	// re-triggering FlowHub.
+	if !strings.Contains(followUp, rules.SelfMarker) || !strings.Contains(followUp, "youtrack_add_issue_comment") {
+		t.Error("the follow-up prompt dropped the reply contract")
+	}
+
+	task, ok := reg.Get(youtrack.SourceName, "TEST-47")
+	if !ok {
+		t.Fatal("the task was not recorded")
+	}
+	if task.State != registry.StateAwaitingInput || task.Plan != registry.PlanDraft {
+		t.Fatalf("state/plan = %q/%q, want awaiting_input/draft once the comment was posted",
+			task.State, task.Plan)
+	}
+	// The follow-up's own usage is folded into the one delivery: its cost is real and
+	// the budget has to see it.
+	if task.Cost <= 0.004 {
+		t.Fatalf("cost = %v, want both turns counted", task.Cost)
 	}
 }
 
@@ -1103,5 +1186,51 @@ func assertNoOverlappingTurns(t *testing.T, fake *fakeOpencode, reason string) {
 	t.Helper()
 	if got := fake.maxConcurrentPrompts(); got != 1 {
 		t.Fatalf("prompts overlapped = %d, want 1: %s", got, reason)
+	}
+}
+
+// TestTheFollowUpIsBoundedToACleanFinish pins the two guards around the follow-up.
+//
+// It only fires for a turn that ended cleanly and posted nothing: an error, a
+// FirstResponse failure and a timeout each have their own state, and re-prompting a
+// session whose prompt the server rejected would fail again for the same reason. And
+// its deadline is a fraction of the ordinary one, so a single delivery cannot hold a
+// worker for two full turn budgets.
+func TestTheFollowUpIsBoundedToACleanFinish(t *testing.T) {
+	clean := agent.Result{Finished: true, SessionID: "ses_1"}
+	cases := map[string]struct {
+		result  agent.Result
+		err     error
+		replied bool
+		want    bool
+	}{
+		"finished without a comment": {clean, nil, false, true},
+		"finished with a comment":    {clean, nil, true, false},
+		"errored":                    {clean, errors.New("boom"), false, false},
+		"never finished":             {agent.Result{SessionID: "ses_1"}, nil, false, false},
+		"timed out":                  {agent.Result{Finished: true, TimedOut: true, SessionID: "ses_1"}, nil, false, false},
+		"no session to continue":     {agent.Result{Finished: true}, nil, false, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := silentFinish(tc.result, tc.err, tc.replied); got != tc.want {
+				t.Fatalf("silentFinish = %t, want %t", got, tc.want)
+			}
+		})
+	}
+
+	if got := nudgeDeadline(15 * time.Minute); got != 5*time.Minute {
+		t.Fatalf("nudgeDeadline(15m) = %s, want 5m", got)
+	}
+	if got := nudgeDeadline(3 * time.Minute); got != MinNudgeDeadline {
+		t.Fatalf("nudgeDeadline(3m) = %s, want the %s floor", got, MinNudgeDeadline)
+	}
+	if got := nudgeDeadline(0); got != MinNudgeDeadline {
+		t.Fatalf("nudgeDeadline(0) = %s, want the %s floor", got, MinNudgeDeadline)
+	}
+	// The floor never raises the bound past the deployment's own budget: a host whose
+	// turns get one second does not hand its follow-up two minutes.
+	if got := nudgeDeadline(time.Second); got != time.Second {
+		t.Fatalf("nudgeDeadline(1s) = %s, want 1s", got)
 	}
 }

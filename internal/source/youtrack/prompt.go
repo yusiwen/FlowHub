@@ -39,12 +39,18 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 	}
 
 	var b strings.Builder
-	switch action {
-	case rules.ActionAnalyze:
+	switch {
+	case ctx.Nudge:
+		// The header names the failure rather than the task: this turn exists because
+		// the previous one broke the contract, and a model that reads it as "try the
+		// whole task again" will loop through the same refusals.
+		fmt.Fprintf(&b, "Your previous turn on YouTrack issue %s ended without posting the comment this workflow requires, so the maintainer was told nothing at all.\n", d.IssueID)
+		fmt.Fprintf(&b, "Issue %s is therefore still unanswered. This follow-up turn exists only to fix that.\n", d.IssueID)
+	case action == rules.ActionAnalyze:
 		fmt.Fprintf(&b, "Analyse YouTrack issue %s before any implementation work.\n", d.IssueID)
-	case rules.ActionPlan:
+	case action == rules.ActionPlan:
 		fmt.Fprintf(&b, "Produce an implementation plan for YouTrack issue %s.\n", d.IssueID)
-	case rules.ActionExecute:
+	case action == rules.ActionExecute:
 		fmt.Fprintf(&b, "Implement the agreed plan for YouTrack issue %s.\n", d.IssueID)
 	default:
 		return ""
@@ -109,18 +115,27 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 		}
 	}
 
-	switch action {
-	case rules.ActionAnalyze:
+	switch {
+	case ctx.Nudge:
+		b.WriteString("\n## This turn\n")
+		b.WriteString("Post the comment described below. Nothing else is required of you, and no further work should\n")
+		b.WriteString("be started.\n")
+		b.WriteString("If something stopped you, say exactly what: quote the command or tool call that was refused and the\n")
+		b.WriteString("reason you were given. A refusal is a fact to report, not an obstacle to work around — and ending a\n")
+		b.WriteString("turn without a comment is never an acceptable outcome, because it leaves the maintainer with no sign\n")
+		b.WriteString("that anything happened at all.\n")
+		b.WriteString("If you did the work, report what you found or changed, and what you could not verify.\n")
+	case action == rules.ActionAnalyze:
 		b.WriteString("\n## This turn\n")
 		b.WriteString("This turn is READ-ONLY. Inspect the repository and the issue, but change nothing:\n")
 		b.WriteString("no file edits, no commits, no state changes in YouTrack.\n")
-	case rules.ActionPlan:
+	case action == rules.ActionPlan:
 		b.WriteString("\n## This turn\n")
 		b.WriteString("This turn is READ-ONLY. Produce a concrete, ordered implementation plan: which files change, what the\n")
 		b.WriteString("risky parts are, and how the change will be verified. List every question that must be answered by a\n")
 		b.WriteString("human before implementation can start. If a plan already exists in this session, refine it instead of\n")
 		b.WriteString("starting over. Change nothing on disk.\n")
-	case rules.ActionExecute:
+	case action == rules.ActionExecute:
 		b.WriteString("\n## This turn\n")
 		b.WriteString("Implement the plan in the working directory. You may edit files and commit locally on the task branch;\n")
 		b.WriteString("you must never push, and never touch another branch or the shared checkout. Run the project's tests or\n")
