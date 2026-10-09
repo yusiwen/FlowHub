@@ -384,6 +384,7 @@ What each value means, and how to get it right:
 | `runtime` / `runtimes` | An **eligibility set**, not an order: a project naming none may be served by any configured runtime. `runtime_policy` (`spread`, the default) decides which one takes a new task. |
 | `agent` | The agent profile name inside opencode (`devops`). **Never the product name** — asking opencode for an agent called "opencode" silently falls back to its own default agent, which is looser. |
 | `max_concurrent` | How many **distinct tasks** a host serves at once, `1`..`64`. A single task is never in two turns at once. |
+| `shell_wrappers` | Optional, `[]` by default. Command prefixes this host's opencode plugins are trusted to insert in front of a bash command. See §8.6 — get this wrong and every read-only git command is refused. |
 
 By default no secret goes in this file: locks live in the environment. A runtime's
 Basic Auth password has four possible sources — see §5.4 — and only the inline one
@@ -667,6 +668,61 @@ safe default, not a dead end.
 
 Expected timings from the reference runs: a read-only analysis turn ~11–19 s, a
 one-file implementation ~22–26 s.
+
+### 8.6 Plugins that rewrite commands (shell wrappers)
+
+**Check this before you blame the model.** An opencode plugin hooked to
+`tool.execute.before` can rewrite a bash command *after* the model writes it and
+*before* the permission request is raised. FlowHub's shell allowlist is anchored at
+the command name, so a rewritten command is refused — and because the model's own
+tool input still shows the original, it retries the same thing until the turn ends
+with no comment at all.
+
+The signature in `flowhub.log`:
+
+```
+level=INFO msg="permission answered" permission=bash command="rtk git status" reply=reject \
+  reason="command segment \"rtk git status\" is not on the read-only allowlist..."
+level=ERROR msg="the turn finished without posting a comment; the issue has no reply"
+```
+
+A command with a word in front of it that the model never typed is the tell. Find the
+plugin:
+
+```bash
+ls ~/.config/opencode/plugins/          # this host's agent server
+cat ~/.config/opencode/plugins/rtk.ts   # the rewrite hook, if any
+```
+
+Two ways forward, and the first is always right when the wrapper is a tool you want:
+
+1. **Trust the prefix** — tell FlowHub which command prefixes may be stripped before
+   judging:
+
+   ```json
+   "runtimes": { "local": { "url": "http://127.0.0.1:4096", "shell_wrappers": ["rtk"] } }
+   ```
+
+   or process-wide with `FLOWHUB_SHELL_WRAPPERS=rtk` (comma separated; a runtime
+   block wins). The arbiter strips it and judges what remains with the **same** deny
+   list and allowlist. `rtk rm -rf /` is still refused, `git add` is still
+   execution-phase-only, and a wrapper in front of `curl`, `python` or a path outside
+   the worktree changes nothing. Restart FlowHub; startup logs
+   `shell wrappers are trusted runtime=local wrappers=rtk`, and `-print-config`
+   shows the effective list.
+
+   A name must be a bare command name (letters, digits, dot, dash, underscore, plus);
+   anything else refuses the start, because an entry that cannot match a command's
+   first word would silently do nothing.
+
+2. **Turn the rewrite off for this agent.** Remove the plugin, or scope it so it does
+   not apply to the profile FlowHub drives. This is the only option if you do *not*
+   want that tool in the loop at all — with no `shell_wrappers` entry, FlowHub refuses
+   the rewritten command, which is the safe default.
+
+Either way, expect the agent's first retry to still fail if you changed nothing:
+FlowHub prints the wrapper name in the refusal precisely so the fact reaches you
+rather than looking like a model that cannot follow instructions.
 
 ---
 
@@ -991,6 +1047,8 @@ tail -5 /var/lib/flowhub/webhook-$(date -u +%F).jsonl | jq -c '{accepted,reason,
 | Every turn runs the wrong behaviour | the agent registry is cached; a *new* agent file is only picked up by a new server process | restart `opencode serve` |
 | The agent asks for a permission forever | a request the server keeps listing | see `README.md`; a 404 is treated as already resolved, and a handled request is never listed again |
 | Push fails on the first real task | `runtime init --check` ran as a different user than the service | re-run the check as the service user; it reports the identity it ran as |
+| Bash refused with a command the model never typed (`rtk git status`) | an opencode plugin rewrote the command before the permission request | §8.6 — trust the prefix with `shell_wrappers`, or disable the plugin |
+| Turn finishes with *the turn finished without posting a comment* | every tool call was refused, so the model gave up with no text | read the `permission answered` lines above it; these are the rejection reasons |
 
 ### 12.5 Escalation data to collect
 

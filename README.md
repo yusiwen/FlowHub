@@ -318,6 +318,7 @@ switched on explicitly:
 | `FLOWHUB_DISPATCH_QUEUE` | `32` | Deliveries waiting for a runtime's worker. A full queue drops work instead of blocking the publisher |
 | `FLOWHUB_TASK_DEADLINE` | `15m` | One turn's budget. A deadline is not a failure: the session keeps running and is marked `executing` |
 | `FLOWHUB_FIRST_RESPONSE` | `90s` | How long a turn may take to produce its first assistant message before it is **failed**. A prompt the agent server never turns into a turn (a model its provider dropped) leaves the session idle with no message, which otherwise looks like a slow turn until the deadline. Capped at a third of `FLOWHUB_TASK_DEADLINE`, floored at `5s` |
+| `FLOWHUB_SHELL_WRAPPERS` | *(unset)* | Comma separated command prefixes an agent host's plugins are trusted to insert in front of a bash command, e.g. `rtk`. The arbiter strips a leading wrapper and judges the remainder with the same deny list and allowlist, so trusting one admits nothing new. Unset means nothing is stripped. A `shell_wrappers` list inside `runtimes.<name>` overrides it per host |
 | `FLOWHUB_MAX_TURNS` | `8` | A task that triggers more often than this stops and asks for a human |
 | `FLOWHUB_TASK_MAX_COST` | `0` | Stop a task whose accumulated opencode cost passes this many dollars. `0` disables the check |
 | `FLOWHUB_TRIGGER` | `/opencode start` | The comment that means "implement it" |
@@ -581,7 +582,7 @@ even though YouTrack knows the answer. Measured evidence:
 | `runtime` / `runtimes` | The eligibility set for a new task. A name that is not a runtime name (`^[a-z0-9][a-z0-9._-]{0,62}$`) is refused when the file is loaded, because it could never be enrolled |
 | `runtime_policy` | `spread` or `first-healthy`, per project or for the whole file; anything else is refused at load |
 | `sources.<name>` | `enabled`, the trigger `policy`, an author allowlist a project may narrow, and `prompt_file` (extra instructions, appended — see below) |
-| `runtimes.<name>` | `url`, `auth` (a username plus exactly one password source: `password`, `password_env`, `password_file`, or the shared `credentials_file`), `agent`, `model`, `deadline`, `max_concurrent` (`1`..`64`, how many distinct tasks the host may serve at once) |
+| `runtimes.<name>` | `url`, `auth` (a username plus exactly one password source: `password`, `password_env`, `password_file`, or the shared `credentials_file`), `agent`, `model`, `deadline`, `max_concurrent` (`1`..`64`, how many distinct tasks the host may serve at once), `shell_wrappers` (command prefixes this host's plugins may rewrite in front of a command, `[]` by default) |
 
 ### Startup validation (fail-closed)
 
@@ -680,6 +681,21 @@ pending permission keeps a session `busy` — so "busy" never means "working" an
      the per-task worktree, not this list.
    A rejection carries a reason, which opencode hands to the model as feedback, so
    the model adapts instead of repeating the call.
+
+   One thing the allowlist cannot see for itself: an opencode plugin hooked to
+   `tool.execute.before` can **rewrite the command** after the model writes it and
+   before the permission request is raised. The list is anchored at the command name,
+   so `rtk git status` is not `git status` — and the model's own tool input still shows
+   what it typed, so "rephrase using inspection commands" sends it into a loop that is
+   rewritten every time. Two answers, in `internal/agent/opencode/wrapper.go`:
+
+   * the refusal **names the wrapper** and the command it hides, so the model reports
+     the fact instead of retrying (this needs no configuration);
+   * an operator may **trust** a prefix — `FLOWHUB_SHELL_WRAPPERS`, or a
+     `shell_wrappers` list in `runtimes.<name>` — and the arbiter strips it and judges
+     what remains with the *same* deny list and allowlist. `rtk rm -rf /` still fails,
+     and `git add` is still execution-phase-only. Nothing is stripped until the
+     operator names the prefix, and each trusted list is logged at startup.
 
 Measured on 2026-09-20 against opencode 1.18.31: a read-only turn finishes in
 about 6 seconds, and the model often submits a *compound* command
@@ -1127,7 +1143,7 @@ Layout:
 | `internal/projectmap` | The configuration file: v1/v2 loader with the v1 translation, `sources`/`runtimes`/`projects`, the `(source, project)` index, per-level policy precedence with provenance, canonical paths, fail-closed validation, runtime addressing |
 | `internal/rules` | Trigger policy over the neutral event: ignore/analyze/plan/execute, self-comment detection, turn budget, reply basis |
 | `internal/agent` | The runtime seam: `Runtime`, the neutral `Turn`/`Result`, the turn phase and the download policy |
-| `internal/agent/opencode` | opencode client, permission arbiter, session ruleset and the runner that drives one unattended turn |
+| `internal/agent/opencode` | opencode client, permission arbiter (including the trusted command prefixes a host plugin may insert), session ruleset and the runner that drives one unattended turn |
 | `internal/workspace` | The workspace seam: `Workspace`, `Handle`, the pinned `Base`, and entry validation |
 | `internal/workspace/localworktree` | The co-located provider: one git worktree per task, baseline pinned through the origin |
 | `internal/dispatch` | The workers: intake loop, one queue and worker per runtime, worktree, session, registry, audit |

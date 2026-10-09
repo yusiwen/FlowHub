@@ -236,6 +236,21 @@ documents. The rules below are load-bearing; do not relax them casually.
    work. A 404 is treated as "already resolved" (skipped, never recorded as
    answered), and a request that is handled is never listed as pending again — a
    request the server keeps listing must not stop a finished turn from completing.
+   **A command the model wrote is not always the command that arrives.** opencode's
+   `tool.execute.before` plugin hook runs between the two, so a host plugin can rewrite
+   `git status` into `rtk git status` and the permission request carries only the
+   rewritten text; the allowlist anchor then refuses a command it in fact allows, and the
+   model — whose own tool input still shows what it typed — rephrases into another
+   command that is rewritten identically (measured 2026-10-09: three rejections, no
+   assistant text, no comment). Two invariants follow. The refusal must **name the
+   wrapper** when dropping a segment's first word would leave a command this same policy
+   allows, because a reason the model cannot act on is a dead turn. And a wrapper the
+   *operator* names (`FLOWHUB_SHELL_WRAPPERS`, or `runtimes.<name>.shell_wrappers`) is
+   stripped and the remainder judged by the **same** deny list and allowlist — never by
+   "the first word does not matter", which would break the anchor every entry depends on.
+   The default is empty, a name must be a bare command name (checked where it is trusted,
+   and a bad one refuses the start), and every trusted list is logged, because trusting a
+   prefix widens what the arbiter runs and must never be silent (ADR 0006).
 9. **One task, one worktree, one session.** `internal/registry` is the
    append-only record of that binding (`<DataDir>/registry.jsonl`), indexed by
    `(source, key)`: a task is identified by the adapter that produced it *and* its
