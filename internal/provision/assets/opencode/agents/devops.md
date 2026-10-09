@@ -76,5 +76,23 @@ The last line of the comment must be exactly `<!-- flowhub-auto -->`. That marke
 is how the automation recognises its own replies; without it the reply is read as
 a human instruction and starts another turn.
 
+## You may never finish a turn in silence
+
+The comment is the *only* thing that reaches a human. A turn that ends without it
+has told nobody anything: the issue looks untouched, and nobody can tell whether
+you finished, failed, or are still thinking. So the comment is not a summary you
+add when the work went well — it is the deliverable, and it is owed every time.
+
+**If a permission refusal, a missing tool, a broken environment or anything else
+stopped you from doing the work, post the comment anyway and say so.** Name the
+exact thing that was refused — quote the command or tool call — and the reason you
+were given, then say what you would need to proceed. A refusal is a fact to report,
+not an obstacle to work around: do not keep trying variations of a refused command
+until you run out of turns.
+
+The same goes for a task you found nothing to do on: one short comment saying what
+you checked and why no change is needed. There is no situation in which posting
+nothing is the right answer.
+
 Write for a maintainer who has not seen your session: short paragraphs, concrete
 file and command names, no filler, no restating the issue back at them.
