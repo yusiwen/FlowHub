@@ -190,6 +190,13 @@ func (a *Arbiter) decideBash(req PermissionRequest) Decision {
 			}
 			continue
 		}
+		// A human's authorisation is consulted here and nowhere earlier: the deny
+		// list, the worktree check, the phase rule and the download exception have all
+		// already had their say, so granting a command can only narrow what would
+		// otherwise be refused for being unrecognised.
+		if a.granted(segment, target) {
+			continue
+		}
 		if !a.matchesAny(target) {
 			if wrapper == "" {
 				// Nothing is configured, yet dropping the first word would leave a
@@ -234,6 +241,9 @@ func (a *Arbiter) decideBash(req PermissionRequest) Decision {
 			if ok, why := a.allowCurl(pattern); !ok {
 				return Decision{Reply: ReplyReject, Reason: fmt.Sprintf("request pattern %q: %s", pattern, why)}
 			}
+			continue
+		}
+		if a.granted(pattern, target) {
 			continue
 		}
 		if !a.matchesAny(target) {

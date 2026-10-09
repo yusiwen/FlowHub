@@ -100,6 +100,7 @@ func (r *Runtime) Run(ctx context.Context, turn agent.Turn) (agent.Result, error
 	}
 	arbiter.AllowTools = toolSet(turn.AllowedTools)
 	arbiter.Wrappers = append([]string(nil), r.shellWrappers...)
+	arbiter.Granted = append([]string(nil), turn.Granted...)
 	// The attachment exception is the source's policy, applied by this runtime's
 	// arbiter: which host serves a tracker's attachments is the adapter's fact.
 	arbiter.CurlHosts = append([]string(nil), turn.Downloads.Hosts...)
