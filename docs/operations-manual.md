@@ -669,6 +669,13 @@ safe default, not a dead end.
 Expected timings from the reference runs: a read-only analysis turn ~11–19 s, a
 one-file implementation ~22–26 s.
 
+The log lines that explain a turn which did *not* answer: `the turn finished without
+posting a comment; asking once more` (the dispatcher is sending its one bounded
+follow-up on the same session), then either `follow-up turn finished replied=true` or
+`follow-up turn finished replied=false` plus the ERROR line. A delivery that includes
+the follow-up can take one turn budget plus a third, so a task is not stuck merely
+because it is taking longer than usual.
+
 ### 8.6 Plugins that rewrite commands (shell wrappers)
 
 **Check this before you blame the model.** An opencode plugin hooked to
@@ -948,7 +955,14 @@ every record keeps the full raw body.
 `/var/lib/flowhub/registry.jsonl` is append-only and indexed by
 `(source, issue key)`. Per task it records the repository, worktree, base commit,
 session id, agent, state (`analyzing → awaiting_input → executing → done`,
-`failed` on a broken turn), plan state, turn count, cost and last reply.
+`failed` on a broken turn **or on a turn that finished without posting a comment**),
+plan state, turn count, cost and last reply.
+
+`awaiting_input` with a plan state of `draft` means "a comment was posted and a
+plan exists". It is never written for a silent turn: a row claiming a plan the
+agent never posted would be read by the next delivery as approval to start an
+execution turn with edit rights. Look for `state=failed` together with
+`the turn finished without posting a comment` in the log.
 
 ```bash
 jq -c '{issue,repo,runtime,state,turns,cost,worktree}' \
@@ -993,6 +1007,21 @@ sudo systemctl restart flowhub
 
 The routing file is validated at startup; a bad edit refuses the start rather
 than routing wrongly. Task worktrees and the registry survive a restart.
+
+**After an upgrade that changed the agent definition, two more steps** — FlowHub's
+embedded `agents/devops.md` is the agent's system prompt, and it is not reread until
+both happen:
+
+```bash
+flowhub runtime init          # rewrites the artifact from the binary, manifest-checked
+# then restart the agent server itself:
+opencode serve                # the agent registry is cached per server process
+```
+
+`runtime init` refuses a file a human edited (it prints the diff) rather than
+overwriting it; an artifact that only FlowHub has ever written is updated silently.
+Skipping the second step is the trap: the *file* is new, but the running server keeps
+answering with the profile it loaded at startup, cached model included.
 
 ---
 
@@ -1048,7 +1077,7 @@ tail -5 /var/lib/flowhub/webhook-$(date -u +%F).jsonl | jq -c '{accepted,reason,
 | The agent asks for a permission forever | a request the server keeps listing | see `README.md`; a 404 is treated as already resolved, and a handled request is never listed again |
 | Push fails on the first real task | `runtime init --check` ran as a different user than the service | re-run the check as the service user; it reports the identity it ran as |
 | Bash refused with a command the model never typed (`rtk git status`) | an opencode plugin rewrote the command before the permission request | §8.6 — trust the prefix with `shell_wrappers`, or disable the plugin |
-| Turn finishes with *the turn finished without posting a comment* | every tool call was refused, so the model gave up with no text | read the `permission answered` lines above it; these are the rejection reasons |
+| Turn finishes with *the turn finished without posting a comment* | every tool call was refused, so the model gave up with no text — the dispatcher then asked once more and that also produced nothing | read the `permission answered` lines above it; these are the rejection reasons. The task is now `failed`, and the fix is to remove the refusal (e.g. a `shell_wrappers` entry) before triggering again |
 
 ### 12.5 Escalation data to collect
 
