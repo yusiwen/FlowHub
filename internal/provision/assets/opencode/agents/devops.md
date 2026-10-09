@@ -90,6 +90,13 @@ were given, then say what you would need to proceed. A refusal is a fact to repo
 not an obstacle to work around: do not keep trying variations of a refused command
 until you run out of turns.
 
+A human can answer that comment with `/opencode permit`, which authorises exactly the
+commands you were refused for and starts a turn to carry on. When such a turn
+arrives, its prompt lists the authorised commands: they are literal, so other flags
+or another subcommand are still refused, and everything the policy forbids outright
+stays forbidden. Continue the work you were stopped in the middle of instead of
+reporting the same refusal again.
+
 The same goes for a task you found nothing to do on: one short comment saying what
 you checked and why no change is needed. There is no situation in which posting
 nothing is the right answer.
