@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -59,6 +60,14 @@ type fakeOpencode struct {
 	// silentFinish completes the message with tools only and no text, which is what a
 	// turn that ends without a final message looks like.
 	silentFinish bool
+	// permissionCommand, when set, makes every turn raise one bash permission request
+	// for that command before finishing. permissionReplies records what the arbiter
+	// answered, keyed by the 1-based prompt number, which is how a test sees a refusal
+	// and then a permitted retry of the same command.
+	permissionCommand string
+	permissionPending bool
+	permissionReplies map[int]string
+
 	// hold, when set, blocks every prompt until release is called. It is how a test
 	// proves that two runtimes are running turns at the same time rather than in
 	// sequence.
@@ -91,7 +100,21 @@ func (f *fakeOpencode) release() {
 }
 
 func newFakeOpencode(t *testing.T) *fakeOpencode {
-	return &fakeOpencode{t: t, askPermission: true, postComment: true}
+	return &fakeOpencode{t: t, askPermission: true, postComment: true, permissionReplies: map[int]string{}}
+}
+
+// permissionReplyFor reports what the arbiter answered on the given 1-based prompt.
+func (f *fakeOpencode) permissionReplyFor(prompt int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.permissionReplies[prompt]
+}
+
+// promptsSeen reports how many prompts have been delivered, under the lock.
+func (f *fakeOpencode) promptsSeen() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.prompts...)
 }
 
 func (f *fakeOpencode) start() *httptest.Server {
@@ -120,6 +143,11 @@ func (f *fakeOpencode) start() *httptest.Server {
 		}
 		if len(f.prompts) > 1 {
 			f.continued++
+		}
+		if f.permissionCommand != "" {
+			// A fresh turn asks again: the request is unanswered until this turn's
+			// reply arrives.
+			f.permissionPending = true
 		}
 		// The turn is in flight from here until the handler returns; a second turn for
 		// the same task would overlap with it.
@@ -175,7 +203,26 @@ func (f *fakeOpencode) start() *httptest.Server {
 	handler.HandleFunc("/permission", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		writeJSON(w, []agentruntime.PermissionRequest{})
+		if f.permissionCommand == "" || !f.permissionPending {
+			writeJSON(w, []agentruntime.PermissionRequest{})
+			return
+		}
+		writeJSON(w, []agentruntime.PermissionRequest{{
+			ID: "per_1", SessionID: "ses_fake", Permission: "bash",
+			Patterns: []string{f.permissionCommand},
+			Metadata: agentruntime.PermissionMetadata{Command: f.permissionCommand},
+		}})
+	})
+	handler.HandleFunc("/permission/per_1/reply", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		var body struct {
+			Reply string `json:"reply"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.permissionReplies[len(f.prompts)] = body.Reply
+		f.permissionPending = false
+		writeJSON(w, true)
 	})
 	return httptest.NewServer(handler)
 }
@@ -273,6 +320,15 @@ func delivery(issueID, event, body string) *store.Record {
 		Kind: "webhook", Accepted: true, Event: event, IssueID: issueID,
 		ProjectKey: "TEST", PrimaryActor: "yusiwen", RawBody: body,
 	}
+}
+
+// commentBody is the payload shape the app sends for a comment: the text lives in
+// comments[].text, not at the top level — which is exactly the kind of detail that makes
+// a permit test look like a policy failure.
+func commentBody(issueID, text string) string {
+	return `{"event":"commentAdded","id":"` + issueID + `","summary":"x","description":"d",` +
+		`"project":{"key":"TEST","name":"TEST","shortName":"TEST"},` +
+		`"comments":[{"text":` + strconv.Quote(text) + `,"created":1,"author":{"login":"yusiwen"}}]}`
 }
 
 func issueCreatedBody(issueID string) string {
@@ -1232,5 +1288,191 @@ func TestTheFollowUpIsBoundedToACleanFinish(t *testing.T) {
 	// turns get one second does not hand its follow-up two minutes.
 	if got := nudgeDeadline(time.Second); got != time.Second {
 		t.Fatalf("nudgeDeadline(1s) = %s, want 1s", got)
+	}
+}
+
+// TestAPermitAuthorisesExactlyWhatWasRefusedAndContinuesTheTask is the whole permit
+// loop, end to end: a turn is refused a command, the registry records it, the human
+// answers with the permit phrase, and the task continues *in the same session* with
+// that command authorised — proved by the arbiter answering "once" where it answered
+// "reject" a moment earlier.
+func TestAPermitAuthorisesExactlyWhatWasRefusedAndContinuesTheTask(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.permissionCommand = "mvn -q verify"
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-60", "issueCreated", issueCreatedBody("TEST-60")))
+
+	task, ok := reg.Get(youtrack.SourceName, "TEST-60")
+	if !ok {
+		t.Fatal("the task was not recorded")
+	}
+	if len(task.Refusals) != 1 || task.Refusals[0].Command != "mvn -q verify" {
+		t.Fatalf("refusals = %+v, want the refused command recorded", task.Refusals)
+	}
+	if task.LastAction != string(rules.ActionAnalyze) {
+		t.Fatalf("last_action = %q, want the action a permit should continue", task.LastAction)
+	}
+	if got := fake.permissionReplyFor(1); got != string(agent.DecisionReject) {
+		t.Fatalf("the first turn answered %q, want a refusal", got)
+	}
+
+	// The human replies on the issue. Nothing else changes.
+	dispatcher.handle(context.Background(), delivery("TEST-60", "commentAdded",
+		commentBody("TEST-60", rules.PermitTrigger)))
+
+	prompts := fake.promptsSeen()
+	if len(prompts) != 2 {
+		t.Fatalf("prompts = %d, want the permit to run a continuation turn", len(prompts))
+	}
+	for _, want := range []string{"## Authorised commands", "mvn -q verify", rules.PermitTrigger} {
+		if !strings.Contains(prompts[1], want) {
+			t.Errorf("the continuation prompt is missing %q", want)
+		}
+	}
+	if got := fake.permissionReplyFor(2); got != "once" {
+		t.Fatalf("the continuation turn answered %q, want the authorised command allowed", got)
+	}
+
+	task, _ = reg.Get(youtrack.SourceName, "TEST-60")
+	if task.Grant == nil || len(task.Grant.Commands) != 1 || task.Grant.Commands[0] != "mvn -q verify" {
+		t.Fatalf("grant = %+v, want the refused command authorised", task.Grant)
+	}
+	if task.Grant.By != "yusiwen" {
+		t.Fatalf("grant.by = %q, want the human who permitted it", task.Grant.By)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.sessions != 1 {
+		t.Fatalf("sessions = %d, want the continuation on the existing session", fake.sessions)
+	}
+	if fake.continued != 1 {
+		t.Fatalf("continued = %d, want the continuation prompt on the same session", fake.continued)
+	}
+}
+
+// TestARevokeTakesTheAuthorisationBack: revoking runs no turn, and the next turn is
+// judged by the policy alone again.
+func TestARevokeTakesTheAuthorisationBack(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.permissionCommand = "mvn -q verify"
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-61", "issueCreated", issueCreatedBody("TEST-61")))
+	dispatcher.handle(context.Background(), delivery("TEST-61", "commentAdded",
+		commentBody("TEST-61", rules.PermitTrigger)))
+	if task, _ := reg.Get(youtrack.SourceName, "TEST-61"); task.Grant == nil {
+		t.Fatal("the permit did not record an authorisation")
+	}
+
+	dispatcher.handle(context.Background(), delivery("TEST-61", "commentAdded",
+		commentBody("TEST-61", rules.RevokeTrigger)))
+
+	task, _ := reg.Get(youtrack.SourceName, "TEST-61")
+	if task.Grant != nil {
+		t.Fatalf("grant = %+v, want it cleared", task.Grant)
+	}
+	// A retraction is not a turn: nothing was sent after it.
+	if got := len(fake.promptsSeen()); got != 2 {
+		t.Fatalf("prompts = %d, want the revoke to send nothing", got)
+	}
+
+	// And the next real trigger is refused again.
+	dispatcher.handle(context.Background(), delivery("TEST-61", "commentAdded",
+		commentBody("TEST-61", "/opencode start")))
+	if got := fake.permissionReplyFor(3); got != string(agent.DecisionReject) {
+		t.Fatalf("after the revoke the command was answered %q, want a refusal", got)
+	}
+}
+
+// TestTheAgentCannotGrantItselfAPermit: the agent posts as the same tracker user as the
+// human, so the phrase must be inert when it comes from our own reply. The marker is
+// what makes that work, and it is the layer that has to hold for the permit phrase
+// exactly as it does for the trigger — a model that writes the keyword itself must not
+// be able to authorise a command.
+func TestTheAgentCannotGrantItselfAPermit(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.permissionCommand = "mvn -q verify"
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-62", "issueCreated", issueCreatedBody("TEST-62")))
+
+	// The agent's own comment, marker and all, asking for the permit it wants.
+	self := commentBody("TEST-62", rules.PermitTrigger+"\n\n> "+rules.SelfMarker)
+	dispatcher.handle(context.Background(), delivery("TEST-62", "commentAdded", self))
+
+	task, _ := reg.Get(youtrack.SourceName, "TEST-62")
+	if task.Grant != nil {
+		t.Fatalf("grant = %+v, want the agent's own comment to authorise nothing", task.Grant)
+	}
+	if got := len(fake.promptsSeen()); got != 1 {
+		t.Fatalf("prompts = %d, want no continuation turn", got)
+	}
+}
+
+// TestAPermitWithNothingRefusedDoesNothing: the authorisation is exactly the refused
+// set, so a phrase with no refusal to point at is ignored rather than guessed at.
+func TestAPermitWithNothingRefusedDoesNothing(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-63", "issueCreated", issueCreatedBody("TEST-63")))
+	before := len(fake.promptsSeen())
+
+	dispatcher.handle(context.Background(), delivery("TEST-63", "commentAdded",
+		commentBody("TEST-63", rules.PermitTrigger)))
+
+	if task, _ := reg.Get(youtrack.SourceName, "TEST-63"); task.Grant != nil {
+		t.Fatalf("grant = %+v, want nothing authorised", task.Grant)
+	}
+	if got := len(fake.promptsSeen()); got != before {
+		t.Fatalf("prompts = %d, want no turn for a permit with nothing to authorise", got)
+	}
+}
+
+// TestAPermitContinuesInThePhaseTheRefusalsStopped: the authorisation has to resume the
+// *work*, not merely a turn. An implementation blocked by a refusal that came back as a
+// read-only analysis would be able to run the command and still not be allowed to use
+// it — the failure this test exists to prevent.
+func TestAPermitContinuesInThePhaseTheRefusalsStopped(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.permissionCommand = "mvn -q verify"
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	// Analysis (which posts a plan), then the trigger, which now plans-or-executes with a
+	// plan on file — an execution turn, whose command is refused.
+	dispatcher.handle(context.Background(), delivery("TEST-64", "issueCreated", issueCreatedBody("TEST-64")))
+	dispatcher.handle(context.Background(), delivery("TEST-64", "commentAdded", commentBody("TEST-64", "/opencode start")))
+	if task, _ := reg.Get(youtrack.SourceName, "TEST-64"); task.LastAction != string(rules.ActionExecute) {
+		t.Fatalf("last_action = %q, want the refused turn to have been an execution", task.LastAction)
+	}
+
+	dispatcher.handle(context.Background(), delivery("TEST-64", "commentAdded",
+		commentBody("TEST-64", rules.PermitTrigger)))
+
+	prompts := fake.promptsSeen()
+	if len(prompts) != 3 {
+		t.Fatalf("prompts = %d, want three", len(prompts))
+	}
+	if !strings.Contains(prompts[2], "Implement the plan in the working directory") {
+		t.Fatalf("the continuation is not an implementation turn:\n%s", prompts[2])
+	}
+	if !strings.Contains(prompts[2], "## Authorised commands") {
+		t.Fatal("the continuation does not carry the authorisation")
+	}
+	// The executed arbiter had the command allowed, which is what makes the phase useful.
+	if got := fake.permissionReplyFor(3); got != "once" {
+		t.Fatalf("the continuation answered %q, want the authorised command allowed", got)
 	}
 }
