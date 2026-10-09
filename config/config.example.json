@@ -43,7 +43,9 @@
       "_comment_deadline": "One turn's budget on this host. FLOWHUB_TASK_DEADLINE is the outermost default.",
       "deadline": "15m",
       "_comment_max_concurrent": "How many distinct TASKS this host may serve at once, 1..64. One task is never in two turns at once: a second delivery for a task already running waits and runs when that turn ends. The host's own claim (its CPU count, reported at init) is a ceiling, so this can only narrow what the host offered. Fixed when the host is first used, so a change needs a restart.",
-      "max_concurrent": 1
+      "max_concurrent": 1,
+      "_comment_shell_wrappers": "Optional, and empty by default. The command prefixes THIS host's opencode plugins are trusted to insert in front of a bash command. A plugin hooked to tool.execute.before rewrites the command after the model writes it and before the permission request is raised (on one host the `rtk` plugin turns `git status` into `rtk git status`), while FlowHub's shell allowlist is anchored at the command name — so an undeclared rewrite is refused, and the model's own tool input still shows the original command. Naming a wrapper makes the arbiter strip it and judge what remains with the SAME deny list and allowlist, so trusting one can never admit a command the policy refuses (`rtk rm -rf /` is still refused). A name must be a bare command name: letters, digits, dot, dash, underscore or plus. FLOWHUB_SHELL_WRAPPERS (comma separated) is the outermost default; this block overrides it. See docs/adr/0006-shell-wrappers.md.",
+      "shell_wrappers": []
     }
   },
 
