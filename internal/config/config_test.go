@@ -89,6 +89,31 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	}
 }
 
+// TestLoadReadsShellWrappers pins the environment level of the wrapper list. The
+// default is empty on purpose: nothing is stripped from a command unless the
+// operator says which prefix is trusted (internal/agent/opencode/wrapper.go).
+func TestLoadReadsShellWrappers(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.ShellWrappers) != 0 {
+		t.Fatalf("shell wrappers default to %v, want none", cfg.ShellWrappers)
+	}
+
+	t.Setenv("FLOWHUB_SHELL_WRAPPERS", "rtk, my-tool ")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := strings.Join(cfg.ShellWrappers, ","); got != "rtk,my-tool" {
+		t.Fatalf("shell wrappers = %q, want %q", got, "rtk,my-tool")
+	}
+	if !strings.Contains(cfg.Report(), "shell_wrappers:     rtk,my-tool") {
+		t.Fatalf("the report does not name the wrappers:\n%s", cfg.Report())
+	}
+}
+
 func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("FLOWHUB_REPLAY_WINDOW", "fortnight")
 	if _, err := Load(); err == nil {

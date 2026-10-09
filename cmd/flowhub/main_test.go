@@ -12,9 +12,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/yusiwen/flowhub/internal/agent"
 	"github.com/yusiwen/flowhub/internal/config"
 	"github.com/yusiwen/flowhub/internal/dispatch"
 	"github.com/yusiwen/flowhub/internal/event"
@@ -555,5 +557,173 @@ func TestTheFallbackProbeUsesTheRuntimeCredentials(t *testing.T) {
 	noCredentials := buildDefaultRuntime(cfg, emptyProjects(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, err := noCredentials.Health(context.Background()); err == nil {
 		t.Fatal("a runtime without credentials was accepted by a server that requires them")
+	}
+}
+
+// TestShellWrappersResolvePerRuntime pins the wrapper precedence: the environment is
+// the outermost default and a `runtimes.<name>.shell_wrappers` block overrides it, the
+// same shape runtimeDeadline uses. A laptop that rewrites commands and a server that
+// does not must be describable by one configuration file.
+func TestShellWrappersResolvePerRuntime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	body := `{"version": 2,
+	  "runtimes": {
+	    "builder-a": {"url": "http://10.0.0.1:4096", "shell_wrappers": ["my-tool"]},
+	    "local": {"url": "http://127.0.0.1:4096"}
+	  },
+	  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "/tmp/x"}, "runtime": "local"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+	cfg := config.Config{ShellWrappers: []string{"rtk"}}
+
+	if got := strings.Join(shellWrappers(cfg, projects, "builder-a"), ","); got != "my-tool" {
+		t.Fatalf("builder-a wrappers = %q, want the block's my-tool", got)
+	}
+	// A block that declares none falls back to the process-wide default, and so does a
+	// runtime name no block mentions — the single-host case with no configuration file.
+	for _, name := range []string{"local", "default", "never-declared"} {
+		if got := strings.Join(shellWrappers(cfg, projects, name), ","); got != "rtk" {
+			t.Fatalf("%s wrappers = %q, want the environment default rtk", name, got)
+		}
+	}
+	if got := shellWrappers(config.Config{}, projects, "default"); len(got) != 0 {
+		t.Fatalf("with nothing configured the list is %v, want empty (nothing is stripped)", got)
+	}
+}
+
+// TestShellWrapperProblemsRefuseNamesThatCannotMatch pins the gate: a wrapper is
+// matched against a command's first word, so an entry that is not a command name would
+// silently do nothing. Both levels are checked, because the mistake is the same
+// whether it was written in the environment or in a runtime block.
+func TestShellWrapperProblemsRefuseNamesThatCannotMatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	body := `{"version": 2,
+	  "runtimes": {"builder-a": {"url": "http://10.0.0.1:4096", "shell_wrappers": ["rtk git"]}},
+	  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "/tmp/x"}, "runtime": "builder-a"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+
+	problems := shellWrapperProblems(config.Config{ShellWrappers: []string{"rtk", "/usr/bin/rtk"}}, projects)
+	if len(problems) != 2 {
+		t.Fatalf("problems = %v, want one for the environment and one for the block", problems)
+	}
+	if !strings.Contains(problems[0], "FLOWHUB_SHELL_WRAPPERS") || !strings.Contains(problems[0], `"/usr/bin/rtk"`) {
+		t.Fatalf("the environment problem does not name the variable and the entry: %s", problems[0])
+	}
+	if !strings.Contains(problems[1], "runtimes.builder-a.shell_wrappers") || !strings.Contains(problems[1], `"rtk git"`) {
+		t.Fatalf("the block problem does not name the field and the entry: %s", problems[1])
+	}
+
+	good := config.Config{ShellWrappers: []string{"rtk", "my-tool"}}
+	if problems := shellWrapperProblems(good, projects); len(problems) != 1 {
+		t.Fatalf("problems = %v, want only the block's", problems)
+	}
+	clean := projectmap.Map{}
+	if problems := shellWrapperProblems(good, &clean); len(problems) != 0 {
+		t.Fatalf("problems = %v, want none", problems)
+	}
+}
+
+// TestTheRuntimeFactoryCarriesTheConfiguredShellWrappers is the wiring test for the
+// whole path: the prefix is written into the configuration file, the factory builds the
+// runtime the dispatcher will use, and that runtime's arbiter has to answer a
+// rewritten permission request with "once". A ShellWrappers field that never reaches
+// the arbiter is exactly the silently inert setting this project refuses — the same
+// class of defect as a `prompt_file` that parses and then does nothing.
+func TestTheRuntimeFactoryCarriesTheConfiguredShellWrappers(t *testing.T) {
+	type replied struct {
+		body string
+	}
+	var mu sync.Mutex
+	var seen []replied
+	answered := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/session":
+			_, _ = w.Write([]byte(`{"id":"ses_1"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/session/ses_1/prompt_async":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/session/ses_1/message":
+			if !answered {
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
+			// One completed assistant message, which is the only reliable marker
+			// that the turn really ended.
+			_, _ = w.Write([]byte(`[{"info":{"id":"msg_1","role":"assistant","finish":"stop",
+			  "cost":0.001,"tokens":{"total":10,"input":8,"output":2},
+			  "time":{"created":1,"completed":2}},"parts":[{"type":"text","text":"the tree is clean"}]}]`))
+		case r.Method == http.MethodGet && r.URL.Path == "/session/status":
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/permission":
+			if answered {
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
+			// The measured request: the model wrote `git status`, a host plugin
+			// rewrote it before the permission was raised.
+			_, _ = w.Write([]byte(`[{"id":"per_1","sessionID":"ses_1","permission":"bash",
+			  "patterns":["rtk git status"],"metadata":{"command":"rtk git status"}}]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/permission/per_1/reply":
+			raw, _ := io.ReadAll(r.Body)
+			seen = append(seen, replied{body: string(raw)})
+			answered = true
+			_, _ = w.Write([]byte(`true`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	body := `{"version": 2,
+	  "runtimes": {"local": {"url": "` + server.URL + `", "shell_wrappers": ["rtk"],
+	                         "auth": {"user": "opencode", "password": "secret"}}},
+	  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "/tmp/x"}, "runtime": "local"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+
+	cfg := config.Config{
+		OpenCodeURL: server.URL, TaskDeadline: time.Minute, FirstResponse: 5 * time.Second,
+		ShellWrappers: []string{"never-used-the-block-wins"},
+	}
+	runtime := newRuntimeFactory(cfg, projects, slog.New(slog.NewTextHandler(io.Discard, nil)))("local", server.URL)
+	if _, err := runtime.Run(context.Background(), agent.Turn{
+		Directory: "/tmp/x",
+		Prompt:    "check the git status",
+		Agent:     "devops",
+		Title:     "BEAP_BE-46",
+		Phase:     agent.PhaseAnalysis,
+		Deadline:  time.Minute,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 1 {
+		t.Fatalf("%d permission replies reached the server, want 1", len(seen))
+	}
+	if !strings.Contains(seen[0].body, `"reply":"once"`) {
+		t.Fatalf("the rewritten command was answered %s, want once — the configured wrapper did not reach the arbiter", seen[0].body)
 	}
 }

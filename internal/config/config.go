@@ -212,6 +212,14 @@ type Config struct {
 	// immediately looks like a slow turn until TaskDeadline.
 	FirstResponse time.Duration
 
+	// ShellWrappers are command prefixes an agent host's plugins are trusted to put
+	// in front of a bash command before the permission request is raised. It is the
+	// process-wide default; `runtimes.<name>.shell_wrappers` overrides it per host.
+	// Empty means nothing is stripped, which is the safe default: see
+	// internal/agent/opencode/wrapper.go. The *syntax* of a name is checked there,
+	// not here, because the package that will trust the name owns what it may be.
+	ShellWrappers []string
+
 	// MaxTurns stops a task that keeps triggering; the cheap runaway guard.
 	MaxTurns int
 
@@ -344,6 +352,7 @@ func Load() (Config, error) {
 	if cfg.FirstResponse, err = envDuration("FLOWHUB_FIRST_RESPONSE", DefaultFirstResponse); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_FIRST_RESPONSE: %w", err)
 	}
+	cfg.ShellWrappers = splitList(env("FLOWHUB_SHELL_WRAPPERS", ""))
 	if cfg.TaskMaxCost, err = envFloat("FLOWHUB_TASK_MAX_COST", 0); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_TASK_MAX_COST: %w", err)
 	}
@@ -725,6 +734,7 @@ func (c Config) Report() string {
 	fmt.Fprintf(&b, "dispatch_queue:     %d\n", c.DispatchQueueSize)
 	fmt.Fprintf(&b, "task_deadline:      %s\n", c.TaskDeadline)
 	fmt.Fprintf(&b, "first_response:     %s\n", c.FirstResponse)
+	fmt.Fprintf(&b, "shell_wrappers:     %s (env default; a runtime block overrides it)\n", orNone(strings.Join(c.ShellWrappers, ",")))
 	fmt.Fprintf(&b, "max_turns:          %d\n", c.MaxTurns)
 	fmt.Fprintf(&b, "task_max_cost:      %s\n", formatCost(c.TaskMaxCost))
 	fmt.Fprintf(&b, "trigger:            %q\n", c.Trigger)
