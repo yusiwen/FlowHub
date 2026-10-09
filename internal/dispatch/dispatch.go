@@ -640,6 +640,10 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		taskView.Plan = task.Plan
 		taskView.Turns = task.Turns
 		taskView.LastReply = task.LastReply
+		// What a bare `/opencode permit` authorises: the commands the last turn was
+		// refused for, so rules can tell "there is something to authorise" from
+		// "the human is asking for something that does not exist".
+		taskView.Refusals = task.Refusals
 	}
 
 	decision := d.policy.Decide(delivery, taskView)
@@ -676,6 +680,15 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		return
 	}
 
+	if decision.Action == rules.ActionRevoke {
+		// A retraction runs no turn: there is nothing for the agent to do about it, and
+		// spending a turn to say so would be noise. It is answered here — after the
+		// actor check, before anything is prepared — so revoking cannot be blocked by
+		// the worktree or the binding.
+		d.revokeGrant(rec, task)
+		return
+	}
+
 	// The registry is authoritative about the binding: the router chose this runtime
 	// from the same record, but a task may never move between runtimes, so it is
 	// checked here too rather than trusted.
@@ -690,6 +703,16 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 	if err != nil {
 		d.log.Error("cannot prepare the task", "issue", rec.IssueID, "error", err)
 		return
+	}
+
+	if decision.Action == rules.ActionPermit {
+		// The authorisation is recorded first, and then the *same delivery* becomes the
+		// turn that carries on: the human's comment is what unblocks the task, so it
+		// must not need a second trigger.
+		decision, task = d.grantPermit(rec, task, decision)
+		if decision.Action == rules.ActionIgnore {
+			return
+		}
 	}
 
 	d.runTurn(ctx, rec, delivery, task, match, decision, binding)
@@ -880,7 +903,12 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	// The context is built once and reused by the follow-up turn: same issue, same
 	// worktree, same basis. Only what the prompt *says* differs.
 	promptCtx := rules.PromptContext{
-		Worktree: task.Worktree,
+		// Whatever a human has authorised for this task travels with every turn it
+		// runs, not only the permit turn: the authorisation lasts until the task ends
+		// or is revoked, and a later turn that hits the same refusal must not need the
+		// human to say it again.
+		Permitted: grantedCommands(task),
+		Worktree:  task.Worktree,
 		// The prompt and the arbiter read one value: telling the agent to write
 		// somewhere the runtime would reject is worse than saying nothing.
 		AttachmentsDir: tools.Download.Prefix,
@@ -945,6 +973,10 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 			Hosts:  tools.Download.Hosts,
 			Prefix: tools.Download.Prefix,
 		},
+		// The runtime turns these into an exception to its own allowlist, after its
+		// deny list and its phase rule: a human's authorisation can make an
+		// unrecognised command runnable, never a forbidden one.
+		Granted:  grantedCommands(task),
 		Metadata: map[string]any{"task_key": rec.IssueID, "action": string(decision.Action)},
 		Deadline: deadline,
 	}
@@ -1049,6 +1081,15 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		t.Repo = match.Entry.Repo.Path
 		t.State = state
 		t.Plan = plan
+		// The phase a permit continues in, and the commands a bare permit would
+		// authorise next: both are facts about the turn that just ran.
+		t.LastAction = string(decision.Action)
+		t.Refusals = refusedCommands(result.Permissions)
+		if state == registry.StateDone {
+			// The authorised commands were for the work this task has now finished, so
+			// keeping them would silently widen whatever this task does next.
+			t.Grant = nil
+		}
 		t.Turns++
 		t.Cost += result.Cost
 		// Only a turn that produced text replaces the recorded reply. A turn that
@@ -1151,6 +1192,109 @@ func addTokens(first, second agent.Tokens) agent.Tokens {
 	sum.CacheRead += second.CacheRead
 	sum.CacheWrite += second.CacheWrite
 	return sum
+}
+
+// grantedCommands is the human's authorisation for this task, or nil.
+func grantedCommands(task registry.Task) []string {
+	if task.Grant == nil || len(task.Grant.Commands) == 0 {
+		return nil
+	}
+	return append([]string(nil), task.Grant.Commands...)
+}
+
+// refusedCommands extracts the commands a turn was refused for, in order and without
+// duplicates. This set is what a bare `/opencode permit` authorises, so it has to be
+// exactly what the human read in the agent's comment: no inference, no patterns.
+func refusedCommands(decisions []agent.PermissionDecision) []registry.Refusal {
+	var refusals []registry.Refusal
+	seen := map[string]bool{}
+	for _, decision := range decisions {
+		command := strings.TrimSpace(decision.Command)
+		if decision.Reply != agent.DecisionReject || command == "" || seen[command] {
+			continue
+		}
+		seen[command] = true
+		refusals = append(refusals, registry.Refusal{Command: command, Reason: decision.Reason})
+	}
+	return refusals
+}
+
+// grantPermit records the human's authorisation and turns the permit comment into the
+// turn that carries on from where the refusals stopped the agent.
+//
+// The authorised set accumulates: a second permit adds what the newest turn was
+// refused for instead of replacing the first, because the authorisation lasts until
+// the task ends and dropping an earlier command would refuse the agent something a
+// human already approved.
+func (d *Dispatcher) grantPermit(rec *store.Record, task registry.Task, decision rules.Decision) (rules.Decision, registry.Task) {
+	commands := grantedCommands(task)
+	known := make(map[string]bool, len(commands))
+	for _, command := range commands {
+		known[command] = true
+	}
+	var added []string
+	for _, refusal := range task.Refusals {
+		if command := strings.TrimSpace(refusal.Command); command != "" && !known[command] {
+			known[command] = true
+			commands = append(commands, command)
+			added = append(added, command)
+		}
+	}
+	if len(added) == 0 {
+		// Every refusal was already authorised. Nothing to record, and the turn still
+		// runs: the human asked for the work to continue, which is a legitimate thing
+		// to ask for twice.
+		d.log.Info("a permit added no new command; every refusal was already authorised",
+			"issue", rec.IssueID, "by", rec.PrimaryActor)
+	} else {
+		d.log.Warn("a human authorised refused commands; the task continues",
+			"issue", rec.IssueID, "by", rec.PrimaryActor,
+			"added", strings.Join(added, " && "),
+			"authorised_total", len(commands))
+	}
+	if updated, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
+		t.Grant = &registry.Grant{Commands: commands, By: rec.PrimaryActor, At: time.Now().UTC()}
+	}); err != nil {
+		d.log.Error("cannot record the authorisation", "issue", rec.IssueID, "error", err)
+		task.Grant = &registry.Grant{Commands: commands, By: rec.PrimaryActor, At: time.Now().UTC()}
+	} else {
+		task = updated
+	}
+
+	// Continue in the phase the refusals stopped, which is the only phase that can do
+	// the work the human just unblocked. A row written before the action was recorded
+	// has nothing to continue, and a read-only turn is the safe guess.
+	action := rules.Action(strings.TrimSpace(task.LastAction))
+	switch action {
+	case rules.ActionAnalyze, rules.ActionPlan, rules.ActionExecute:
+	default:
+		d.log.Warn("the task has no recorded action to continue; permitting a read-only turn instead",
+			"issue", rec.IssueID, "recorded", task.LastAction)
+		action = rules.ActionAnalyze
+	}
+	return rules.Decision{
+		Action: action, Trigger: decision.Trigger,
+		Reason: decision.Reason + "; continuing the task with the authorised commands",
+	}, task
+}
+
+// revokeGrant clears the authorisation a human gave, so the next turn is judged by the
+// policy alone again.
+func (d *Dispatcher) revokeGrant(rec *store.Record, task registry.Task) {
+	if task.Grant == nil || len(task.Grant.Commands) == 0 {
+		d.log.Info("a revoke arrived but no command was authorised for this task",
+			"issue", rec.IssueID, "by", rec.PrimaryActor)
+		return
+	}
+	if _, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
+		t.Grant = nil
+	}); err != nil {
+		d.log.Error("cannot revoke the authorisation", "issue", rec.IssueID, "error", err)
+		return
+	}
+	d.log.Warn("a human revoked the authorised commands; the policy applies again",
+		"issue", rec.IssueID, "by", rec.PrimaryActor,
+		"revoked", strings.Join(task.Grant.Commands, " && "))
 }
 
 // shortCommit renders a commit id for a log line: long enough to be unambiguous in
