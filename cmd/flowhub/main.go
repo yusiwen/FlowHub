@@ -569,19 +569,9 @@ func configFileSecretProblems(path string, projects *projectmap.Map) []string {
 // the same run). Both are passed through, and the dispatcher adds a declared runtime
 // as a candidate only when it has an address of its own.
 func declaredRuntimes(cfg config.Config, projects *projectmap.Map) []dispatch.DeclaredRuntime {
-	out := make([]dispatch.DeclaredRuntime, 0, len(projects.Runtimes()))
-	for _, name := range projects.Runtimes() {
-		block, _ := projects.RuntimeBlock(name)
-		out = append(out, dispatch.DeclaredRuntime{
-			Name:          name,
-			URL:           strings.TrimSpace(block.URL),
-			Agent:         strings.TrimSpace(block.Agent),
-			Model:         strings.TrimSpace(block.Model),
-			Deadline:      runtimeDeadline(cfg, projects, name),
-			MaxConcurrent: block.MaxConcurrentTasks(),
-		})
-	}
-	return out
+	// The projection itself lives in internal/dispatch so the tests build the same
+	// policy a start does; see DeclaredRuntimes.
+	return dispatch.DeclaredRuntimes(projects, cfg.TaskDeadline)
 }
 
 // opencodeProber decides whether a host that just claimed a name is usable.

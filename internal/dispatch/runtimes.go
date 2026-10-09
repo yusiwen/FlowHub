@@ -282,6 +282,39 @@ func (d *Dispatcher) allRuntimes() []runtimeBinding {
 	return out
 }
 
+// DeclaredRuntimes projects the configuration file's `runtimes` blocks into the policy
+// the dispatcher applies, with `fallbackDeadline` used for a block that names none.
+//
+// It lives here rather than in `main` because the tests need the same projection: a
+// harness that left Declared empty silently ran every host at a breadth of one, so the
+// per-task serialization the scheduler exists for was never exercised (found while
+// fixing the flaky timing assertions, #17). One projection means a test and a start
+// cannot disagree about what the file declared.
+func DeclaredRuntimes(projects *projectmap.Map, fallbackDeadline time.Duration) []DeclaredRuntime {
+	if projects == nil {
+		return nil
+	}
+	out := make([]DeclaredRuntime, 0, len(projects.Runtimes()))
+	for _, name := range projects.Runtimes() {
+		block, _ := projects.RuntimeBlock(name)
+		deadline := fallbackDeadline
+		if declared := strings.TrimSpace(block.Deadline); declared != "" {
+			if parsed, err := time.ParseDuration(declared); err == nil {
+				deadline = parsed
+			}
+		}
+		out = append(out, DeclaredRuntime{
+			Name:          name,
+			URL:           strings.TrimSpace(block.URL),
+			Agent:         strings.TrimSpace(block.Agent),
+			Model:         strings.TrimSpace(block.Model),
+			Deadline:      deadline,
+			MaxConcurrent: block.MaxConcurrentTasks(),
+		})
+	}
+	return out
+}
+
 // runtimeBinding is a runtime together with the adapter that talks to it.
 type runtimeBinding struct {
 	Name string
