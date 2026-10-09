@@ -264,6 +264,46 @@ func TestRuntimeBlocksCarryPolicyAndRefuseWhatCannotBeHonoured(t *testing.T) {
 	}
 }
 
+// TestTheRuntimeBlockCarriesShellWrappers pins the per-host half of the wrapper
+// declaration: the plugins that rewrite a command are installed on the host, so which
+// prefixes are trusted is a property of that host and not of the process.
+func TestTheRuntimeBlockCarriesShellWrappers(t *testing.T) {
+	m := writeConfig(t, `{
+	  "version": 2,
+	  "runtimes": {"local": {"url": "http://127.0.0.1:4096", "shell_wrappers": ["rtk"]}},
+	  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "/tmp/x"}, "runtime": "local"}]
+	}`)
+	block, ok := m.RuntimeBlock("local")
+	if !ok {
+		t.Fatal("the local runtime block was not parsed")
+	}
+	if len(block.ShellWrappers) != 1 || block.ShellWrappers[0] != "rtk" {
+		t.Fatalf("shell_wrappers = %v, want [rtk]", block.ShellWrappers)
+	}
+	// The block's grammar is the shell policy's business, not this file's: an entry
+	// that is not a command name is refused by agentruntime.ValidateShellWrappers,
+	// which is what keeps one authority for one fact. What the file must do is report
+	// the declaration, or the effective policy is invisible.
+	var found bool
+	for _, value := range m.Provenance(PolicyDefaults{}) {
+		if value.Scope == "runtimes.local" && value.Field == "shell_wrappers" {
+			found = value.Value == "rtk" && value.Level == "runtimes.local"
+		}
+	}
+	if !found {
+		t.Fatalf("the report does not name the declared wrappers: %+v", m.Provenance(PolicyDefaults{}))
+	}
+	// A block that declares none renders no line, so the report does not suggest a
+	// wrapper list that is not there.
+	plain := writeConfig(t, `{"version": 2, "runtimes": {"local": {"url": "http://127.0.0.1:4096"}},
+	  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "/tmp/x"}, "runtime": "local"}]}`)
+	for _, value := range plain.Provenance(PolicyDefaults{}) {
+		if value.Field == "shell_wrappers" {
+			t.Fatalf("a block without wrappers reported %q", value.Value)
+		}
+	}
+}
+
 // TestProvenanceNamesTheLevelOfEveryValue is the second acceptance criterion: the
 // report has to answer "which level supplied this" for each value, because the
 // whole point of three levels is that the answer is not obvious.

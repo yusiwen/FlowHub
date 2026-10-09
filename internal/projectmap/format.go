@@ -120,6 +120,17 @@ type v2Runtime struct {
 	// had before per-task scheduling existed; the host's own claim can only lower it
 	// (ADR 0003).
 	MaxConcurrent *int `json:"max_concurrent,omitempty"`
+	// ShellWrappers are the command prefixes this host's opencode plugins are trusted
+	// to insert in front of a bash command before the permission request is raised.
+	// It is policy, not enrolment, and it belongs to the host because the plugins are
+	// installed there — a laptop with `rtk` and a server without it need different
+	// answers. Empty falls back to FLOWHUB_SHELL_WRAPPERS, then to nothing.
+	//
+	// The names are checked by the package that consumes them
+	// (agentruntime.ValidateShellWrappers), not here: what may sit in front of a
+	// command is the shell policy's own grammar, and duplicating it would be two
+	// authorities for one fact.
+	ShellWrappers []string `json:"shell_wrappers,omitempty"`
 }
 
 type v2RuntimeAuth struct {
@@ -387,7 +398,7 @@ func (m *Map) Provenance(defaults PolicyDefaults) []Provenance {
 	for _, name := range m.Runtimes() {
 		block := m.runtimes[name]
 		scope := "runtimes." + name
-		for _, field := range []string{"url", "auth", "agent", "model", "deadline", "max_concurrent"} {
+		for _, field := range []string{"url", "auth", "agent", "model", "deadline", "max_concurrent", "shell_wrappers"} {
 			// `auth` is rendered by the Map, because naming the source of the password
 			// needs the credentials file and the environment.
 			if field == "auth" {
@@ -465,6 +476,11 @@ func renderRuntimeField(block v2Runtime, field string) (string, bool) {
 			return "", false
 		}
 		return strconv.Itoa(*block.MaxConcurrent), true
+	case "shell_wrappers":
+		if len(block.ShellWrappers) == 0 {
+			return "", false
+		}
+		return strings.Join(block.ShellWrappers, ","), true
 	default:
 		return "", false
 	}

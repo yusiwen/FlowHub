@@ -199,6 +199,9 @@ func run(envResult config.EnvFileResult, envErr error) error {
 			fmt.Printf("effective:          %s %s=%s (level: %s)\n",
 				credential.Scope, credential.Field, credential.Value, credential.Level)
 		}
+		for _, problem := range shellWrapperProblems(cfg, projects) {
+			fmt.Printf("shell_wrapper_problem: %s\n", problem)
+		}
 		if cfg.Dispatch {
 			for _, problem := range workspace.ValidateEntries(localworktree.Validator{}, projects.WorkspaceEntries(cfg.WorktreeBase)) {
 				fmt.Printf("dispatch_problem:   %s\n", problem)
@@ -236,6 +239,9 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		}
 		if problems := configFileSecretProblems(cfg.ConfigFile, projects); len(problems) > 0 {
 			return fmt.Errorf("refusing to start, configuration %s:\n  - %s", cfg.ConfigFile, strings.Join(problems, "\n  - "))
+		}
+		if problems := shellWrapperProblems(cfg, projects); len(problems) > 0 {
+			return fmt.Errorf("refusing to start, configuration of shell wrappers:\n  - %s", strings.Join(problems, "\n  - "))
 		}
 		if problems, _ := dispatch.RuntimeProblems(projects, inventory); len(problems) > 0 {
 			return fmt.Errorf("refusing to start, a project names a runtime that cannot take work:\n  - %s", strings.Join(problems, "\n  - "))
@@ -452,7 +458,8 @@ func sourcePolicyDefaults(cfg config.Config) projectmap.PolicyDefaults {
 // therefore taken from the declaration whose URL is this address — the runtime that
 // will actually carry the work — and only then from the fallback name.
 func buildDefaultRuntime(cfg config.Config, projects *projectmap.Map, logger *slog.Logger) agent.Runtime {
-	credential, _ := projects.ResolveCredential(defaultRuntimeNameFor(cfg, projects), os.Getenv)
+	name := defaultRuntimeNameFor(cfg, projects)
+	credential, _ := projects.ResolveCredential(name, os.Getenv)
 	client := agentruntime.New(agentruntime.Options{
 		BaseURL:  cfg.OpenCodeURL,
 		Username: credential.User,
@@ -461,6 +468,7 @@ func buildDefaultRuntime(cfg config.Config, projects *projectmap.Map, logger *sl
 	})
 	return agentruntime.NewRuntime(client, agentruntime.RuntimeOptions{
 		Name: dispatch.DefaultRuntimeName, Log: logger, FirstResponse: cfg.FirstResponse,
+		ShellWrappers: shellWrappers(cfg, projects, name),
 	})
 }
 
@@ -505,7 +513,10 @@ func newRuntimeFactory(cfg config.Config, projects *projectmap.Map, logger *slog
 				Password: credential.Password,
 				Timeout:  runtimeDeadline(cfg, projects, name),
 			}),
-			agentruntime.RuntimeOptions{Name: name, Log: logger, FirstResponse: cfg.FirstResponse},
+			agentruntime.RuntimeOptions{
+				Name: name, Log: logger, FirstResponse: cfg.FirstResponse,
+				ShellWrappers: shellWrappers(cfg, projects, name),
+			},
 		)
 	}
 }
@@ -521,6 +532,44 @@ func runtimeDeadline(cfg config.Config, projects *projectmap.Map, name string) t
 		}
 	}
 	return cfg.TaskDeadline
+}
+
+// shellWrappers resolves which command prefixes one host's arbiter may strip before
+// judging a command. It follows runtimeDeadline's shape: the environment is the
+// outermost default and a `runtimes.<name>.shell_wrappers` block overrides it, so a
+// laptop that rewrites commands and a server that does not can be described by one
+// configuration file.
+func shellWrappers(cfg config.Config, projects *projectmap.Map, name string) []string {
+	if block, ok := projects.RuntimeBlock(name); ok && len(block.ShellWrappers) > 0 {
+		return append([]string(nil), block.ShellWrappers...)
+	}
+	return append([]string(nil), cfg.ShellWrappers...)
+}
+
+// shellWrapperProblems refuses a wrapper name that is not a bare command name.
+//
+// The grammar lives in the package that will trust the name
+// (agentruntime.ValidateShellWrappers), because what may sit in front of a command is
+// the shell policy's own business — and one authority for one fact. An entry that
+// cannot match a command's first word would silently do nothing, and a silently
+// inert policy entry is what this project refuses everywhere else. Every declared
+// block is checked, including one no project names yet: the mistake is the same
+// whether or not something currently routes to it.
+func shellWrapperProblems(cfg config.Config, projects *projectmap.Map) []string {
+	var problems []string
+	if err := agentruntime.ValidateShellWrappers(cfg.ShellWrappers); err != nil {
+		problems = append(problems, fmt.Sprintf("FLOWHUB_SHELL_WRAPPERS: %v", err))
+	}
+	for _, name := range projects.Runtimes() {
+		block, ok := projects.RuntimeBlock(name)
+		if !ok || len(block.ShellWrappers) == 0 {
+			continue
+		}
+		if err := agentruntime.ValidateShellWrappers(block.ShellWrappers); err != nil {
+			problems = append(problems, fmt.Sprintf("runtimes.%s.shell_wrappers: %v", name, err))
+		}
+	}
+	return problems
 }
 
 // declaredAuthProblems reports a `runtimes.<name>.auth` block whose password cannot
@@ -739,6 +788,15 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 	// names a variable ended up refused at startup with a 401 (found 2026-10-08).
 	defaultRuntime := buildDefaultRuntime(cfg, projects, logger)
 	factory := newRuntimeFactory(cfg, projects, logger)
+	// Trusting a wrapper widens what the arbiter will run, so it is never silent:
+	// the operator sees which prefixes this process will strip, per host.
+	for _, name := range append([]string{dispatch.DefaultRuntimeName}, projects.Runtimes()...) {
+		if wrappers := shellWrappers(cfg, projects, name); len(wrappers) > 0 {
+			logger.Info("shell wrappers are trusted",
+				"runtime", name, "wrappers", strings.Join(wrappers, ","),
+				"note", "a command segment starting with one of these is judged without it")
+		}
+	}
 	// Refuse to start when nothing can serve a turn: a dispatcher that accepts
 	// deliveries and then fails every one of them is worse than a refused start.
 	// With an inventory the rule becomes "at least one runtime answers", because
