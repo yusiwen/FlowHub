@@ -726,6 +726,12 @@ What a maintainer sees, once `FLOWHUB_DISPATCH=1`:
    its own replies; the blockquote is how a *reader* can tell an automated reply
    from a human one, and the trigger it names comes from the decision rather than
    from the model's own account of why it replied.
+5. **If the agent cannot finish the work, it still posts that comment** — and it is
+   told so twice over: the agent definition says a refusal is a fact to report and
+   that no turn may end in silence, and the dispatcher will not accept a silent
+   finish (one bounded follow-up on the same session, then `failed`). This matters
+   most in exactly the case that produced it: every bash call refused, the model out
+   of moves, and an issue that showed no sign anything had happened.
 
 Which deliveries become work is a pure function of the neutral event and the
 recorded task (`internal/rules`), so it is unit tested without opencode, git or
@@ -756,7 +762,20 @@ update can only touch its own. The registry
 worktree, the opencode session id, the agent, the state, the plan state, the
 number of turns, the accumulated cost, and the agent's last reply text. State
 moves `analyzing → awaiting_input → executing → done`, with `failed` for a turn
-that broke.
+that broke — **or for a turn that finished without posting a comment**. That second
+case is deliberate: `awaiting_input` means "the analysis is posted and a human must
+answer", and a plan state of `draft` means "a plan exists", so neither may be written
+when the issue has no comment at all. Recording them anyway is how a silent task came
+to be read as "a plan is awaiting approval" and went straight to an execution turn
+with edit rights (issue #27, fixed 2026-10-09).
+
+A comment is the only thing that reaches a human, so the dispatcher will not accept a
+silent finish quietly. When a turn finishes having called none of the source's reply
+tools, it sends **one** bounded follow-up on the *same* session, whose prompt exists
+only to get that comment posted; a second silent finish is a failure, never another
+attempt. The follow-up gets a third of the ordinary turn budget (floored at 2 minutes,
+never above the ordinary budget), so the worst case for one delivery is one turn plus
+that third rather than two full turns.
 
 The worktree is the real containment. Each task gets its own checkout from the
 entry's `default_branch`, on its own branch, under the entry's `worktrees`
