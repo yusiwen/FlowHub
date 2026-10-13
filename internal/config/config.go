@@ -55,7 +55,13 @@ const (
 	// it catches (a prompt the agent server never admits) is immediate, and a turn
 	// that never starts otherwise occupies the only worker until the deadline.
 	DefaultFirstResponse = 90 * time.Second
-	DefaultMaxTurns      = 8
+	// DefaultOpenCodeRequestTimeout bounds ONE HTTP request to an agent server. It is
+	// a different thing from the turn deadline, which bounds the whole turn: a turn
+	// may legitimately run for minutes while every individual call stays fast, and a
+	// host that stops answering without closing the connection (black-holed packets, a
+	// wedged server) must not be able to hold a worker for the whole turn budget.
+	DefaultOpenCodeRequestTimeout = 30 * time.Second
+	DefaultMaxTurns               = 8
 	// DefaultSourceName is the source a process serves when FLOWHUB_SOURCE is unset.
 	// It matches the only adapter this binary registers today.
 	DefaultSourceName = "youtrack"
@@ -220,6 +226,14 @@ type Config struct {
 	// not here, because the package that will trust the name owns what it may be.
 	ShellWrappers []string
 
+	// OpenCodeRequestTimeout bounds one HTTP request to an agent server, which is not
+	// the same as TaskDeadline: a turn may run for minutes while every call stays
+	// fast, and a host that goes silent without closing the connection would otherwise
+	// hold a worker for the whole budget. It is never allowed above the turn budget of
+	// the runtime it applies to — a host whose own `deadline` is shorter gets the
+	// shorter request bound.
+	OpenCodeRequestTimeout time.Duration
+
 	// MaxTurns stops a task that keeps triggering; the cheap runaway guard.
 	MaxTurns int
 
@@ -352,6 +366,9 @@ func Load() (Config, error) {
 	if cfg.FirstResponse, err = envDuration("FLOWHUB_FIRST_RESPONSE", DefaultFirstResponse); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_FIRST_RESPONSE: %w", err)
 	}
+	if cfg.OpenCodeRequestTimeout, err = envDuration("FLOWHUB_OPENCODE_REQUEST_TIMEOUT", DefaultOpenCodeRequestTimeout); err != nil {
+		return Config{}, fmt.Errorf("FLOWHUB_OPENCODE_REQUEST_TIMEOUT: %w", err)
+	}
 	cfg.ShellWrappers = splitList(env("FLOWHUB_SHELL_WRAPPERS", ""))
 	if cfg.TaskMaxCost, err = envFloat("FLOWHUB_TASK_MAX_COST", 0); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_TASK_MAX_COST: %w", err)
@@ -464,6 +481,9 @@ func (c Config) validate() error {
 	if c.FirstResponse <= 0 {
 		return fmt.Errorf("FLOWHUB_FIRST_RESPONSE must be positive, got %s", c.FirstResponse)
 	}
+	if c.OpenCodeRequestTimeout <= 0 {
+		return fmt.Errorf("FLOWHUB_OPENCODE_REQUEST_TIMEOUT must be positive, got %s", c.OpenCodeRequestTimeout)
+	}
 	if c.MaxTurns <= 0 {
 		return fmt.Errorf("FLOWHUB_MAX_TURNS must be positive, got %d", c.MaxTurns)
 	}
@@ -535,6 +555,13 @@ func (c Config) Warnings() []string {
 	if c.Dispatch && c.FirstResponse >= c.TaskDeadline {
 		warns = append(warns, fmt.Sprintf("FLOWHUB_FIRST_RESPONSE (%s) is not below FLOWHUB_TASK_DEADLINE (%s), so a turn that never starts is only noticed at the deadline",
 			c.FirstResponse, c.TaskDeadline))
+	}
+	if c.Dispatch && c.OpenCodeRequestTimeout >= c.TaskDeadline {
+		// The warning the whole setting exists for: at or above the turn budget, one
+		// silent host holds a worker for the whole turn, which is the failure this bound
+		// was added to prevent.
+		warns = append(warns, fmt.Sprintf("FLOWHUB_OPENCODE_REQUEST_TIMEOUT (%s) is not below FLOWHUB_TASK_DEADLINE (%s), so a single unanswered request can hold a worker for the whole turn",
+			c.OpenCodeRequestTimeout, c.TaskDeadline))
 	}
 	if c.ControlAPIEnabled() && c.AdminToken == "" {
 		warns = append(warns, "FLOWHUB_ADMIN_ADDR is set with no FLOWHUB_ADMIN_TOKEN: the control API will refuse to start")
@@ -735,6 +762,7 @@ func (c Config) Report() string {
 	fmt.Fprintf(&b, "task_deadline:      %s\n", c.TaskDeadline)
 	fmt.Fprintf(&b, "first_response:     %s\n", c.FirstResponse)
 	fmt.Fprintf(&b, "shell_wrappers:     %s (env default; a runtime block overrides it)\n", orNone(strings.Join(c.ShellWrappers, ",")))
+	fmt.Fprintf(&b, "opencode_request_timeout: %s (one HTTP call; never above the turn budget)\n", c.OpenCodeRequestTimeout)
 	fmt.Fprintf(&b, "max_turns:          %d\n", c.MaxTurns)
 	fmt.Fprintf(&b, "task_max_cost:      %s\n", formatCost(c.TaskMaxCost))
 	fmt.Fprintf(&b, "trigger:            %q\n", c.Trigger)

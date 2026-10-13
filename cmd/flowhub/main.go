@@ -464,7 +464,8 @@ func buildDefaultRuntime(cfg config.Config, projects *projectmap.Map, logger *sl
 		BaseURL:  cfg.OpenCodeURL,
 		Username: credential.User,
 		Password: credential.Password,
-		Timeout:  cfg.TaskDeadline,
+		// One request, not one turn: see requestTimeout.
+		Timeout: requestTimeout(cfg, projects, name),
 	})
 	return agentruntime.NewRuntime(client, agentruntime.RuntimeOptions{
 		Name: dispatch.DefaultRuntimeName, Log: logger, FirstResponse: cfg.FirstResponse,
@@ -511,7 +512,11 @@ func newRuntimeFactory(cfg config.Config, projects *projectmap.Map, logger *slog
 				BaseURL:  url,
 				Username: credential.User,
 				Password: credential.Password,
-				Timeout:  runtimeDeadline(cfg, projects, name),
+				// The turn deadline is deliberately *not* passed here. It bounds the
+				// turn; one request is bounded by its own much smaller value, because a
+				// host that goes silent without closing the connection would otherwise
+				// hold a worker for the entire budget (found 2026-10-09, issue #33).
+				Timeout: requestTimeout(cfg, projects, name),
 			}),
 			agentruntime.RuntimeOptions{
 				Name: name, Log: logger, FirstResponse: cfg.FirstResponse,
@@ -532,6 +537,26 @@ func runtimeDeadline(cfg config.Config, projects *projectmap.Map, name string) t
 		}
 	}
 	return cfg.TaskDeadline
+}
+
+// requestTimeout resolves how long ONE HTTP request to a host may take.
+//
+// It is not the turn deadline, and conflating the two is the defect this exists to
+// close: a turn may legitimately run for minutes while every individual call stays
+// fast, so passing the turn budget as the per-request bound let a host that stopped
+// answering without closing the connection hold a worker for the whole budget — with a
+// breadth of one, the whole runtime. The turn deadline remains the outer bound, so a
+// host whose `deadline` is shorter than this value gets the shorter request bound
+// rather than a request that outlives its own turn.
+func requestTimeout(cfg config.Config, projects *projectmap.Map, name string) time.Duration {
+	bound := cfg.OpenCodeRequestTimeout
+	if bound <= 0 {
+		bound = config.DefaultOpenCodeRequestTimeout
+	}
+	if deadline := runtimeDeadline(cfg, projects, name); deadline > 0 && bound > deadline {
+		return deadline
+	}
+	return bound
 }
 
 // shellWrappers resolves which command prefixes one host's arbiter may strip before
@@ -789,12 +814,19 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 	defaultRuntime := buildDefaultRuntime(cfg, projects, logger)
 	factory := newRuntimeFactory(cfg, projects, logger)
 	// Trusting a wrapper widens what the arbiter will run, so it is never silent:
-	// the operator sees which prefixes this process will strip, per host.
+	// the operator sees which prefixes this process will strip, per host. The request
+	// bound is reported the same way when a host's own turn deadline lowers it, because
+	// a silently shortened timeout changes how a slow host behaves.
 	for _, name := range append([]string{dispatch.DefaultRuntimeName}, projects.Runtimes()...) {
 		if wrappers := shellWrappers(cfg, projects, name); len(wrappers) > 0 {
 			logger.Info("shell wrappers are trusted",
 				"runtime", name, "wrappers", strings.Join(wrappers, ","),
 				"note", "a command segment starting with one of these is judged without it")
+		}
+		if bound := requestTimeout(cfg, projects, name); bound != cfg.OpenCodeRequestTimeout {
+			logger.Info("the request bound is lowered by the turn deadline",
+				"runtime", name, "request_timeout", bound,
+				"turn_deadline", runtimeDeadline(cfg, projects, name))
 		}
 	}
 	// Refuse to start when nothing can serve a turn: a dispatcher that accepts
