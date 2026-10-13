@@ -756,7 +756,7 @@ What that does, exactly:
 
 ```bash
 # What is authorised for a task, and what it was stopped by:
-jq -c 'select(.task_key=="BEAP_BE-46") | {state,last_action,grant,refusals}' \
+jq -c 'select(.task_key=="BEAP_BE-46") | {state,last_error,last_action,grant,refusals}' \
   /var/lib/flowhub/registry.jsonl | tail -1
 ```
 
@@ -997,7 +997,9 @@ every record keeps the full raw body.
 session id, agent, state (`analyzing → awaiting_input → executing → done`,
 `failed` on a broken turn **or on a turn that finished without posting a comment**),
 plan state, turn count, cost and last reply, plus `last_action`, `refusals` (what the
-most recent turn was stopped by) and `grant` (what a human has authorised so far).
+most recent turn was stopped by), `grant` (what a human has authorised so far) and
+`last_error` — the reason a `failed` task is failed, whether the turn errored or the
+worktree could not be prepared at all. The error is cleared by the next turn that runs.
 
 `awaiting_input` with a plan state of `draft` means "a comment was posted and a
 plan exists". It is never written for a silent turn: a row claiming a plan the
@@ -1109,6 +1111,7 @@ tail -5 /var/lib/flowhub/webhook-$(date -u +%F).jsonl | jq -c '{accepted,reason,
 | A turn sits for a long time and then fails with a connection error | the host stopped answering **without** closing the connection (black-holed packets, a wedged server), so only the client-side bound can end the call | check `FLOWHUB_OPENCODE_REQUEST_TIMEOUT` (`-print-config` shows it, and a value at or above the turn budget prints a `warning:`). It bounds one request, never a turn: a healthy slow turn is unaffected |
 | Task refused: *bound to runtime X, which is no longer configured* | the runtime was removed or renamed | restore it under the same name; the task cannot move |
 | Task refused: *mapping now points at …* | `repo.path` changed for an existing task | un-bind deliberately (new issue, or prune the registry row) rather than editing the path |
+| Task is `failed` with `last_error` naming `origin` / `ls-remote` / `fetch` | the worktree could not be prepared: `origin` is unreachable or the `default_branch` is not on it | fix the clone's remote access, then deliver again — the next delivery retries the preparation, because the worktree is still missing. Nothing was sent to opencode, and `turns` was not incremented |
 
 ### 12.4 A turn starts and fails
 
