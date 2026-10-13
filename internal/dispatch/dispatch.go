@@ -701,7 +701,7 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 
 	task, err = d.ensureTask(ctx, rec, match.Entry, task, known, binding)
 	if err != nil {
-		d.log.Error("cannot prepare the task", "issue", rec.IssueID, "error", err)
+		d.failPreparation(rec, binding, err)
 		return
 	}
 
@@ -1081,6 +1081,14 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		t.Repo = match.Entry.Repo.Path
 		t.State = state
 		t.Plan = plan
+		// The row carries the reason as well as the state: "failed" with no answer to
+		// "failed at what?" sends the operator to a rotating log, and /healthz only keeps
+		// each host's most recent error.
+		if state == registry.StateFailed {
+			t.LastError = failureText(err, result)
+		} else {
+			t.LastError = ""
+		}
 		// The phase a permit continues in, and the commands a bare permit would
 		// authorise next: both are facts about the turn that just ran.
 		t.LastAction = string(decision.Action)
@@ -1192,6 +1200,55 @@ func addTokens(first, second agent.Tokens) agent.Tokens {
 	sum.CacheRead += second.CacheRead
 	sum.CacheWrite += second.CacheWrite
 	return sum
+}
+
+// failPreparation records a task whose worktree could not be prepared.
+//
+// A row left at `analyzing` asserts that the read-only analysis turn is running, when in
+// fact no session exists and no comment will ever be posted: the operator's `jq` over the
+// registry, and the state the next delivery reads, both describe work that is not
+// happening (issue #34). The state is `failed` rather than terminal because the next
+// delivery for the same task retries the preparation — a missing worktree is still
+// missing, so `ensureTask` runs again.
+func (d *Dispatcher) failPreparation(rec *store.Record, binding runtimeBinding, cause error) {
+	d.log.Error("cannot prepare the task",
+		"issue", rec.IssueID, "runtime", binding.Name, "error", cause,
+		"hint", "the task is recorded failed; the next delivery for it retries the preparation")
+	// The per-host view names the task, so a repository problem cannot be mistaken for a
+	// host that is down.
+	d.setRuntimeError(binding.Name, fmt.Sprintf("preparing %s: %v", rec.IssueID, cause))
+	if _, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
+		t.State = registry.StateFailed
+		t.LastError = cause.Error()
+	}); err != nil {
+		if !errors.Is(err, registry.ErrTaskNotFound) {
+			d.log.Error("cannot record the preparation failure", "issue", rec.IssueID, "error", err)
+			return
+		}
+		// The delivery failed before any row existed — a repository that moved under a
+		// bound task, a routing entry with no default branch. There is nothing to attach
+		// the failure to; the log line above is the whole record, and saying so is better
+		// than an update error nobody can act on.
+		d.log.Warn("no task row exists for the delivery that failed preparation, so only the log records it",
+			"issue", rec.IssueID)
+	}
+}
+
+// failureText is what a failed task row records as the reason. The turn's error is the
+// most precise source, then the runtime's own last error, then a description of the state
+// — a turn that finished having posted nothing is a failure with no error value at all
+// (rule 16).
+func failureText(err error, result agent.Result) string {
+	switch {
+	case err != nil:
+		return err.Error()
+	case strings.TrimSpace(result.ErrorText) != "":
+		return result.ErrorText
+	case result.Finished:
+		return "the turn finished without posting a comment"
+	default:
+		return "the turn did not finish"
+	}
 }
 
 // grantedCommands is the human's authorisation for this task, or nil.

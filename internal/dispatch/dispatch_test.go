@@ -1476,3 +1476,98 @@ func TestAPermitContinuesInThePhaseTheRefusalsStopped(t *testing.T) {
 		t.Fatalf("the continuation answered %q, want the authorised command allowed", got)
 	}
 }
+
+// gitIn runs one git command in repo, with the developer's own configuration kept out of
+// the way — the same isolation testRepo uses.
+func gitIn(t *testing.T, repo string, args ...string) {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = repo
+	command.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL="+filepath.Join(t.TempDir(), "gitconfig"),
+		"GIT_CONFIG_NOSYSTEM=1")
+	if out, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+// TestAFailedPreparationIsRecordedAndRetriedByTheNextDelivery is issue #34.
+//
+// A task whose worktree cannot be prepared used to keep `state: analyzing` — the
+// documented meaning of which is "the read-only analysis turn is running" — while no
+// session existed, no prompt had been sent and no comment would ever be posted. The row
+// now says `failed` and carries the reason, and the next delivery retries the preparation
+// because the worktree is still missing.
+func TestAFailedPreparationIsRecordedAndRetriedByTheNextDelivery(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, repo := newTestDispatcher(t, fake, server)
+
+	// An origin that cannot be resolved: `Resolve` asks the origin for the baseline, so
+	// this is the failure the acceptance criterion names, without touching the network.
+	gitIn(t, repo, "remote", "add", "origin", filepath.Join(t.TempDir(), "does-not-exist.git"))
+
+	dispatcher.handle(context.Background(), delivery("TEST-70", "issueCreated", issueCreatedBody("TEST-70")))
+
+	task, ok := reg.Get(youtrack.SourceName, "TEST-70")
+	if !ok {
+		t.Fatal("the task was not recorded, so a failed delivery left no trace at all")
+	}
+	if task.State != registry.StateFailed {
+		t.Fatalf("state = %q, want failed: no turn ran and no session exists", task.State)
+	}
+	if !strings.Contains(task.LastError, "origin") {
+		t.Fatalf("last_error = %q, want it to name the unresolvable origin", task.LastError)
+	}
+	if task.Worktree != "" {
+		t.Fatalf("worktree = %q, want none recorded", task.Worktree)
+	}
+	if task.Turns != 0 {
+		t.Fatalf("turns = %d, want no turn to have been counted", task.Turns)
+	}
+	if got := len(fake.promptsSeen()); got != 0 {
+		t.Fatalf("prompts = %d, want nothing sent to opencode", got)
+	}
+
+	// Repair the repository the way an operator would, then deliver again: the
+	// preparation is retried, this time successfully, and the recorded failure is cleared.
+	gitIn(t, repo, "remote", "remove", "origin")
+	dispatcher.handle(context.Background(), delivery("TEST-70", "issueCreated", issueCreatedBody("TEST-70")))
+
+	task, _ = reg.Get(youtrack.SourceName, "TEST-70")
+	if task.State == registry.StateFailed {
+		t.Fatalf("the retry did not recover the task: state = %q, last_error = %q", task.State, task.LastError)
+	}
+	if task.LastError != "" {
+		t.Fatalf("last_error = %q, want it cleared by the turn that ran", task.LastError)
+	}
+	if task.Worktree == "" {
+		t.Fatal("the retry prepared no worktree")
+	}
+	if task.Turns != 1 {
+		t.Fatalf("turns = %d, want the successful delivery counted once", task.Turns)
+	}
+}
+
+// TestAFailedTurnRecordsWhyOnTheRow: the row used to say `failed` with no reason, leaving
+// the log (which rotates) and /healthz (which keeps only each host's most recent error) as
+// the only places to look. The silent-finish case matters most, because it has no error
+// value at all.
+func TestAFailedTurnRecordsWhyOnTheRow(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.postComment = false
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-71", "issueCreated", issueCreatedBody("TEST-71")))
+
+	task, _ := reg.Get(youtrack.SourceName, "TEST-71")
+	if task.State != registry.StateFailed {
+		t.Fatalf("state = %q, want failed", task.State)
+	}
+	if !strings.Contains(task.LastError, "without posting a comment") {
+		t.Fatalf("last_error = %q, want the silent finish named", task.LastError)
+	}
+}
