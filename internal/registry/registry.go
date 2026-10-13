@@ -99,6 +99,12 @@ type Task struct {
 	// LastAction is the action of the most recent turn, so a human's permit can
 	// continue where the agent was stopped instead of guessing from the plan state.
 	LastAction string `json:"last_action,omitempty"`
+	// LastError is why the task is in this state, when it is a failed one: the turn's
+	// error, or the reason the worktree could not be prepared. It is cleared by the
+	// next turn that runs, and it exists because the alternative is a row that says
+	// `failed` with no answer to "failed at what?" — the log rotates and /healthz keeps
+	// only each host's most recent error.
+	LastError string `json:"last_error,omitempty"`
 	// Refusals are the permission requests the most recent turn was refused for.
 	// They are replaced every turn because they are what a bare `/opencode permit`
 	// authorises: the commands the human has just read about, and nothing else.
