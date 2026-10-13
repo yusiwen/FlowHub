@@ -648,6 +648,7 @@ what a human reviews and pushes.
 | `FLOWHUB_MAX_TURNS` | `8` | A task that triggers more often stops and asks for a human |
 | `FLOWHUB_TASK_DEADLINE` | `15m` | One turn's budget. Hitting it is **not** a failure: the session keeps running and the task is marked `executing` |
 | `FLOWHUB_FIRST_RESPONSE` | `90s` | A turn that produces no assistant message in this window is **failed** — the signature of a prompt the server rejected |
+| `FLOWHUB_OPENCODE_REQUEST_TIMEOUT` | `30s` | How long **one HTTP request** may take. Not the turn budget: a host that accepts the connection and then says nothing must not hold a worker for the whole turn |
 | `FLOWHUB_TASK_MAX_COST` | `0` | Stop a task whose accumulated cost passes this many dollars. `0` disables it |
 | `FLOWHUB_DISPATCH_QUEUE` | `32` | Deliveries waiting per runtime; a full queue **drops** rather than blocking the publisher |
 
@@ -1105,6 +1106,7 @@ tail -5 /var/lib/flowhub/webhook-$(date -u +%F).jsonl | jq -c '{accepted,reason,
 | No turn, `dispatch.paused > 0` | the pause file exists | `rm <FLOWHUB_PAUSE_FILE>` |
 | No turn, `dropped > 0` | the dispatch queue is full | raise `FLOWHUB_DISPATCH_QUEUE`; investigate why turns are slow |
 | `no runtime answered` | the opencode server is down | `curl <runtime_url>/global/health` |
+| A turn sits for a long time and then fails with a connection error | the host stopped answering **without** closing the connection (black-holed packets, a wedged server), so only the client-side bound can end the call | check `FLOWHUB_OPENCODE_REQUEST_TIMEOUT` (`-print-config` shows it, and a value at or above the turn budget prints a `warning:`). It bounds one request, never a turn: a healthy slow turn is unaffected |
 | Task refused: *bound to runtime X, which is no longer configured* | the runtime was removed or renamed | restore it under the same name; the task cannot move |
 | Task refused: *mapping now points at …* | `repo.path` changed for an existing task | un-bind deliberately (new issue, or prune the registry row) rather than editing the path |
 

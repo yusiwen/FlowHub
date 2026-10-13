@@ -229,7 +229,14 @@ documents. The rules below are load-bearing; do not relax them casually.
    A turn that produces no assistant message at all while the session is idle is
    failed at `FLOWHUB_FIRST_RESPONSE` rather than held until the deadline — that is
    the signature of a prompt the agent server rejected, and a busy session with no
-   message yet is not it. Permission replies are **one per round trip, re-listing in
+   message yet is not it. **Two timeouts, two meanings, and they must not be
+   conflated again:** `FLOWHUB_TASK_DEADLINE` (or a runtime's own `deadline`) bounds the
+   *turn*, while `FLOWHUB_OPENCODE_REQUEST_TIMEOUT` bounds *one HTTP request* and is
+   never allowed above that turn budget. Passing the turn deadline as the client's
+   `Options.Timeout` — which is what the code did until 2026-10-09 — means a host that
+   accepts the connection and then says nothing holds a worker for the whole budget
+   (with a breadth of one, the whole runtime), because the runner is blocked inside the
+   call and cannot reach its own deadline check (issue #33). Permission replies are **one per round trip, re-listing in
    between**: opencode can hold two pending requests for one session and resolve one
    when the other is answered, so replying to a whole stale list got a 404
    (`PermissionNotFoundError`) and used to kill a turn that had already done the
