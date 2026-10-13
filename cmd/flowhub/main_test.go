@@ -727,3 +727,87 @@ func TestTheRuntimeFactoryCarriesTheConfiguredShellWrappers(t *testing.T) {
 		t.Fatalf("the rewritten command was answered %s, want once — the configured wrapper did not reach the arbiter", seen[0].body)
 	}
 }
+
+// TestTheRequestBoundIsNeverTheTurnBudget pins the resolver that exists because the two
+// were confused: `Options.Timeout` bounds ONE HTTP call, and passing the turn deadline as
+// that bound let a host which accepts a connection and then says nothing hold a worker
+// for the whole budget (issue #33).
+func TestTheRequestBoundIsNeverTheTurnBudget(t *testing.T) {
+	cfg := config.Config{TaskDeadline: time.Hour, OpenCodeRequestTimeout: 30 * time.Second}
+	if got := requestTimeout(cfg, &projectmap.Map{}, "local"); got != 30*time.Second {
+		t.Fatalf("request bound = %s, want the configured 30s rather than the turn budget", got)
+	}
+
+	// A host whose own turn deadline is shorter than the request bound gets the shorter
+	// bound: a request must not outlive the turn it belongs to.
+	path := filepath.Join(t.TempDir(), "config.json")
+	body := `{"version": 2, "runtimes": {"local": {"url": "http://127.0.0.1:4096", "deadline": "10s"}},
+	  "projects": [{"source": "youtrack", "project": "T", "repo": {"path": "/tmp/x"}, "runtime": "local"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+	if got := requestTimeout(cfg, projects, "local"); got != 10*time.Second {
+		t.Fatalf("request bound = %s, want the host's 10s turn deadline", got)
+	}
+	// A runtime the table does not describe keeps the configured bound.
+	if got := requestTimeout(cfg, projects, "default"); got != 30*time.Second {
+		t.Fatalf("request bound = %s, want the configured 30s", got)
+	}
+	// An unset value falls back to the compiled default rather than to zero, which
+	// would mean "no bound at all" to net/http.
+	if got := requestTimeout(config.Config{TaskDeadline: time.Hour}, projects, "default"); got != config.DefaultOpenCodeRequestTimeout {
+		t.Fatalf("request bound = %s, want the %s default", got, config.DefaultOpenCodeRequestTimeout)
+	}
+}
+
+// TestATurnAgainstASilentHostFailsWithinTheRequestBound is the acceptance test from
+// issue #33, at the level that actually broke: a host that accepts the connection and
+// never answers must fail the turn within a request bound, not within a turn budget. The
+// turn deadline here is an hour; with the old wiring this test would sit there for one.
+func TestATurnAgainstASilentHostFailsWithinTheRequestBound(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Accept, then never answer — the black-holed-host shape, where nothing closes
+		// the connection and only a client-side timeout can end the call.
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	cfg := config.Config{
+		OpenCodeURL:            server.URL,
+		TaskDeadline:           time.Hour,
+		FirstResponse:          time.Minute,
+		OpenCodeRequestTimeout: 300 * time.Millisecond,
+	}
+	runtime := newRuntimeFactory(cfg, &projectmap.Map{}, slog.New(slog.NewTextHandler(io.Discard, nil)))("local", server.URL)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := runtime.Run(context.Background(), agent.Turn{
+			Directory: "/tmp/TestATurnAgainstASilentHost",
+			Prompt:    "check the git status",
+			Agent:     "devops",
+			Title:     "TEST-33",
+			Phase:     agent.PhaseAnalysis,
+			Deadline:  time.Hour,
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a host that never answers produced a successful turn")
+		}
+	case <-time.After(20 * time.Second):
+		// Long enough that a 300 ms bound cannot trip it, short enough that the mutation
+		// (the turn budget as the request bound) fails in seconds instead of holding the
+		// suite for an hour.
+		t.Fatal("a host that accepts the connection and never answers held the turn; the request bound is the turn budget again")
+	}
+}

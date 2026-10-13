@@ -114,6 +114,61 @@ func TestLoadReadsShellWrappers(t *testing.T) {
 	}
 }
 
+// TestOneRequestIsBoundedFarBelowTheTurn pins the setting that exists because the two
+// bounds were confused: the turn deadline once doubled as the per-request timeout, so a
+// host that went silent without closing the connection held a worker for the whole turn
+// (issue #33).
+func TestOneRequestIsBoundedFarBelowTheTurn(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OpenCodeRequestTimeout != DefaultOpenCodeRequestTimeout {
+		t.Fatalf("request timeout = %s, want the %s default", cfg.OpenCodeRequestTimeout, DefaultOpenCodeRequestTimeout)
+	}
+	if DefaultOpenCodeRequestTimeout >= DefaultTaskDeadline {
+		t.Fatalf("the default request bound (%s) is not below the default turn budget (%s)",
+			DefaultOpenCodeRequestTimeout, DefaultTaskDeadline)
+	}
+
+	t.Setenv("FLOWHUB_OPENCODE_REQUEST_TIMEOUT", "5s")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OpenCodeRequestTimeout != 5*time.Second {
+		t.Fatalf("request timeout = %s, want 5s", cfg.OpenCodeRequestTimeout)
+	}
+	if !strings.Contains(cfg.Report(), "opencode_request_timeout: 5s") {
+		t.Fatalf("the report does not name the request bound:\n%s", cfg.Report())
+	}
+
+	// Zero is refused rather than read as "no bound", which is what net/http would do.
+	t.Setenv("FLOWHUB_OPENCODE_REQUEST_TIMEOUT", "0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "FLOWHUB_OPENCODE_REQUEST_TIMEOUT") {
+		t.Fatalf("Load with a zero request timeout = %v, want a refusal naming the variable", err)
+	}
+
+	// At or above the turn budget is the shape of the bug, so it is warned about — the
+	// same treatment FLOWHUB_FIRST_RESPONSE gets, because the two are the same mistake.
+	t.Setenv("FLOWHUB_OPENCODE_REQUEST_TIMEOUT", "30s")
+	t.Setenv("FLOWHUB_TASK_DEADLINE", "30s")
+	t.Setenv("FLOWHUB_DISPATCH", "1")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var warned bool
+	for _, warning := range cfg.Warnings() {
+		if strings.Contains(warning, "FLOWHUB_OPENCODE_REQUEST_TIMEOUT") && strings.Contains(warning, "FLOWHUB_TASK_DEADLINE") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("a request bound equal to the turn budget produced no warning: %v", cfg.Warnings())
+	}
+}
+
 func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("FLOWHUB_REPLAY_WINDOW", "fortnight")
 	if _, err := Load(); err == nil {
