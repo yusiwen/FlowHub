@@ -772,8 +772,10 @@ update can only touch its own. The registry
 (`<DataDir>/registry.jsonl`, append-only) records, per task: the repository, the
 worktree, the opencode session id, the agent, the state, the plan state, the
 number of turns, the accumulated cost, the agent's last reply text, the commands the
-last turn was refused for (`refusals`) and any authorisation a human has given
-(`grant`). State
+last turn was refused for (`refusals`), any authorisation a human has given
+(`grant`), the action its last turn ran (`last_action`) and, when the task is `failed`,
+**why** (`last_error`) — the reason a delivery could not even prepare its worktree, or
+what the turn failed with. State
 moves `analyzing → awaiting_input → executing → done`, with `failed` for a turn
 that broke — **or for a turn that finished without posting a comment**. That second
 case is deliberate: `awaiting_input` means "the analysis is posted and a human must
