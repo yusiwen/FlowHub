@@ -30,3 +30,23 @@ export function kindLabel(kind: InstanceKind): string {
       return "other";
   }
 }
+
+export interface TabInfo {
+  instance_id: string;
+  instance_name: string;
+  title: string;
+  url: string;
+  loading: boolean;
+  active: boolean;
+}
+
+export interface TabStateEvent {
+  instance_id: string;
+  url: string;
+  loading: boolean;
+}
+
+export interface TabTitleEvent {
+  instance_id: string;
+  title: string;
+}

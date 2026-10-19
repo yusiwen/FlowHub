@@ -2,14 +2,23 @@ import "./styles/base.css";
 import { confirmRemove, openInstanceForm } from "./components/instance-form";
 import { renderSidebar } from "./components/sidebar";
 import {
+  activateTab,
   addInstance,
+  closeTab,
   listInstances,
+  listTabs,
   onInstancesChanged,
+  onTabState,
+  onTabTitle,
+  onTabsChanged,
+  openTab,
   removeInstance,
   reorderInstances,
+  setContentVisible,
+  setStageBounds,
   updateInstance,
 } from "./ipc";
-import type { Instance } from "./types";
+import type { Instance, TabInfo } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (app === null) throw new Error("shell: missing #app");
@@ -17,20 +26,28 @@ if (app === null) throw new Error("shell: missing #app");
 app.innerHTML = `
   <div class="layout">
     <aside class="sidebar" id="sidebar"></aside>
-    <main class="stage" id="stage">
-      <section class="stage-empty">
-        <h2>Agent Hub</h2>
-        <p>Pick an instance on the left. One native tab per instance arrives in the next slice.</p>
-      </section>
-    </main>
+    <section class="workspace">
+      <div class="tabbar" id="tabbar"></div>
+      <div class="stage" id="stage">
+        <div class="stage-empty" id="stage-empty">
+          <h2>Agent Hub</h2>
+          <p>Pick an instance on the left to open its page in a tab.</p>
+        </div>
+      </div>
+    </section>
   </div>
   <p class="error" id="error" role="alert" hidden></p>
 `;
 
 const sidebar = document.querySelector<HTMLElement>("#sidebar")!;
+const tabbar = document.querySelector<HTMLElement>("#tabbar")!;
+const stage = document.querySelector<HTMLElement>("#stage")!;
+const stageEmpty = document.querySelector<HTMLElement>("#stage-empty")!;
 const errorBar = document.querySelector<HTMLElement>("#error")!;
 
 let instances: Instance[] = [];
+let tabs: TabInfo[] = [];
+let stageKey = "";
 
 function showError(error: unknown): void {
   errorBar.textContent = error instanceof Error ? error.message : String(error);
@@ -41,7 +58,7 @@ function clearError(): void {
   errorBar.hidden = true;
 }
 
-function render(): void {
+function renderInstances(): void {
   renderSidebar(sidebar, instances, {
     onAdd: () => {
       void add();
@@ -55,46 +72,163 @@ function render(): void {
     onMove: (instance, direction) => {
       void move(instance, direction);
     },
+    onOpen: (instance) => {
+      void open(instance);
+    },
   });
 }
 
-async function refresh(): Promise<void> {
+function renderTabs(): void {
+  tabbar.replaceChildren();
+
+  if (tabs.length === 0) {
+    const hint = document.createElement("span");
+    hint.className = "tabbar-empty";
+    hint.textContent = "No tab open";
+    tabbar.append(hint);
+    stageEmpty.hidden = false;
+    return;
+  }
+
+  stageEmpty.hidden = true;
+
+  for (const tab of tabs) {
+    const item = document.createElement("div");
+    item.className = `tab${tab.active ? " active" : ""}${
+      tab.loading ? " loading" : ""
+    }`;
+    item.dataset.id = tab.instance_id;
+
+    const label = document.createElement("button");
+    label.type = "button";
+    label.className = "tab-label";
+    label.title = tab.url;
+    label.textContent = tab.title.trim() === "" ? tab.instance_name : tab.title;
+    label.addEventListener("click", () => {
+      void activate(tab);
+    });
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "tab-close";
+    close.title = "Close tab";
+    close.textContent = "×";
+    close.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void closeOne(tab);
+    });
+
+    item.append(label, close);
+    tabbar.append(item);
+  }
+}
+
+async function refreshInstances(): Promise<void> {
+  instances = await listInstances();
+  clearError();
+  renderInstances();
+}
+
+function applyTabs(next: TabInfo[]): void {
+  const previous = new Map(tabs.map((tab) => [tab.instance_id, tab]));
+  tabs = next.map((tab) => {
+    const old = previous.get(tab.instance_id);
+    if (old === undefined) return tab;
+    // The backend list carries the instance defaults; the page title and the
+    // loading flag arrive as events and must survive a list refresh.
+    return { ...tab, title: old.title, url: old.url, loading: old.loading };
+  });
+  renderTabs();
+}
+
+async function refreshTabs(): Promise<void> {
+  applyTabs(await listTabs());
+}
+
+async function syncStageBounds(): Promise<void> {
+  const rect = stage.getBoundingClientRect();
+  const key = `${rect.x}:${rect.y}:${rect.width}:${rect.height}`;
+  if (key === stageKey) return;
+  stageKey = key;
   try {
-    instances = await listInstances();
-    clearError();
-    render();
+    await setStageBounds(rect.x, rect.y, rect.width, rect.height);
+  } catch (error) {
+    stageKey = "";
+    throw error;
+  }
+}
+
+async function withHiddenContent<T>(action: () => Promise<T>): Promise<T> {
+  await setContentVisible(false).catch(() => undefined);
+  try {
+    return await action();
+  } finally {
+    await setContentVisible(true).catch(() => undefined);
+  }
+}
+
+async function open(instance: Instance): Promise<void> {
+  try {
+    await syncStageBounds();
+    await openTab(instance.id);
+    await refreshTabs();
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function activate(tab: TabInfo): Promise<void> {
+  if (tab.active) return;
+  try {
+    await activateTab(tab.instance_id);
+    await refreshTabs();
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function closeOne(tab: TabInfo): Promise<void> {
+  try {
+    await closeTab(tab.instance_id);
+    await refreshTabs();
   } catch (error) {
     showError(error);
   }
 }
 
 async function add(): Promise<void> {
-  const input = await openInstanceForm();
+  const input = await withHiddenContent(() => openInstanceForm());
   if (input === null) return;
   try {
     await addInstance(input);
-    await refresh();
+    await refreshInstances();
+    await refreshTabs();
   } catch (error) {
     showError(error);
   }
 }
 
 async function edit(instance: Instance): Promise<void> {
-  const input = await openInstanceForm(instance);
+  const input = await withHiddenContent(() => openInstanceForm(instance));
   if (input === null) return;
   try {
     await updateInstance(instance.id, input);
-    await refresh();
+    await refreshInstances();
+    await refreshTabs();
   } catch (error) {
     showError(error);
   }
 }
 
 async function remove(instance: Instance): Promise<void> {
-  if (!(await confirmRemove(instance.name))) return;
+  const confirmed = await withHiddenContent(() =>
+    confirmRemove(instance.name),
+  );
+  if (!confirmed) return;
   try {
     await removeInstance(instance.id);
-    await refresh();
+    await refreshInstances();
+    await refreshTabs();
   } catch (error) {
     showError(error);
   }
@@ -109,16 +243,57 @@ async function move(instance: Instance, direction: -1 | 1): Promise<void> {
   [ids[index], ids[target]] = [ids[target], ids[index]];
   try {
     await reorderInstances(ids);
-    await refresh();
+    await refreshInstances();
   } catch (error) {
     showError(error);
   }
 }
 
+const observer = new ResizeObserver(() => {
+  void syncStageBounds().catch(showError);
+});
+observer.observe(stage);
+window.addEventListener("resize", () => {
+  void syncStageBounds().catch(showError);
+});
+
 void onInstancesChanged((next) => {
   instances = next;
   clearError();
-  render();
+  renderInstances();
 });
 
-void refresh();
+void onTabsChanged((next) => {
+  applyTabs(next);
+});
+
+void onTabTitle((event) => {
+  const tab = tabs.find(
+    (candidate) => candidate.instance_id === event.instance_id,
+  );
+  if (tab === undefined) return;
+  tab.title = event.title;
+  renderTabs();
+});
+
+void onTabState((event) => {
+  const tab = tabs.find(
+    (candidate) => candidate.instance_id === event.instance_id,
+  );
+  if (tab === undefined) return;
+  tab.url = event.url;
+  tab.loading = event.loading;
+  renderTabs();
+});
+
+async function init(): Promise<void> {
+  try {
+    await refreshInstances();
+    await refreshTabs();
+    await syncStageBounds();
+  } catch (error) {
+    showError(error);
+  }
+}
+
+void init();

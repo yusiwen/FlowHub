@@ -6,6 +6,7 @@ export interface SidebarActions {
   onEdit: (instance: Instance) => void;
   onRemove: (instance: Instance) => void;
   onMove: (instance: Instance, direction: -1 | 1) => void;
+  onOpen: (instance: Instance) => void;
 }
 
 function button(label: string, action: string, title: string): HTMLButtonElement {
@@ -26,6 +27,8 @@ function row(
   const item = document.createElement("li");
   item.className = "instance";
   item.dataset.id = instance.id;
+  item.tabIndex = 0;
+  item.title = "Open in a tab";
 
   const main = document.createElement("div");
   main.className = "instance-main";
@@ -121,22 +124,29 @@ export function renderSidebar(
   root.append(header, list);
 
   root.onclick = (event) => {
-    const target = (event.target as HTMLElement).closest<HTMLButtonElement>(
-      "button[data-action]",
-    );
-    if (target === null) return;
-    if (target.dataset.action === "add") {
+    const element = event.target as HTMLElement;
+    const button = element.closest<HTMLButtonElement>("button[data-action]");
+    if (button === null) {
+      const owner = element.closest<HTMLLIElement>("li[data-id]");
+      if (owner === null) return;
+      const instance = instances.find(
+        (candidate) => candidate.id === owner.dataset.id,
+      );
+      if (instance !== undefined) actions.onOpen(instance);
+      return;
+    }
+    if (button.dataset.action === "add") {
       actions.onAdd();
       return;
     }
-    const owner = target.closest<HTMLLIElement>("li[data-id]");
+    const owner = button.closest<HTMLLIElement>("li[data-id]");
     if (owner === null) return;
     const instance = instances.find(
       (candidate) => candidate.id === owner.dataset.id,
     );
     if (instance === undefined) return;
 
-    switch (target.dataset.action) {
+    switch (button.dataset.action) {
       case "edit":
         actions.onEdit(instance);
         break;

@@ -28,8 +28,17 @@ make desktop-build     # release bundle (after the packaging slice lands)
 | --- | --- |
 | `src/` | shell UI, running only in the local webview |
 | `src-tauri/src/main.rs` | window and webview wiring |
+| `src-tauri/src/tabs.rs` | tab manager: one child webview per instance, stage bounds, activate/close |
 | `src-tauri/capabilities/shell.json` | IPC grant for the `shell` webview only |
 | `src-tauri/tauri.conf.json` | Tauri configuration |
+
+## Tabs
+
+Clicking an instance row opens its page in a tab. Each tab is a separate native
+child WebView labelled `tab-<uuid>`; switching tabs hides the inactive webview
+instead of destroying it, so scroll and input state survive. The shell measures
+the `#stage` rectangle and Rust applies it to every content webview. A content
+webview matches no capability, so the page has no Tauri IPC.
 
 ## Registry
 
