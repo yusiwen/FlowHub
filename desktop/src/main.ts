@@ -128,6 +128,24 @@ function renderInstances(): void {
   });
 }
 
+function tabLabelParts(tab: TabInfo): { title: string; suffix: string } {
+  const title = tab.title.trim();
+  return {
+    title,
+    // The suffix always ends the label; the leading space is preserved by the
+    // suffix element's `white-space: pre`.
+    suffix: title === "" ? `[${tab.instance_name}]` : ` [${tab.instance_name}]`,
+  };
+}
+
+function tabTooltip(tab: TabInfo): string {
+  // Built from the untruncated values: the visible label ellipsizes the title,
+  // so the tooltip is the only place the full title remains readable.
+  return [tab.title.trim(), tab.instance_name, tab.url]
+    .filter((line) => line !== "")
+    .join("\n");
+}
+
 function renderTabs(): void {
   tabsEl.replaceChildren();
 
@@ -152,8 +170,18 @@ function renderTabs(): void {
     const label = document.createElement("button");
     label.type = "button";
     label.className = "tab-label";
-    label.title = tab.url;
-    label.textContent = tab.title.trim() === "" ? tab.instance_name : tab.title;
+    label.title = tabTooltip(tab);
+    const parts = tabLabelParts(tab);
+    if (parts.title !== "") {
+      const title = document.createElement("span");
+      title.className = "tab-title";
+      title.textContent = parts.title;
+      label.append(title);
+    }
+    const suffix = document.createElement("span");
+    suffix.className = "tab-instance";
+    suffix.textContent = parts.suffix;
+    label.append(suffix);
     label.addEventListener("click", () => {
       if (tab.auth_required) showAuth(tab.instance_id, tab.instance_name);
       void activate(tab);

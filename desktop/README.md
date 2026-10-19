@@ -54,6 +54,12 @@ CSS viewport below the title bar. The shell therefore also reports
 `y` before positioning a child webview. Without that inset the page starts 32
 points too high and covers the bottom of the tab bar.
 
+A tab label is the page title followed by `[<instance name>]`, or just
+`[<instance name>]` before a title arrives. The tab is capped at 230 px and only
+the title ellipsizes, so the instance suffix stays visible and two instances
+with the same page title remain distinguishable. Hovering a tab shows the full,
+untruncated page title, the instance name, and the URL.
+
 ## Shortcuts
 
 The macOS menu owns the accelerators because a focused content webview receives

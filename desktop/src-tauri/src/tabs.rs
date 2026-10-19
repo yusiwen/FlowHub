@@ -205,7 +205,9 @@ impl TabManager {
                 *id,
                 Tab {
                     instance: instance.clone(),
-                    title: instance.name.clone(),
+                    // No page title until the webview reports one; the shell
+                    // labels the tab with the instance name alone meanwhile.
+                    title: String::new(),
                     url: instance.url.clone(),
                     loading: false,
                     auth_required: false,
@@ -244,7 +246,9 @@ impl TabManager {
             instance.id,
             Tab {
                 instance: instance.clone(),
-                title: instance.name.clone(),
+                // No page title until the webview reports one; the shell labels
+                // the tab with the instance name alone meanwhile.
+                title: String::new(),
                 url: instance.url.clone(),
                 loading: false,
                 auth_required: false,
@@ -730,6 +734,7 @@ mod tests {
         assert_eq!(tabs[0].instance_id, second.id);
         assert_eq!(tabs[1].instance_id, first.id);
         assert!(tabs.iter().all(|tab| !tab.loaded));
+        assert!(tabs.iter().all(|tab| tab.title.is_empty()));
         assert_eq!(
             manager.session_snapshot(),
             (vec![second.id, first.id], Some(first.id))

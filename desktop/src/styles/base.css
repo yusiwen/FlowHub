@@ -238,7 +238,9 @@ body {
   display: flex;
   flex: none;
   align-items: center;
+  box-sizing: border-box;
   max-width: 230px;
+  overflow: hidden;
   border: 1px solid transparent;
   border-radius: 7px;
 }
@@ -258,7 +260,10 @@ body {
 }
 
 .tab-label {
-  max-width: 190px;
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  min-width: 0;
   padding: 4px 6px;
   overflow: hidden;
   border: none;
@@ -266,12 +271,25 @@ body {
   color: var(--text);
   font: inherit;
   font-size: 12px;
-  text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
 }
 
+/* Only the title may shrink; the instance suffix stays fully visible. */
+.tab-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-instance {
+  flex: none;
+  white-space: pre;
+}
+
 .tab-close {
+  flex: none;
   width: 18px;
   height: 18px;
   margin-right: 3px;
