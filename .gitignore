@@ -34,3 +34,10 @@ result-*
 .DS_Store
 .idea/
 .vscode/
+
+# Desktop app (desktop/): Rust/Node build output
+/desktop/node_modules/
+/desktop/dist/
+/desktop/src-tauri/target/
+/desktop/src-tauri/gen/
+/.pnpm-store/

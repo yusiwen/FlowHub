@@ -1,0 +1,14 @@
+[package]
+name = "agent-hub"
+version = "0.1.0"
+description = "Agent Hub desktop shell"
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The child-webview API (WebviewBuilder + Window::add_child) is behind the
+# `unstable` feature. Pin the minor version: the API may move between minors.
+tauri = { version = "=2.12.4", features = ["unstable"] }

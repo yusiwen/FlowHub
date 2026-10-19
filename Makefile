@@ -20,7 +20,8 @@ PLATFORM_LIST = \
 	darwin-arm64
 
 .PHONY: default build run secrets test test-race test-live test-repeat lint staticcheck \
-	fmt fmt-check smoke clean all releases
+	fmt fmt-check smoke clean all releases \
+	desktop-install desktop-dev desktop-build desktop-check desktop-clean
 
 default: build
 
@@ -146,3 +147,26 @@ fuzz:
 		echo "=== $$fn ($$pkg) for $(FUZZTIME)"; \
 		go test -run=^$$ -fuzz=^$$fn$$ -fuzztime=$(FUZZTIME) $$pkg || exit 1; \
 	done
+
+# ---- Desktop app (desktop/) ----
+# Independent Rust/Node toolchain. These targets never feed the Go build; they
+# exist so the desktop slice has the same one-command entry points as the
+# service. See docs/adr/0008-desktop-agent-hub.md.
+
+desktop-install:
+	cd desktop && pnpm install --frozen-lockfile
+
+desktop-dev:
+	cd desktop && pnpm tauri dev
+
+desktop-build:
+	cd desktop && pnpm tauri build
+
+desktop-check:
+	cd desktop && pnpm exec tsc --noEmit
+	cd desktop/src-tauri && cargo fmt --check
+	cd desktop/src-tauri && cargo clippy --all-targets -- -D warnings
+	cd desktop/src-tauri && cargo test
+
+desktop-clean:
+	cd desktop && rm -rf node_modules dist src-tauri/target src-tauri/gen
