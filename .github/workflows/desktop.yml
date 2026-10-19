@@ -1,0 +1,76 @@
+# The desktop gate. It is path-filtered and deliberately separate from ci.yml:
+# a Go-only change does not run it, so it must not be a required check.
+#
+# The runner is the arm64 macOS image. The Rust steps mirror `make desktop-check`
+# and the final build proves the Tauri app still compiles without bundling.
+name: desktop
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/desktop.yml'
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/desktop.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: desktop
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 12.14.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+
+      # The multi-webview API needs the stable toolchain plus rustfmt and clippy.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install shell dependencies
+        working-directory: desktop
+        run: pnpm install --frozen-lockfile
+
+      # The Tauri build script embeds frontendDist, so the shell must be built
+      # before any Rust step compiles the crate.
+      - name: Typecheck and build shell
+        working-directory: desktop
+        run: |
+          pnpm exec tsc --noEmit
+          pnpm build
+
+      - name: Rust format, lint, test
+        working-directory: desktop/src-tauri
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Build app without bundling
+        working-directory: desktop
+        run: pnpm tauri build --debug --no-bundle

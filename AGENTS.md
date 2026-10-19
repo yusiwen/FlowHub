@@ -460,4 +460,7 @@ Makefile's pinned linter needs a newer toolchain than the module does); `cross-c
 builds linux/amd64, linux/arm64 and darwin/arm64 and asserts each artifact's format; and
 `test-darwin` runs `make test` on macOS, where path handling differs (`/tmp` is a symlink
 to `/private/tmp`, which `localworktree` canonicalises). The action pins are kept current
-by Dependabot (`.github/dependabot.yml`).
+by Dependabot (`.github/dependabot.yml`). A separate path-filtered workflow,
+`.github/workflows/desktop.yml`, runs `make desktop-check` and a no-bundle Tauri build on
+an arm64 macOS runner for `desktop/**` changes; because it is filtered, it is not a
+required check for a Go-only pull request.
