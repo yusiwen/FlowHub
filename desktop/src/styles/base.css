@@ -45,6 +45,16 @@ body {
   height: 100%;
 }
 
+.layout.sidebar-hidden {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+.layout.sidebar-hidden .sidebar {
+  padding: 0;
+  border-right: none;
+  visibility: hidden;
+}
+
 .workspace {
   display: flex;
   flex-direction: column;
@@ -202,12 +212,20 @@ body {
   display: flex;
   flex: none;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
   min-height: 40px;
   padding: 5px 10px;
-  overflow-x: auto;
+  overflow: hidden;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
 }
 
 .tabbar-empty {

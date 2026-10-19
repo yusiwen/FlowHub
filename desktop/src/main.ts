@@ -11,6 +11,7 @@ import {
   onTabState,
   onTabTitle,
   onTabsChanged,
+  onToggleSidebar,
   openTab,
   removeInstance,
   reorderInstances,
@@ -27,7 +28,10 @@ app.innerHTML = `
   <div class="layout">
     <aside class="sidebar" id="sidebar"></aside>
     <section class="workspace">
-      <div class="tabbar" id="tabbar"></div>
+      <div class="tabbar">
+        <button type="button" class="icon-button" id="sidebar-toggle" title="Toggle sidebar (Cmd+B)">☰</button>
+        <div class="tabs" id="tabs"></div>
+      </div>
       <div class="stage" id="stage">
         <div class="stage-empty" id="stage-empty">
           <h2>Agent Hub</h2>
@@ -40,8 +44,9 @@ app.innerHTML = `
 `;
 
 const sidebar = document.querySelector<HTMLElement>("#sidebar")!;
-const tabbar = document.querySelector<HTMLElement>("#tabbar")!;
+const tabsEl = document.querySelector<HTMLElement>("#tabs")!;
 const stage = document.querySelector<HTMLElement>("#stage")!;
+const layout = document.querySelector<HTMLElement>(".layout")!;
 const stageEmpty = document.querySelector<HTMLElement>("#stage-empty")!;
 const errorBar = document.querySelector<HTMLElement>("#error")!;
 
@@ -79,13 +84,13 @@ function renderInstances(): void {
 }
 
 function renderTabs(): void {
-  tabbar.replaceChildren();
+  tabsEl.replaceChildren();
 
   if (tabs.length === 0) {
     const hint = document.createElement("span");
     hint.className = "tabbar-empty";
     hint.textContent = "No tab open";
-    tabbar.append(hint);
+    tabsEl.append(hint);
     stageEmpty.hidden = false;
     return;
   }
@@ -119,7 +124,7 @@ function renderTabs(): void {
     });
 
     item.append(label, close);
-    tabbar.append(item);
+    tabsEl.append(item);
   }
 }
 
@@ -255,6 +260,21 @@ const observer = new ResizeObserver(() => {
 observer.observe(stage);
 window.addEventListener("resize", () => {
   void syncStageBounds().catch(showError);
+});
+
+function toggleSidebar(): void {
+  layout.classList.toggle("sidebar-hidden");
+  requestAnimationFrame(() => {
+    void syncStageBounds().catch(showError);
+  });
+}
+
+document
+  .querySelector("#sidebar-toggle")
+  ?.addEventListener("click", toggleSidebar);
+
+void onToggleSidebar(() => {
+  toggleSidebar();
 });
 
 void onInstancesChanged((next) => {
