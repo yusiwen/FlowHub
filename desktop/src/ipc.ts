@@ -9,6 +9,7 @@ import type {
   AuthRequiredEvent,
   AuthOkEvent,
   AuthFailedEvent,
+  HealthReport,
 } from "./types";
 
 export const listInstances = (): Promise<Instance[]> =>
@@ -91,5 +92,18 @@ export const onAuthFailed = (
   handler: (event: AuthFailedEvent) => void,
 ): Promise<UnlistenFn> =>
   listen<AuthFailedEvent>("auth://failed", (event) =>
+    handler(event.payload),
+  );
+
+export const listHealth = (): Promise<HealthReport[]> =>
+  invoke<HealthReport[]>("list_health");
+
+export const probeAll = (): Promise<HealthReport[]> =>
+  invoke<HealthReport[]>("probe_all");
+
+export const onHealthChanged = (
+  handler: (report: HealthReport) => void,
+): Promise<UnlistenFn> =>
+  listen<HealthReport>("health://changed", (event) =>
     handler(event.payload),
   );

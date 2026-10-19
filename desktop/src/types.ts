@@ -65,3 +65,11 @@ export interface AuthFailedEvent {
   instance_id: string;
   reason: string;
 }
+
+export type HealthStatus = "ok" | "auth" | "http" | "unreachable";
+
+export interface HealthReport {
+  instance_id: string;
+  status: HealthStatus;
+  latency_ms: number;
+}

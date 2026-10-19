@@ -1,4 +1,5 @@
 use crate::auth;
+use crate::health::{self, HealthReport};
 use crate::model::{AuthMode, Instance, InstanceInput};
 use crate::state::{lock_tabs, AppState};
 use crate::store::lock;
@@ -164,8 +165,25 @@ pub fn remove_instance(id: Uuid, state: State<'_, AppState>, app: AppHandle) -> 
     lock(&state.store)?
         .remove(id)
         .map_err(|error| error.to_string())?;
+    if let Ok(mut health) = state.health.lock() {
+        health.remove(&id);
+    }
     broadcast_instances(&app, snapshot(&state)?)?;
     broadcast_tabs(&app, &state)
+}
+
+#[tauri::command]
+pub fn list_health(state: State<'_, AppState>) -> Result<Vec<HealthReport>, String> {
+    let guard = state
+        .health
+        .lock()
+        .map_err(|_| "health lock poisoned".to_string())?;
+    Ok(guard.values().cloned().collect())
+}
+
+#[tauri::command]
+pub async fn probe_all(app: AppHandle) -> Result<Vec<HealthReport>, String> {
+    Ok(health::probe_all(&app).await)
 }
 
 #[tauri::command]

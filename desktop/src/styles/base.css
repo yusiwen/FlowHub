@@ -488,3 +488,32 @@ body {
   letter-spacing: 0.03em;
   text-transform: uppercase;
 }
+
+.health-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  opacity: 0.55;
+}
+
+.health-dot.ok {
+  background: #30d158;
+  opacity: 1;
+}
+
+.health-dot.auth {
+  background: #ffd60a;
+  opacity: 1;
+}
+
+.health-dot.http {
+  background: #ff9f0a;
+  opacity: 1;
+}
+
+.health-dot.unreachable {
+  background: #ff453a;
+  opacity: 1;
+}

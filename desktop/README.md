@@ -30,6 +30,7 @@ make desktop-build     # release bundle (after the packaging slice lands)
 | `src-tauri/src/main.rs` | window and webview wiring |
 | `src-tauri/src/tabs.rs` | tab manager: one child webview per instance, stage bounds, activate/close |
 | `src-tauri/src/auth.rs` | dsh launch-token parsing, the token URL, and the authority-hashed cookie name |
+| `src-tauri/src/health.rs` | reachability probes and the `ok` / `auth` / `http` / `unreachable` classes |
 | `src-tauri/src/menu.rs` | macOS menu, accelerators, and the window-close lifecycle |
 | `src-tauri/capabilities/shell.json` | IPC grant for the `shell` webview only |
 | `src-tauri/tauri.conf.json` | Tauri configuration |
@@ -66,6 +67,15 @@ panel open with an error and lets the user retry.
 The token is never written to `instances.json` or the logs; only the cookie is a
 session. The cookie name hashes `host:port`, so cookies for two dsh ports on the
 same host cannot be confused.
+
+## Health
+
+Every 30 s (and on demand from the UI) each instance gets one `GET` with a 3 s
+timeout and redirects disabled. `200-399` is `ok`, `401`/`403` is `auth`
+(reachable but sign-in required), any other HTTP status is `http`, and a
+timeout or connection error is `unreachable`. The sidebar dot is green, yellow,
+orange or red; its tooltip includes the latency. The probe runs in the Rust
+process, so it is not subject to page CORS or a missing webview cookie.
 
 ## Registry
 
