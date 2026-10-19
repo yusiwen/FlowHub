@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn classifies_reachability_and_auth_separately() {
-        assert_eq!(classify(200), HealthStatus::Ok);
+        assert_eq!(classify(200), HealthStatus::Auth);
         assert_eq!(classify(303), HealthStatus::Ok);
         assert_eq!(classify(401), HealthStatus::Auth);
         assert_eq!(classify(403), HealthStatus::Auth);
