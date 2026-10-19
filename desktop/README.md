@@ -38,6 +38,8 @@ check for a Go-only pull request.
 | `src-tauri/src/health.rs` | reachability probes and the `ok` / `auth` / `http` / `unreachable` classes |
 | `src-tauri/src/menu.rs` | macOS menu, accelerators, and the window-close lifecycle |
 | `src-tauri/capabilities/shell.json` | IPC grant for the `shell` webview only |
+| `src-tauri/icons/icon.svg` | the icon master, and the generated PNG/ICNS/ICO set next to it |
+| `scripts/build-icons.sh` | regenerates that set from the master |
 | `src-tauri/tauri.conf.json` | Tauri configuration |
 
 ## Tabs
@@ -109,6 +111,29 @@ The sidebar is backed by `instances.json` in the app config directory
 (`~/Library/Application Support/dev.flowhub.agenthub/` on macOS). The file is
 versioned, written atomically with mode `0600`, and holds no secret: a dsh launch
 token is never persisted, only exchanged for a cookie in the webview.
+
+## App icon
+
+The mark is one hub wired to three agents, with the live agent in mint. It is drawn
+as a single vector master, `src-tauri/icons/icon.svg`: a 1024 px canvas, an 824 px
+body with continuous (superellipse) corners, the macOS icon grid, and no baked-in
+drop shadow outside the body.
+
+Every raster is generated from that master:
+
+```bash
+bash scripts/build-icons.sh          # BROWSER=/path/to/chrome to override detection
+```
+
+The script renders each size natively in a headless Chromium-family browser
+(transparent background, one launch per size) and then writes `icon.png` (1024),
+`32x32.png`, `64x64.png`, `128x128.png`, `128x128@2x.png` (256), the ten-slot
+`icon.icns` through `iconutil`, and `icon.ico` through ImageMagick when it is
+installed. `sips` and `iconutil` ship with macOS; no other tool is required.
+
+`bundle.icon` lists the generated files, which is what makes `pnpm tauri dev` set
+the Dock tile from `icon.icns` — Tauri's codegen reads that list in development.
+`bundle.active` stays `false` until the packaging slice lands.
 
 ## Security invariants
 
