@@ -38,6 +38,7 @@ export interface TabInfo {
   url: string;
   loading: boolean;
   auth_required: boolean;
+  loaded: boolean;
   active: boolean;
 }
 
@@ -72,4 +73,10 @@ export interface HealthReport {
   instance_id: string;
   status: HealthStatus;
   latency_ms: number;
+}
+
+export interface SessionView {
+  sidebar_visible: boolean;
+  active: string | null;
+  tabs: string[];
 }

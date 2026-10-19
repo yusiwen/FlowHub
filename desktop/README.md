@@ -28,7 +28,8 @@ make desktop-build     # release bundle (after the packaging slice lands)
 | --- | --- |
 | `src/` | shell UI, running only in the local webview |
 | `src-tauri/src/main.rs` | window and webview wiring |
-| `src-tauri/src/tabs.rs` | tab manager: one child webview per instance, stage bounds, activate/close |
+| `src-tauri/src/tabs.rs` | tab manager: one child webview per instance, stage bounds, activate/close, lazy restore |
+| `src-tauri/src/session.rs` | the versioned `session.json`: open tab ids, active tab, sidebar visibility |
 | `src-tauri/src/auth.rs` | dsh launch-token parsing, the token URL, and the authority-hashed cookie name |
 | `src-tauri/src/health.rs` | reachability probes and the `ok` / `auth` / `http` / `unreachable` classes |
 | `src-tauri/src/menu.rs` | macOS menu, accelerators, and the window-close lifecycle |
@@ -67,6 +68,15 @@ panel open with an error and lets the user retry.
 The token is never written to `instances.json` or the logs; only the cookie is a
 session. The cookie name hashes `host:port`, so cookies for two dsh ports on the
 same host cannot be confused.
+
+## Session restore
+
+`session.json` (mode `0644`, written atomically) holds the open instance ids, the
+active id and the sidebar visibility. On startup the tabs are rebuilt as
+placeholders: the tab bar renders immediately, only the active tab's webview is
+created, and every other webview is created on first activation. Ids whose
+instance no longer exists are pruned; a corrupt or unknown-version file starts
+with an empty session and is rewritten instead of blocking the app.
 
 ## Health
 

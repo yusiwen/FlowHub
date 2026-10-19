@@ -4,6 +4,9 @@
 //! not named in any capability, so a remote page has no Tauri IPC. The shell
 //! owns the sidebar and tab bar; Rust owns the stage rectangle and applies it to
 //! every child webview.
+//!
+//! A restored tab starts as a placeholder with no webview. Activating it creates
+//! the webview; the rest stay placeholders until first use.
 
 use crate::auth;
 use crate::model::{AuthMode, Instance};
@@ -50,13 +53,8 @@ pub struct TabInfo {
     pub url: String,
     pub loading: bool,
     pub auth_required: bool,
+    pub loaded: bool,
     pub active: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AuthRequiredEvent {
-    instance_id: Uuid,
-    instance_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +68,12 @@ struct TabStateEvent {
 struct TabTitleEvent {
     instance_id: Uuid,
     title: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthRequiredEvent {
+    instance_id: Uuid,
+    instance_name: String,
 }
 
 /// Pure ordering and active-tab selection, separate from the webviews so the
@@ -157,12 +161,12 @@ fn tab_label(id: Uuid) -> String {
 }
 
 struct Tab {
-    instance_name: String,
+    instance: Instance,
     title: String,
     url: String,
     loading: bool,
     auth_required: bool,
-    webview: Webview,
+    webview: Option<Webview>,
 }
 
 #[derive(Default)]
@@ -173,6 +177,46 @@ pub struct TabManager {
 }
 
 impl TabManager {
+    /// Build placeholders from a session. No webview is created here; the active
+    /// tab is loaded by `activate` when the shell asks for it.
+    pub fn restore(instances: &[Instance], ids: &[Uuid], active: Option<Uuid>) -> Self {
+        let mut by_id: HashMap<Uuid, &Instance> = instances
+            .iter()
+            .map(|instance| (instance.id, instance))
+            .collect();
+        let mut tabs = HashMap::new();
+        let mut order = TabOrder::default();
+        for id in ids {
+            let Some(instance) = by_id.remove(id) else {
+                continue;
+            };
+            tabs.insert(
+                *id,
+                Tab {
+                    instance: instance.clone(),
+                    title: instance.name.clone(),
+                    url: instance.url.clone(),
+                    loading: false,
+                    auth_required: false,
+                    webview: None,
+                },
+            );
+            order.open(*id);
+        }
+        if let Some(active) = active {
+            order.activate(active);
+        }
+        Self {
+            tabs,
+            order,
+            bounds: None,
+        }
+    }
+
+    pub fn session_snapshot(&self) -> (Vec<Uuid>, Option<Uuid>) {
+        (self.order.ids().to_vec(), self.order.active())
+    }
+
     pub fn set_bounds(&mut self, bounds: StageBounds) -> Result<(), String> {
         self.bounds = Some(bounds);
         self.apply_bounds()?;
@@ -181,9 +225,37 @@ impl TabManager {
 
     pub fn open(&mut self, app: &AppHandle, instance: &Instance) -> Result<TabInfo, String> {
         if self.tabs.contains_key(&instance.id) {
-            self.order.activate(instance.id);
-            self.apply_visibility()?;
-            return Ok(self.info(instance.id).ok_or("tab disappeared")?);
+            self.activate(app, instance.id)?;
+            return self.info(instance.id).ok_or("tab disappeared".to_string());
+        }
+
+        self.tabs.insert(
+            instance.id,
+            Tab {
+                instance: instance.clone(),
+                title: instance.name.clone(),
+                url: instance.url.clone(),
+                loading: false,
+                auth_required: false,
+                webview: None,
+            },
+        );
+        self.order.open(instance.id);
+        if let Err(error) = self.ensure_webview(app, instance.id) {
+            self.tabs.remove(&instance.id);
+            self.order.close(instance.id);
+            return Err(error);
+        }
+        self.apply_visibility()?;
+        self.info(instance.id).ok_or("tab disappeared".to_string())
+    }
+
+    fn ensure_webview(&mut self, app: &AppHandle, id: Uuid) -> Result<(), String> {
+        let Some(tab) = self.tabs.get(&id) else {
+            return Err("no such tab".to_string());
+        };
+        if tab.webview.is_some() {
+            return Ok(());
         }
 
         let bounds = self
@@ -192,11 +264,13 @@ impl TabManager {
         let window = app
             .get_window("main")
             .ok_or_else(|| "main window is missing".to_string())?;
-        let url =
-            Url::parse(&instance.url).map_err(|error| format!("invalid instance url: {error}"))?;
+        let url = Url::parse(&tab.instance.url)
+            .map_err(|error| format!("invalid instance url: {error}"))?;
         let cookie_url = url.clone();
-        let instance_id = instance.id;
-        let label = tab_label(instance_id);
+        let instance_id = id;
+        let instance_name = tab.instance.name.clone();
+        let auth_mode = tab.instance.auth;
+        let label = tab_label(id);
 
         let state_app = app.clone();
         let title_app = app.clone();
@@ -226,46 +300,46 @@ impl TabManager {
             .map_err(|error| format!("create tab webview: {error}"))?;
 
         let expected_cookie = auth::cookie_name(&cookie_url);
-        let auth_required = instance.auth == AuthMode::DshToken
+        let auth_required = auth_mode == AuthMode::DshToken
             && !webview
                 .cookies()
                 .map(|cookies| {
                     cookies
                         .iter()
-                        .any(|cookie| cookie.name() == expected_cookie)
+                        .any(|cookie| cookie.name() == expected_cookie.as_str())
                 })
                 .unwrap_or(false);
 
-        self.tabs.insert(
-            instance.id,
-            Tab {
-                instance_name: instance.name.clone(),
-                title: instance.name.clone(),
-                url: instance.url.clone(),
-                loading: false,
-                auth_required,
-                webview,
-            },
-        );
-        self.order.open(instance.id);
-        self.apply_visibility()?;
+        {
+            let tab = self.tabs.get_mut(&id).ok_or("tab disappeared")?;
+            tab.webview = Some(webview);
+            tab.auth_required = auth_required;
+        }
+
         if auth_required {
+            if let Some(webview) = self.tabs.get(&id).and_then(|tab| tab.webview.as_ref()) {
+                webview
+                    .hide()
+                    .map_err(|error| format!("hide tab during sign-in: {error}"))?;
+            }
             let _ = app.emit(
                 "auth://required",
                 AuthRequiredEvent {
                     instance_id,
-                    instance_name: instance.name.clone(),
+                    instance_name,
                 },
             );
         }
-        self.info(instance.id).ok_or("tab disappeared".to_string())
+        Ok(())
     }
 
     pub fn close(&mut self, id: Uuid) -> Result<(), String> {
         if let Some(tab) = self.tabs.remove(&id) {
-            tab.webview
-                .close()
-                .map_err(|error| format!("close tab webview: {error}"))?;
+            if let Some(webview) = tab.webview {
+                webview
+                    .close()
+                    .map_err(|error| format!("close tab webview: {error}"))?;
+            }
         }
         self.order.close(id);
         self.apply_visibility()
@@ -278,66 +352,62 @@ impl TabManager {
         Ok(())
     }
 
-    pub fn activate(&mut self, id: Uuid) -> Result<(), String> {
-        if !self.order.activate(id) {
+    pub fn activate(&mut self, app: &AppHandle, id: Uuid) -> Result<(), String> {
+        if !self.tabs.contains_key(&id) {
             return Err("no such tab".to_string());
+        }
+        self.order.activate(id);
+        if self
+            .tabs
+            .get(&id)
+            .map(|tab| tab.webview.is_none())
+            .unwrap_or(false)
+        {
+            self.ensure_webview(app, id)?;
         }
         self.apply_visibility()
     }
 
-    pub fn begin_auth(&mut self, id: Uuid, target: Url) -> Result<(), String> {
-        let tab = self.tabs.get_mut(&id).ok_or("no such tab")?;
-        tab.auth_required = true;
-        tab.webview
-            .navigate(target)
-            .map_err(|error| format!("navigate to the token URL: {error}"))?;
-        tab.webview
-            .hide()
-            .map_err(|error| format!("hide tab during sign-in: {error}"))
-    }
-
-    /// `(url still carries a token, dsh cookie is present)`. The poll loop needs
-    /// both: a successful exchange removes the token and sets the cookie.
-    pub fn auth_status(&self, id: Uuid) -> Option<(bool, bool)> {
-        let tab = self.tabs.get(&id)?;
-        let url = tab.webview.url().ok()?;
-        let has_token = url.query_pairs().any(|(key, _)| key == "token");
-        let expected = auth::cookie_name(&Url::parse(&tab.url).ok()?);
-        let has_cookie = tab
-            .webview
-            .cookies()
-            .ok()
-            .map(|cookies| cookies.iter().any(|cookie| cookie.name() == expected))
-            .unwrap_or(false);
-        Some((has_token, has_cookie))
-    }
-
-    pub fn complete_auth(&mut self, id: Uuid) -> Result<(), String> {
-        let tab = self.tabs.get_mut(&id).ok_or("no such tab")?;
-        tab.auth_required = false;
-        self.apply_visibility()
-    }
-
-    pub fn activate_index(&mut self, index: usize) -> Result<(), String> {
+    pub fn activate_index(&mut self, app: &AppHandle, index: usize) -> Result<(), String> {
         self.order
             .activate_index(index)
             .ok_or_else(|| format!("no tab at index {index}"))?;
+        if let Some(id) = self.order.active() {
+            if self
+                .tabs
+                .get(&id)
+                .map(|tab| tab.webview.is_none())
+                .unwrap_or(false)
+            {
+                self.ensure_webview(app, id)?;
+            }
+        }
         self.apply_visibility()
     }
 
-    pub fn cycle(&mut self, delta: isize) -> Result<(), String> {
+    pub fn cycle(&mut self, app: &AppHandle, delta: isize) -> Result<(), String> {
         self.order
             .cycle(delta)
             .ok_or_else(|| "no tabs are open".to_string())?;
+        if let Some(id) = self.order.active() {
+            if self
+                .tabs
+                .get(&id)
+                .map(|tab| tab.webview.is_none())
+                .unwrap_or(false)
+            {
+                self.ensure_webview(app, id)?;
+            }
+        }
         self.apply_visibility()
     }
 
     pub fn reload_active(&self) -> Result<(), String> {
         let id = self.order.active().ok_or("no active tab")?;
-        self.tabs
-            .get(&id)
-            .ok_or("no active tab")?
-            .webview
+        let tab = self.tabs.get(&id).ok_or("no active tab")?;
+        tab.webview
+            .as_ref()
+            .ok_or("tab is not loaded yet")?
             .reload()
             .map_err(|error| format!("reload tab: {error}"))
     }
@@ -346,8 +416,8 @@ impl TabManager {
         let id = self.order.active()?;
         let tab = self.tabs.get(&id)?;
         tab.webview
-            .url()
-            .ok()
+            .as_ref()
+            .and_then(|webview| webview.url().ok())
             .map(|url| url.to_string())
             .or_else(|| Some(tab.url.clone()))
     }
@@ -371,21 +441,61 @@ impl TabManager {
 
     pub fn close_all(&mut self) {
         for (_, tab) in self.tabs.drain() {
-            let _ = tab.webview.close();
+            if let Some(webview) = tab.webview {
+                let _ = webview.close();
+            }
         }
         self.order.clear();
     }
 
     pub fn rename(&mut self, id: Uuid, name: &str) {
         if let Some(tab) = self.tabs.get_mut(&id) {
-            tab.instance_name = name.to_string();
+            tab.instance.name = name.to_string();
         }
+    }
+
+    pub fn begin_auth(&mut self, id: Uuid, target: Url) -> Result<(), String> {
+        let tab = self.tabs.get_mut(&id).ok_or("no such tab")?;
+        tab.auth_required = true;
+        let webview = tab.webview.as_ref().ok_or("tab is not loaded yet")?;
+        webview
+            .navigate(target)
+            .map_err(|error| format!("navigate to the token URL: {error}"))?;
+        webview
+            .hide()
+            .map_err(|error| format!("hide tab during sign-in: {error}"))
+    }
+
+    /// `(url still carries a token, dsh cookie is present)`. The poll loop needs
+    /// both: a successful exchange removes the token and sets the cookie.
+    pub fn auth_status(&self, id: Uuid) -> Option<(bool, bool)> {
+        let tab = self.tabs.get(&id)?;
+        let webview = tab.webview.as_ref()?;
+        let url = webview.url().ok()?;
+        let has_token = url.query_pairs().any(|(key, _)| key == "token");
+        let expected = auth::cookie_name(&Url::parse(&tab.url).ok()?);
+        let has_cookie = webview
+            .cookies()
+            .ok()
+            .map(|cookies| {
+                cookies
+                    .iter()
+                    .any(|cookie| cookie.name() == expected.as_str())
+            })
+            .unwrap_or(false);
+        Some((has_token, has_cookie))
+    }
+
+    pub fn complete_auth(&mut self, id: Uuid) -> Result<(), String> {
+        let tab = self.tabs.get_mut(&id).ok_or("no such tab")?;
+        tab.auth_required = false;
+        self.apply_visibility()
     }
 
     pub fn hide_content(&mut self, app: &AppHandle) -> Result<(), String> {
         if let Some(id) = self.order.active() {
-            if let Some(tab) = self.tabs.get(&id) {
-                tab.webview
+            if let Some(webview) = self.tabs.get(&id).and_then(|tab| tab.webview.as_ref()) {
+                webview
                     .hide()
                     .map_err(|error| format!("hide tab webview: {error}"))?;
             }
@@ -403,35 +513,28 @@ impl TabManager {
     }
 
     pub fn list(&self) -> Vec<TabInfo> {
-        let active = self.order.active();
         self.order
             .ids()
             .iter()
-            .filter_map(|id| {
-                self.tabs.get(id).map(|tab| TabInfo {
-                    instance_id: *id,
-                    instance_name: tab.instance_name.clone(),
-                    title: tab.title.clone(),
-                    url: tab.url.clone(),
-                    loading: tab.loading,
-                    auth_required: tab.auth_required,
-                    active: Some(*id) == active,
-                })
-            })
+            .filter_map(|id| self.tabs.get(id).map(|tab| self.to_info(*id, tab)))
             .collect()
     }
 
     fn info(&self, id: Uuid) -> Option<TabInfo> {
-        let active = self.order.active();
-        self.tabs.get(&id).map(|tab| TabInfo {
+        self.tabs.get(&id).map(|tab| self.to_info(id, tab))
+    }
+
+    fn to_info(&self, id: Uuid, tab: &Tab) -> TabInfo {
+        TabInfo {
             instance_id: id,
-            instance_name: tab.instance_name.clone(),
+            instance_name: tab.instance.name.clone(),
             title: tab.title.clone(),
             url: tab.url.clone(),
             loading: tab.loading,
             auth_required: tab.auth_required,
-            active: Some(id) == active,
-        })
+            loaded: tab.webview.is_some(),
+            active: self.order.active() == Some(id),
+        }
     }
 
     fn apply_bounds(&self) -> Result<(), String> {
@@ -439,10 +542,13 @@ impl TabManager {
             return Ok(());
         };
         for tab in self.tabs.values() {
-            tab.webview
+            let Some(webview) = tab.webview.as_ref() else {
+                continue;
+            };
+            webview
                 .set_position(LogicalPosition::new(bounds.x, bounds.y))
                 .map_err(|error| format!("position tab webview: {error}"))?;
-            tab.webview
+            webview
                 .set_size(LogicalSize::new(bounds.width, bounds.height))
                 .map_err(|error| format!("size tab webview: {error}"))?;
         }
@@ -452,15 +558,18 @@ impl TabManager {
     fn apply_visibility(&self) -> Result<(), String> {
         let active = self.order.active();
         for (id, tab) in &self.tabs {
+            let Some(webview) = tab.webview.as_ref() else {
+                continue;
+            };
             if Some(*id) == active && !tab.auth_required {
-                tab.webview
+                webview
                     .show()
                     .map_err(|error| format!("show tab webview: {error}"))?;
-                tab.webview
+                webview
                     .set_focus()
                     .map_err(|error| format!("focus tab webview: {error}"))?;
             } else {
-                tab.webview
+                webview
                     .hide()
                     .map_err(|error| format!("hide tab webview: {error}"))?;
             }
@@ -472,9 +581,24 @@ impl TabManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{InstanceInput, InstanceKind};
 
     fn id() -> Uuid {
         Uuid::new_v4()
+    }
+
+    fn instance(name: &str, kind: InstanceKind, url: &str) -> Instance {
+        Instance::from_input(
+            &InstanceInput {
+                name: name.to_string(),
+                kind,
+                url: url.to_string(),
+                group: None,
+                notes: None,
+            },
+            0,
+        )
+        .expect("valid instance")
     }
 
     #[test]
@@ -527,14 +651,6 @@ mod tests {
     }
 
     #[test]
-    fn stage_bounds_reject_offscreen_or_empty_rectangles() {
-        assert!(StageBounds::new(0.0, 38.0, 1000.0, 700.0).is_ok());
-        assert!(StageBounds::new(-1.0, 0.0, 100.0, 100.0).is_err());
-        assert!(StageBounds::new(0.0, 0.0, 0.0, 100.0).is_err());
-        assert!(StageBounds::new(0.0, 0.0, f64::NAN, 100.0).is_err());
-    }
-
-    #[test]
     fn cycling_wraps_in_both_directions() {
         let mut order = TabOrder::default();
         let first = id();
@@ -559,6 +675,14 @@ mod tests {
     }
 
     #[test]
+    fn stage_bounds_reject_offscreen_or_empty_rectangles() {
+        assert!(StageBounds::new(0.0, 38.0, 1000.0, 700.0).is_ok());
+        assert!(StageBounds::new(-1.0, 0.0, 100.0, 100.0).is_err());
+        assert!(StageBounds::new(0.0, 0.0, 0.0, 100.0).is_err());
+        assert!(StageBounds::new(0.0, 0.0, f64::NAN, 100.0).is_err());
+    }
+
+    #[test]
     fn tab_labels_never_match_the_shell() {
         let label = tab_label(id());
         assert!(label.starts_with("tab-"));
@@ -572,5 +696,36 @@ mod tests {
         assert_eq!(value["webviews"], serde_json::json!(["shell"]));
         assert!(value.get("windows").is_none());
         assert!(value.get("remote").is_none());
+    }
+
+    #[test]
+    fn restore_keeps_order_and_creates_placeholders() {
+        let first = instance("one", InstanceKind::Other, "http://127.0.0.1:1");
+        let second = instance("two", InstanceKind::Other, "http://127.0.0.1:2");
+        let manager = TabManager::restore(
+            &[first.clone(), second.clone()],
+            &[second.id, first.id],
+            Some(first.id),
+        );
+        let tabs = manager.list();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].instance_id, second.id);
+        assert_eq!(tabs[1].instance_id, first.id);
+        assert!(tabs.iter().all(|tab| !tab.loaded));
+        assert_eq!(
+            manager.session_snapshot(),
+            (vec![second.id, first.id], Some(first.id))
+        );
+    }
+
+    #[test]
+    fn restore_skips_ids_without_an_instance() {
+        let first = instance("one", InstanceKind::Other, "http://127.0.0.1:1");
+        let missing = id();
+        let manager = TabManager::restore(std::slice::from_ref(&first), &[missing, first.id], None);
+        let tabs = manager.list();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].instance_id, first.id);
+        assert!(tabs[0].active);
     }
 }

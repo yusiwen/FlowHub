@@ -1,7 +1,8 @@
 use crate::auth;
 use crate::health::{self, HealthReport};
 use crate::model::{AuthMode, Instance, InstanceInput};
-use crate::state::{lock_tabs, AppState};
+use crate::session::SessionView;
+use crate::state::{lock_session, lock_tabs, AppState};
 use crate::store::lock;
 use crate::tabs::{StageBounds, TabInfo};
 use serde::Serialize;
@@ -42,6 +43,17 @@ fn broadcast_tabs(app: &AppHandle, state: &AppState) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Persist the current tab order and active tab. The sidebar flag comes from the
+/// session store because the shell owns that toggle.
+fn persist_session(state: &AppState) -> Result<(), String> {
+    let (tabs, active) = lock_tabs(state)?.session_snapshot();
+    let mut session = lock_session(state)?;
+    let sidebar = session.sidebar_visible();
+    session
+        .save(sidebar, tabs, active)
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) fn open_instance(
     app: &AppHandle,
     state: &AppState,
@@ -58,6 +70,7 @@ pub(crate) fn open_instance(
     };
     let info = lock_tabs(state)?.open(app, &instance)?;
     broadcast_tabs(app, state)?;
+    persist_session(state)?;
     Ok(info)
 }
 
@@ -66,12 +79,14 @@ pub(crate) fn open_instance(
 pub(crate) fn close_active(app: &AppHandle, state: &AppState) -> Result<bool, String> {
     let closed = lock_tabs(state)?.close_active(app)?;
     broadcast_tabs(app, state)?;
+    persist_session(state)?;
     Ok(closed)
 }
 
 pub(crate) fn cycle_tab(app: &AppHandle, state: &AppState, delta: isize) -> Result<(), String> {
-    lock_tabs(state)?.cycle(delta)?;
-    broadcast_tabs(app, state)
+    lock_tabs(state)?.cycle(app, delta)?;
+    broadcast_tabs(app, state)?;
+    persist_session(state)
 }
 
 pub(crate) fn activate_index(
@@ -79,8 +94,9 @@ pub(crate) fn activate_index(
     state: &AppState,
     index: usize,
 ) -> Result<(), String> {
-    lock_tabs(state)?.activate_index(index)?;
-    broadcast_tabs(app, state)
+    lock_tabs(state)?.activate_index(app, index)?;
+    broadcast_tabs(app, state)?;
+    persist_session(state)
 }
 
 pub(crate) fn reload_active(state: &AppState) -> Result<(), String> {
@@ -120,8 +136,9 @@ pub(crate) fn open_next_instance(
     {
         return open_instance(app, state, instance.id).map(Some);
     }
-    lock_tabs(state)?.cycle(1)?;
+    lock_tabs(state)?.cycle(app, 1)?;
     broadcast_tabs(app, state)?;
+    persist_session(state)?;
     Ok(None)
 }
 
@@ -169,7 +186,8 @@ pub fn remove_instance(id: Uuid, state: State<'_, AppState>, app: AppHandle) -> 
         health.remove(&id);
     }
     broadcast_instances(&app, snapshot(&state)?)?;
-    broadcast_tabs(&app, &state)
+    broadcast_tabs(&app, &state)?;
+    persist_session(&state)
 }
 
 #[tauri::command]
@@ -199,13 +217,15 @@ pub fn open_tab(id: Uuid, state: State<'_, AppState>, app: AppHandle) -> Result<
 #[tauri::command]
 pub fn close_tab(id: Uuid, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
     lock_tabs(&state)?.close(id)?;
-    broadcast_tabs(&app, &state)
+    broadcast_tabs(&app, &state)?;
+    persist_session(&state)
 }
 
 #[tauri::command]
 pub fn activate_tab(id: Uuid, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
-    lock_tabs(&state)?.activate(id)?;
-    broadcast_tabs(&app, &state)
+    lock_tabs(&state)?.activate(&app, id)?;
+    broadcast_tabs(&app, &state)?;
+    persist_session(&state)
 }
 
 #[tauri::command]
@@ -231,6 +251,20 @@ pub fn set_content_visible(
     } else {
         lock_tabs(&state)?.hide_content(&app)
     }
+}
+
+#[tauri::command]
+pub fn load_session(state: State<'_, AppState>) -> Result<SessionView, String> {
+    Ok(lock_session(&state)?.view())
+}
+
+#[tauri::command]
+pub fn set_sidebar_visible(visible: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let (tabs, active) = lock_tabs(&state)?.session_snapshot();
+    let mut session = lock_session(&state)?;
+    session
+        .save(visible, tabs, active)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

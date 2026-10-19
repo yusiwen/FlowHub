@@ -10,6 +10,7 @@ import type {
   AuthOkEvent,
   AuthFailedEvent,
   HealthReport,
+  SessionView,
 } from "./types";
 
 export const listInstances = (): Promise<Instance[]> =>
@@ -107,3 +108,9 @@ export const onHealthChanged = (
   listen<HealthReport>("health://changed", (event) =>
     handler(event.payload),
   );
+
+export const loadSession = (): Promise<SessionView> =>
+  invoke<SessionView>("load_session");
+
+export const setSidebarVisible = (visible: boolean): Promise<void> =>
+  invoke<void>("set_sidebar_visible", { visible });

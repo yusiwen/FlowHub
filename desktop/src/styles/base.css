@@ -248,8 +248,13 @@ body {
   background: var(--bg);
 }
 
-.tab.loading .tab-label {
+.tab.loading .tab-label,
+.tab.placeholder .tab-label {
   opacity: 0.6;
+}
+
+.tab.placeholder .tab-label {
+  font-style: italic;
 }
 
 .tab-label {
