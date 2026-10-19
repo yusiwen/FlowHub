@@ -25,6 +25,17 @@ pub struct StageBounds {
     pub height: f64,
 }
 
+/// Distance from the window content view's top to the top of the shell's CSS
+/// viewport.
+///
+/// WebKit insets a full-size window's layout viewport below the title bar, so the
+/// shell measures its stage 32 points lower than the content view's origin. A
+/// child webview is positioned from that origin; without this offset its page
+/// covers the bottom of the tab bar. A host without the inset returns zero.
+pub fn viewport_top_inset(content_height: f64, viewport_height: f64) -> f64 {
+    (content_height - viewport_height).max(0.0)
+}
+
 impl StageBounds {
     pub fn new(x: f64, y: f64, width: f64, height: f64) -> Result<Self, String> {
         if !x.is_finite() || !y.is_finite() || !width.is_finite() || !height.is_finite() {
@@ -672,6 +683,13 @@ mod tests {
         order.open(first);
         assert_eq!(order.activate_index(0), Some(first));
         assert_eq!(order.activate_index(1), None);
+    }
+
+    #[test]
+    fn viewport_top_inset_is_the_title_bar_gap_and_never_negative() {
+        assert_eq!(viewport_top_inset(800.0, 768.0), 32.0);
+        assert_eq!(viewport_top_inset(800.0, 800.0), 0.0);
+        assert_eq!(viewport_top_inset(800.0, 820.0), 0.0);
     }
 
     #[test]

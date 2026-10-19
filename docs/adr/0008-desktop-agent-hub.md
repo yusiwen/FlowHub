@@ -72,6 +72,10 @@ webview. Other platforms are out of scope for now.
 - A native child webview always paints above the shell webview. Any UI that must
   cover the page (login panel, confirmation) either hides the page first or is a
   separate window. The tab bar and sidebar live outside the page rectangle.
+- The stage rectangle is in window content-view coordinates, not the shell's CSS
+  viewport: WebKit insets the shell below the title bar, so Rust adds the
+  difference between the shell height and `window.innerHeight` to the page's
+  top. Removing that offset makes each tab cover the tab bar.
 - The app is not part of the Go binary or its release artifacts. The only shared
   contract is the repository and the documentation.
 - M2 polish (downloads, popups, tab hibernation, packaging) is tracked as

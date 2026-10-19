@@ -4,7 +4,7 @@ use crate::model::{AuthMode, Instance, InstanceInput};
 use crate::session::SessionView;
 use crate::state::{lock_session, lock_tabs, AppState};
 use crate::store::lock;
-use crate::tabs::{StageBounds, TabInfo};
+use crate::tabs::{viewport_top_inset, StageBounds, TabInfo};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -234,9 +234,36 @@ pub fn set_stage_bounds(
     y: f64,
     width: f64,
     height: f64,
+    viewport_height: f64,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<(), String> {
-    let bounds = StageBounds::new(x, y, width, height)?;
+    if !viewport_height.is_finite() || viewport_height <= 0.0 {
+        return Err("viewport height must be a positive finite number".to_string());
+    }
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "main window is missing".to_string())?;
+    let shell = app
+        .get_webview("shell")
+        .ok_or_else(|| "shell webview is missing".to_string())?;
+    let scale = window
+        .scale_factor()
+        .map_err(|error| format!("window scale factor: {error}"))?;
+    let content_height = shell
+        .size()
+        .map_err(|error| format!("shell webview size: {error}"))?
+        .to_logical::<f64>(scale)
+        .height;
+    if !content_height.is_finite() || content_height <= 0.0 {
+        return Err("shell webview height is not measurable".to_string());
+    }
+    let bounds = StageBounds::new(
+        x,
+        y + viewport_top_inset(content_height, viewport_height),
+        width,
+        height,
+    )?;
     lock_tabs(&state)?.set_bounds(bounds)
 }
 
