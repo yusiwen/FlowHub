@@ -29,6 +29,7 @@ make desktop-build     # release bundle (after the packaging slice lands)
 | `src/` | shell UI, running only in the local webview |
 | `src-tauri/src/main.rs` | window and webview wiring |
 | `src-tauri/src/tabs.rs` | tab manager: one child webview per instance, stage bounds, activate/close |
+| `src-tauri/src/auth.rs` | dsh launch-token parsing, the token URL, and the authority-hashed cookie name |
 | `src-tauri/src/menu.rs` | macOS menu, accelerators, and the window-close lifecycle |
 | `src-tauri/capabilities/shell.json` | IPC grant for the `shell` webview only |
 | `src-tauri/tauri.conf.json` | Tauri configuration |
@@ -53,6 +54,18 @@ keyboard events before the shell:
 - `Cmd+1..9` activate a tab by position; `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle
 - `Cmd+Shift+O` open the active page in the system browser
 - `Cmd+Shift+W` close the window; the Edit menu provides the standard clipboard items
+
+## dsh sign-in
+
+A `dsh-web` tab opens its base URL. If the `dsh-auth-<authority hash>` cookie is
+missing, the page is hidden and the shell asks for the URL printed by `dsh web`
+(or the bare token). The app builds `GET /?token=...`, waits for the `303` to
+drop the token, and confirms the cookie is present. A rejected token keeps the
+panel open with an error and lets the user retry.
+
+The token is never written to `instances.json` or the logs; only the cookie is a
+session. The cookie name hashes `host:port`, so cookies for two dsh ports on the
+same host cannot be confused.
 
 ## Registry
 

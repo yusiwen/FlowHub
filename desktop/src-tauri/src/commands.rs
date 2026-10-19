@@ -1,10 +1,25 @@
-use crate::model::{Instance, InstanceInput};
+use crate::auth;
+use crate::model::{AuthMode, Instance, InstanceInput};
 use crate::state::{lock_tabs, AppState};
 use crate::store::lock;
 use crate::tabs::{StageBounds, TabInfo};
+use serde::Serialize;
 use std::collections::HashSet;
-use tauri::{AppHandle, Emitter, State};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager, State};
+use url::Url;
 use uuid::Uuid;
+
+#[derive(Clone, Serialize)]
+struct AuthOkEvent {
+    instance_id: Uuid,
+}
+
+#[derive(Clone, Serialize)]
+struct AuthFailedEvent {
+    instance_id: Uuid,
+    reason: String,
+}
 
 fn snapshot(state: &AppState) -> Result<Vec<Instance>, String> {
     let guard = lock(&state.store)?;
@@ -210,4 +225,63 @@ pub fn reorder_instances(
         .reorder(&ids)
         .map_err(|error| error.to_string())?;
     broadcast_instances(&app, snapshot(&state)?)
+}
+
+#[tauri::command]
+pub fn submit_token(
+    id: Uuid,
+    input: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let instance = {
+        let guard = lock(&state.store)?;
+        guard
+            .instances()
+            .iter()
+            .find(|instance| instance.id == id)
+            .cloned()
+            .ok_or_else(|| format!("instance not found: {id}"))?
+    };
+    if instance.auth != AuthMode::DshToken {
+        return Err("this instance does not use a dsh launch token".to_string());
+    }
+    let base =
+        Url::parse(&instance.url).map_err(|error| format!("invalid instance url: {error}"))?;
+    let token = auth::parse_token_input(&input, &base)?;
+    let target = auth::token_url(&base, &token);
+    lock_tabs(&state)?.begin_auth(id, target)?;
+
+    let app_handle = app.clone();
+    std::thread::spawn(move || poll_auth(app_handle, id));
+    Ok(())
+}
+
+fn poll_auth(app: AppHandle, id: Uuid) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        let state = app.state::<AppState>();
+        let status = lock_tabs(&state).ok().and_then(|tabs| tabs.auth_status(id));
+        if let Some((has_token, has_cookie)) = status {
+            if !has_token && has_cookie {
+                if let Ok(mut tabs) = lock_tabs(&state) {
+                    let _ = tabs.complete_auth(id);
+                }
+                let _ = app.emit("auth://ok", AuthOkEvent { instance_id: id });
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = app.emit(
+                "auth://failed",
+                AuthFailedEvent {
+                    instance_id: id,
+                    reason: "the token was not accepted; paste the URL printed by dsh web again"
+                        .to_string(),
+                },
+            );
+            return;
+        }
+    }
 }

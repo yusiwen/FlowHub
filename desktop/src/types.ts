@@ -37,6 +37,7 @@ export interface TabInfo {
   title: string;
   url: string;
   loading: boolean;
+  auth_required: boolean;
   active: boolean;
 }
 
@@ -49,4 +50,18 @@ export interface TabStateEvent {
 export interface TabTitleEvent {
   instance_id: string;
   title: string;
+}
+
+export interface AuthRequiredEvent {
+  instance_id: string;
+  instance_name: string;
+}
+
+export interface AuthOkEvent {
+  instance_id: string;
+}
+
+export interface AuthFailedEvent {
+  instance_id: string;
+  reason: string;
 }

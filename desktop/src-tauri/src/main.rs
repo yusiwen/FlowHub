@@ -1,6 +1,7 @@
 // A plain window hosts two kinds of webview: the local shell (sidebar and tab
 // bar) and one remote child webview per instance. The shell is the only webview
 // in a capability; remote pages must never reach the IPC layer.
+mod auth;
 mod commands;
 mod menu;
 mod model;
@@ -46,6 +47,7 @@ fn main() {
             commands::activate_tab,
             commands::set_stage_bounds,
             commands::set_content_visible,
+            commands::submit_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Agent Hub");
