@@ -1,14 +1,28 @@
 :root {
   color-scheme: light dark;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #f5f5f7;
-  color: #1d1d1f;
+  --bg: #f2f2f4;
+  --panel: #ffffff;
+  --text: #1d1d1f;
+  --muted: #6e6e73;
+  --border: rgba(0, 0, 0, 0.11);
+  --accent: #0a84ff;
+  --danger: #d70015;
+  --badge: rgba(10, 132, 255, 0.12);
+  --badge-text: #0066cc;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    background: #1c1c1e;
-    color: #f5f5f7;
+    --bg: #1c1c1e;
+    --panel: #242426;
+    --text: #f5f5f7;
+    --muted: #98989d;
+    --border: rgba(255, 255, 255, 0.14);
+    --accent: #0a84ff;
+    --danger: #ff453a;
+    --badge: rgba(10, 132, 255, 0.22);
+    --badge-text: #64b5ff;
   }
 }
 
@@ -19,20 +33,286 @@ body,
   margin: 0;
 }
 
-.shell {
-  display: grid;
-  place-content: center;
-  height: 100%;
-  text-align: center;
+body {
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
 }
 
-.shell h1 {
+.layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  height: 100%;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  padding: 16px 12px;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sidebar-header h1 {
   margin: 0;
-  font-size: 2rem;
+  font-size: 15px;
   font-weight: 600;
 }
 
-.subtitle {
-  margin: 0.5rem 0 0;
-  opacity: 0.65;
+.sidebar-empty {
+  margin: 8px 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.instance-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  margin: 0;
+  padding: 0 2px 8px;
+  overflow: auto;
+  list-style: none;
+}
+
+.instance {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.instance-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.instance-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.instance-name {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--badge);
+  color: var(--badge-text);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.instance-url {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.instance-group {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.instance-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.icon-button,
+.primary-button,
+.ghost-button,
+.danger-button {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.icon-button {
+  min-width: 24px;
+  height: 22px;
+  padding: 0 6px;
+}
+
+.icon-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.primary-button {
+  padding: 5px 12px;
+  border-color: transparent;
+  background: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.ghost-button {
+  padding: 5px 12px;
+}
+
+.danger-button {
+  padding: 5px 12px;
+  border-color: transparent;
+  background: var(--danger);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.stage {
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  padding: 32px;
+}
+
+.stage-empty {
+  max-width: 420px;
+  color: var(--muted);
+  text-align: center;
+  line-height: 1.55;
+}
+
+.stage-empty h2 {
+  margin: 0 0 6px;
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.stage-empty p {
+  margin: 0;
+  font-size: 13px;
+}
+
+.dialog {
+  width: min(460px, calc(100vw - 48px));
+  max-height: calc(100vh - 64px);
+  padding: 0;
+  overflow: auto;
+  border: none;
+  border-radius: 14px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+}
+
+.dialog::backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+}
+
+.form h2 {
+  margin: 0 0 2px;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.optional {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.form input,
+.form select,
+.form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.form textarea {
+  resize: vertical;
+}
+
+.hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.form-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.dialog-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.error {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  max-width: 420px;
+  margin: 0;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: var(--danger);
+  color: #ffffff;
+  font-size: 12px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
 }

@@ -31,6 +31,13 @@ make desktop-build     # release bundle (after the packaging slice lands)
 | `src-tauri/capabilities/shell.json` | IPC grant for the `shell` webview only |
 | `src-tauri/tauri.conf.json` | Tauri configuration |
 
+## Registry
+
+The sidebar is backed by `instances.json` in the app config directory
+(`~/Library/Application Support/dev.flowhub.agenthub/` on macOS). The file is
+versioned, written atomically with mode `0600`, and holds no secret: a dsh launch
+token is never persisted, only exchanged for a cookie in the webview.
+
 ## Security invariants
 
 - Only the `shell` webview is named in a capability; a remote instance page has
