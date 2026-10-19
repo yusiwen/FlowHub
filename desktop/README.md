@@ -22,6 +22,10 @@ make desktop-check     # tsc --noEmit, cargo fmt, clippy, cargo test
 make desktop-build     # release bundle (after the packaging slice lands)
 ```
 
+The same checks run in `.github/workflows/desktop.yml` on an arm64 macOS runner
+for `desktop/**` changes. The workflow is path-filtered, so it is not a required
+check for a Go-only pull request.
+
 ## Layout
 
 | Path | Responsibility |
