@@ -51,7 +51,15 @@ export const setStageBounds = (
   y: number,
   width: number,
   height: number,
-): Promise<void> => invoke<void>("set_stage_bounds", { x, y, width, height });
+  viewportHeight: number,
+): Promise<void> =>
+  invoke<void>("set_stage_bounds", {
+    x,
+    y,
+    width,
+    height,
+    viewportHeight,
+  });
 
 export const setContentVisible = (visible: boolean): Promise<void> =>
   invoke<void>("set_content_visible", { visible });

@@ -224,11 +224,21 @@ async function refreshTabs(): Promise<void> {
 
 async function syncStageBounds(): Promise<void> {
   const rect = stage.getBoundingClientRect();
-  const key = `${rect.x}:${rect.y}:${rect.width}:${rect.height}`;
+  // The shell viewport can be shorter than the window content view: WebKit
+  // insets it below the title bar. Rust needs the viewport height to translate
+  // the stage into content-view coordinates.
+  const viewportHeight = window.innerHeight;
+  const key = `${rect.x}:${rect.y}:${rect.width}:${rect.height}:${viewportHeight}`;
   if (key === stageKey) return;
   stageKey = key;
   try {
-    await setStageBounds(rect.x, rect.y, rect.width, rect.height);
+    await setStageBounds(
+      rect.x,
+      rect.y,
+      rect.width,
+      rect.height,
+      viewportHeight,
+    );
   } catch (error) {
     stageKey = "";
     throw error;

@@ -48,6 +48,12 @@ instead of destroying it, so scroll and input state survive. The shell measures
 the `#stage` rectangle and Rust applies it to every content webview. A content
 webview matches no capability, so the page has no Tauri IPC.
 
+The window's content view spans the full window, while WebKit insets the shell's
+CSS viewport below the title bar. The shell therefore also reports
+`window.innerHeight`; Rust adds `shell height - viewport height` to the stage's
+`y` before positioning a child webview. Without that inset the page starts 32
+points too high and covers the bottom of the tab bar.
+
 ## Shortcuts
 
 The macOS menu owns the accelerators because a focused content webview receives
