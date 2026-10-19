@@ -5,7 +5,8 @@
 //! owns the sidebar and tab bar; Rust owns the stage rectangle and applies it to
 //! every child webview.
 
-use crate::model::Instance;
+use crate::auth;
+use crate::model::{AuthMode, Instance};
 use serde::Serialize;
 use std::collections::HashMap;
 use tauri::webview::{NewWindowResponse, PageLoadEvent, Webview, WebviewBuilder};
@@ -48,7 +49,14 @@ pub struct TabInfo {
     pub title: String,
     pub url: String,
     pub loading: bool,
+    pub auth_required: bool,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthRequiredEvent {
+    instance_id: Uuid,
+    instance_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +161,7 @@ struct Tab {
     title: String,
     url: String,
     loading: bool,
+    auth_required: bool,
     webview: Webview,
 }
 
@@ -185,6 +194,7 @@ impl TabManager {
             .ok_or_else(|| "main window is missing".to_string())?;
         let url =
             Url::parse(&instance.url).map_err(|error| format!("invalid instance url: {error}"))?;
+        let cookie_url = url.clone();
         let instance_id = instance.id;
         let label = tab_label(instance_id);
 
@@ -215,6 +225,17 @@ impl TabManager {
             )
             .map_err(|error| format!("create tab webview: {error}"))?;
 
+        let expected_cookie = auth::cookie_name(&cookie_url);
+        let auth_required = instance.auth == AuthMode::DshToken
+            && !webview
+                .cookies()
+                .map(|cookies| {
+                    cookies
+                        .iter()
+                        .any(|cookie| cookie.name() == expected_cookie)
+                })
+                .unwrap_or(false);
+
         self.tabs.insert(
             instance.id,
             Tab {
@@ -222,11 +243,21 @@ impl TabManager {
                 title: instance.name.clone(),
                 url: instance.url.clone(),
                 loading: false,
+                auth_required,
                 webview,
             },
         );
         self.order.open(instance.id);
         self.apply_visibility()?;
+        if auth_required {
+            let _ = app.emit(
+                "auth://required",
+                AuthRequiredEvent {
+                    instance_id,
+                    instance_name: instance.name.clone(),
+                },
+            );
+        }
         self.info(instance.id).ok_or("tab disappeared".to_string())
     }
 
@@ -251,6 +282,39 @@ impl TabManager {
         if !self.order.activate(id) {
             return Err("no such tab".to_string());
         }
+        self.apply_visibility()
+    }
+
+    pub fn begin_auth(&mut self, id: Uuid, target: Url) -> Result<(), String> {
+        let tab = self.tabs.get_mut(&id).ok_or("no such tab")?;
+        tab.auth_required = true;
+        tab.webview
+            .navigate(target)
+            .map_err(|error| format!("navigate to the token URL: {error}"))?;
+        tab.webview
+            .hide()
+            .map_err(|error| format!("hide tab during sign-in: {error}"))
+    }
+
+    /// `(url still carries a token, dsh cookie is present)`. The poll loop needs
+    /// both: a successful exchange removes the token and sets the cookie.
+    pub fn auth_status(&self, id: Uuid) -> Option<(bool, bool)> {
+        let tab = self.tabs.get(&id)?;
+        let url = tab.webview.url().ok()?;
+        let has_token = url.query_pairs().any(|(key, _)| key == "token");
+        let expected = auth::cookie_name(&Url::parse(&tab.url).ok()?);
+        let has_cookie = tab
+            .webview
+            .cookies()
+            .ok()
+            .map(|cookies| cookies.iter().any(|cookie| cookie.name() == expected))
+            .unwrap_or(false);
+        Some((has_token, has_cookie))
+    }
+
+    pub fn complete_auth(&mut self, id: Uuid) -> Result<(), String> {
+        let tab = self.tabs.get_mut(&id).ok_or("no such tab")?;
+        tab.auth_required = false;
         self.apply_visibility()
     }
 
@@ -350,6 +414,7 @@ impl TabManager {
                     title: tab.title.clone(),
                     url: tab.url.clone(),
                     loading: tab.loading,
+                    auth_required: tab.auth_required,
                     active: Some(*id) == active,
                 })
             })
@@ -364,6 +429,7 @@ impl TabManager {
             title: tab.title.clone(),
             url: tab.url.clone(),
             loading: tab.loading,
+            auth_required: tab.auth_required,
             active: Some(id) == active,
         })
     }
@@ -386,7 +452,7 @@ impl TabManager {
     fn apply_visibility(&self) -> Result<(), String> {
         let active = self.order.active();
         for (id, tab) in &self.tabs {
-            if Some(*id) == active {
+            if Some(*id) == active && !tab.auth_required {
                 tab.webview
                     .show()
                     .map_err(|error| format!("show tab webview: {error}"))?;

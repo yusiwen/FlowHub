@@ -6,6 +6,9 @@ import type {
   TabInfo,
   TabStateEvent,
   TabTitleEvent,
+  AuthRequiredEvent,
+  AuthOkEvent,
+  AuthFailedEvent,
 } from "./types";
 
 export const listInstances = (): Promise<Instance[]> =>
@@ -68,3 +71,25 @@ export const onTabTitle = (
 
 export const onToggleSidebar = (handler: () => void): Promise<UnlistenFn> =>
   listen("menu://toggle-sidebar", () => handler());
+
+export const submitToken = (id: string, input: string): Promise<void> =>
+  invoke<void>("submit_token", { id, input });
+
+export const onAuthRequired = (
+  handler: (event: AuthRequiredEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<AuthRequiredEvent>("auth://required", (event) =>
+    handler(event.payload),
+  );
+
+export const onAuthOk = (
+  handler: (event: AuthOkEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<AuthOkEvent>("auth://ok", (event) => handler(event.payload));
+
+export const onAuthFailed = (
+  handler: (event: AuthFailedEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<AuthFailedEvent>("auth://failed", (event) =>
+    handler(event.payload),
+  );

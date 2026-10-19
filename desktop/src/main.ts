@@ -7,6 +7,9 @@ import {
   closeTab,
   listInstances,
   listTabs,
+  onAuthFailed,
+  onAuthOk,
+  onAuthRequired,
   onInstancesChanged,
   onTabState,
   onTabTitle,
@@ -17,6 +20,7 @@ import {
   reorderInstances,
   setContentVisible,
   setStageBounds,
+  submitToken,
   updateInstance,
 } from "./ipc";
 import type { Instance, TabInfo } from "./types";
@@ -37,6 +41,18 @@ app.innerHTML = `
           <h2>Agent Hub</h2>
           <p>Pick an instance on the left to open its page in a tab.</p>
         </div>
+        <div class="auth-panel" id="auth-panel" hidden>
+          <form class="auth-card" id="auth-form">
+            <h2>Sign in to <span id="auth-name"></span></h2>
+            <p class="auth-hint">Paste the URL printed by the <code>dsh web</code> command. The token is exchanged for a cookie and is not stored.</p>
+            <input id="auth-input" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:3080/?token=..." />
+            <p class="form-error" id="auth-error" role="alert" hidden></p>
+            <div class="dialog-actions">
+              <button type="button" class="ghost-button" id="auth-cancel">Cancel</button>
+              <button type="submit" class="primary-button" id="auth-submit">Sign in</button>
+            </div>
+          </form>
+        </div>
       </div>
     </section>
   </div>
@@ -49,10 +65,18 @@ const stage = document.querySelector<HTMLElement>("#stage")!;
 const layout = document.querySelector<HTMLElement>(".layout")!;
 const stageEmpty = document.querySelector<HTMLElement>("#stage-empty")!;
 const errorBar = document.querySelector<HTMLElement>("#error")!;
+const authPanel = document.querySelector<HTMLElement>("#auth-panel")!;
+const authForm = document.querySelector<HTMLFormElement>("#auth-form")!;
+const authName = document.querySelector<HTMLElement>("#auth-name")!;
+const authInput = document.querySelector<HTMLInputElement>("#auth-input")!;
+const authError = document.querySelector<HTMLElement>("#auth-error")!;
+const authSubmit = document.querySelector<HTMLButtonElement>("#auth-submit")!;
+const authCancel = document.querySelector<HTMLButtonElement>("#auth-cancel")!;
 
 let instances: Instance[] = [];
 let tabs: TabInfo[] = [];
 let stageKey = "";
+let authInstanceId: string | null = null;
 
 function showError(error: unknown): void {
   errorBar.textContent = error instanceof Error ? error.message : String(error);
@@ -61,6 +85,21 @@ function showError(error: unknown): void {
 
 function clearError(): void {
   errorBar.hidden = true;
+}
+
+function showAuth(instanceId: string, name: string): void {
+  authInstanceId = instanceId;
+  authName.textContent = name;
+  authInput.value = "";
+  authError.hidden = true;
+  authSubmit.disabled = false;
+  authPanel.hidden = false;
+  requestAnimationFrame(() => authInput.focus());
+}
+
+function hideAuth(): void {
+  authPanel.hidden = true;
+  authInstanceId = null;
 }
 
 function renderInstances(): void {
@@ -110,6 +149,7 @@ function renderTabs(): void {
     label.title = tab.url;
     label.textContent = tab.title.trim() === "" ? tab.instance_name : tab.title;
     label.addEventListener("click", () => {
+      if (tab.auth_required) showAuth(tab.instance_id, tab.instance_name);
       void activate(tab);
     });
 
@@ -123,7 +163,15 @@ function renderTabs(): void {
       void closeOne(tab);
     });
 
-    item.append(label, close);
+    item.append(label);
+    if (tab.auth_required) {
+      const lock = document.createElement("span");
+      lock.className = "tab-lock";
+      lock.textContent = "sign in";
+      lock.title = "Sign in required";
+      item.append(lock);
+    }
+    item.append(close);
     tabsEl.append(item);
   }
 }
@@ -143,6 +191,17 @@ function applyTabs(next: TabInfo[]): void {
     // loading flag arrive as events and must survive a list refresh.
     return { ...tab, title: old.title, url: old.url, loading: old.loading };
   });
+  const active = tabs.find((tab) => tab.active);
+  if (
+    authInstanceId !== null &&
+    active !== undefined &&
+    (active.instance_id !== authInstanceId || !active.auth_required)
+  ) {
+    hideAuth();
+  }
+  if (authInstanceId !== null && !tabs.some((tab) => tab.instance_id === authInstanceId)) {
+    hideAuth();
+  }
   renderTabs();
 }
 
@@ -202,6 +261,7 @@ async function closeOne(tab: TabInfo): Promise<void> {
 }
 
 async function add(): Promise<void> {
+  hideAuth();
   const input = await withHiddenContent(() => openInstanceForm());
   if (input === null) return;
   try {
@@ -214,6 +274,7 @@ async function add(): Promise<void> {
 }
 
 async function edit(instance: Instance): Promise<void> {
+  hideAuth();
   const input = await withHiddenContent(() => openInstanceForm(instance));
   if (input === null) return;
   try {
@@ -226,6 +287,7 @@ async function edit(instance: Instance): Promise<void> {
 }
 
 async function remove(instance: Instance): Promise<void> {
+  hideAuth();
   const confirmed = await withHiddenContent(() =>
     confirmRemove(instance.name),
   );
@@ -286,6 +348,45 @@ void onInstancesChanged((next) => {
 void onTabsChanged((next) => {
   applyTabs(next);
 });
+
+void onAuthRequired((event) => {
+  showAuth(event.instance_id, event.instance_name);
+  void refreshTabs();
+});
+
+void onAuthOk(() => {
+  hideAuth();
+  void refreshTabs();
+});
+
+void onAuthFailed((event) => {
+  if (authInstanceId !== event.instance_id) return;
+  authError.textContent = event.reason;
+  authError.hidden = false;
+  authSubmit.disabled = false;
+});
+
+authForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const id = authInstanceId;
+  if (id === null) return;
+  const input = authInput.value.trim();
+  if (input === "") {
+    authError.textContent = "Paste the URL printed by dsh web.";
+    authError.hidden = false;
+    return;
+  }
+  authError.hidden = true;
+  authSubmit.disabled = true;
+  submitToken(id, input).catch((error) => {
+    authError.textContent =
+      error instanceof Error ? error.message : String(error);
+    authError.hidden = false;
+    authSubmit.disabled = false;
+  });
+});
+
+authCancel.addEventListener("click", hideAuth);
 
 void onTabTitle((event) => {
   const tab = tabs.find(
