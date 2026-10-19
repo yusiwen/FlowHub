@@ -6,6 +6,7 @@ mod commands;
 mod health;
 mod menu;
 mod model;
+mod session;
 mod state;
 mod store;
 mod tabs;
@@ -59,6 +60,8 @@ fn main() {
             commands::submit_token,
             commands::list_health,
             commands::probe_all,
+            commands::load_session,
+            commands::set_sidebar_visible,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Agent Hub");

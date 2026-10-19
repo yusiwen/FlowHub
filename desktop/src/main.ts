@@ -7,6 +7,7 @@ import {
   closeTab,
   listHealth,
   listInstances,
+  loadSession,
   listTabs,
   onAuthFailed,
   onAuthOk,
@@ -22,6 +23,7 @@ import {
   removeInstance,
   reorderInstances,
   setContentVisible,
+  setSidebarVisible,
   setStageBounds,
   submitToken,
   updateInstance,
@@ -144,7 +146,7 @@ function renderTabs(): void {
     const item = document.createElement("div");
     item.className = `tab${tab.active ? " active" : ""}${
       tab.loading ? " loading" : ""
-    }`;
+    }${tab.loaded ? "" : " placeholder"}`;
     item.dataset.id = tab.instance_id;
 
     const label = document.createElement("button");
@@ -253,7 +255,7 @@ async function open(instance: Instance): Promise<void> {
 }
 
 async function activate(tab: TabInfo): Promise<void> {
-  if (tab.active) return;
+  if (tab.active && tab.loaded) return;
   try {
     await activateTab(tab.instance_id);
     await refreshTabs();
@@ -339,7 +341,8 @@ window.addEventListener("resize", () => {
 });
 
 function toggleSidebar(): void {
-  layout.classList.toggle("sidebar-hidden");
+  const hidden = layout.classList.toggle("sidebar-hidden");
+  void setSidebarVisible(!hidden).catch(showError);
   requestAnimationFrame(() => {
     void syncStageBounds().catch(showError);
   });
@@ -428,10 +431,20 @@ void onTabState((event) => {
 
 async function init(): Promise<void> {
   try {
+    const session = await loadSession();
+    if (!session.sidebar_visible) {
+      layout.classList.add("sidebar-hidden");
+    }
     await refreshInstances();
     applyHealth(await listHealth());
     await refreshTabs();
     await syncStageBounds();
+
+    const active = tabs.find((tab) => tab.active);
+    if (active !== undefined && !active.loaded) {
+      await activateTab(active.instance_id);
+      await refreshTabs();
+    }
   } catch (error) {
     showError(error);
   }
