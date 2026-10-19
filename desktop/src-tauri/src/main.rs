@@ -3,6 +3,7 @@
 // in a capability; remote pages must never reach the IPC layer.
 mod auth;
 mod commands;
+mod health;
 mod menu;
 mod model;
 mod state;
@@ -19,6 +20,14 @@ fn main() {
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             app.manage(state::AppState::load(&config_dir)?);
+
+            let probe_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    health::probe_all(&probe_app).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            });
 
             let window = WindowBuilder::new(app, "main")
                 .title("Agent Hub")
@@ -48,6 +57,8 @@ fn main() {
             commands::set_stage_bounds,
             commands::set_content_visible,
             commands::submit_token,
+            commands::list_health,
+            commands::probe_all,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Agent Hub");

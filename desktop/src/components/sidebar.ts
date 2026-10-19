@@ -1,4 +1,4 @@
-import type { Instance } from "../types";
+import type { HealthReport, Instance } from "../types";
 import { kindLabel } from "../types";
 
 export interface SidebarActions {
@@ -19,10 +19,24 @@ function button(label: string, action: string, title: string): HTMLButtonElement
   return element;
 }
 
+function statusLabel(status: HealthReport["status"]): string {
+  switch (status) {
+    case "ok":
+      return "reachable";
+    case "auth":
+      return "reachable, sign-in required";
+    case "http":
+      return "reachable, HTTP error";
+    case "unreachable":
+      return "unreachable";
+  }
+}
+
 function row(
   instance: Instance,
   index: number,
   total: number,
+  health: Map<string, HealthReport>,
 ): HTMLLIElement {
   const item = document.createElement("li");
   item.className = "instance";
@@ -44,7 +58,15 @@ function row(
   badge.className = "badge";
   badge.textContent = kindLabel(instance.kind);
 
-  heading.append(name, badge);
+  const report = health.get(instance.id);
+  const dot = document.createElement("span");
+  dot.className = `health-dot ${report?.status ?? "unknown"}`;
+  dot.title =
+    report === undefined
+      ? "Not checked yet"
+      : `${statusLabel(report.status)} · ${report.latency_ms} ms`;
+
+  heading.append(dot, name, badge);
 
   const url = document.createElement("span");
   url.className = "instance-url";
@@ -84,6 +106,7 @@ function row(
 export function renderSidebar(
   root: HTMLElement,
   instances: Instance[],
+  health: Map<string, HealthReport>,
   actions: SidebarActions,
 ): void {
   root.replaceChildren();
@@ -119,7 +142,7 @@ export function renderSidebar(
   }
 
   instances.forEach((instance, index) => {
-    list.append(row(instance, index, instances.length));
+    list.append(row(instance, index, instances.length, health));
   });
   root.append(header, list);
 

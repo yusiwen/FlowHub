@@ -5,17 +5,20 @@ import {
   activateTab,
   addInstance,
   closeTab,
+  listHealth,
   listInstances,
   listTabs,
   onAuthFailed,
   onAuthOk,
   onAuthRequired,
+  onHealthChanged,
   onInstancesChanged,
   onTabState,
   onTabTitle,
   onTabsChanged,
   onToggleSidebar,
   openTab,
+  probeAll,
   removeInstance,
   reorderInstances,
   setContentVisible,
@@ -23,7 +26,7 @@ import {
   submitToken,
   updateInstance,
 } from "./ipc";
-import type { Instance, TabInfo } from "./types";
+import type { HealthReport, Instance, TabInfo } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (app === null) throw new Error("shell: missing #app");
@@ -75,6 +78,7 @@ const authCancel = document.querySelector<HTMLButtonElement>("#auth-cancel")!;
 
 let instances: Instance[] = [];
 let tabs: TabInfo[] = [];
+const health = new Map<string, HealthReport>();
 let stageKey = "";
 let authInstanceId: string | null = null;
 
@@ -103,7 +107,7 @@ function hideAuth(): void {
 }
 
 function renderInstances(): void {
-  renderSidebar(sidebar, instances, {
+  renderSidebar(sidebar, instances, health, {
     onAdd: () => {
       void add();
     },
@@ -179,6 +183,13 @@ function renderTabs(): void {
 async function refreshInstances(): Promise<void> {
   instances = await listInstances();
   clearError();
+  renderInstances();
+}
+
+function applyHealth(reports: HealthReport[]): void {
+  for (const report of reports) {
+    health.set(report.instance_id, report);
+  }
   renderInstances();
 }
 
@@ -268,6 +279,7 @@ async function add(): Promise<void> {
     await addInstance(input);
     await refreshInstances();
     await refreshTabs();
+    void probeAll().then(applyHealth).catch(showError);
   } catch (error) {
     showError(error);
   }
@@ -281,6 +293,7 @@ async function edit(instance: Instance): Promise<void> {
     await updateInstance(instance.id, input);
     await refreshInstances();
     await refreshTabs();
+    void probeAll().then(applyHealth).catch(showError);
   } catch (error) {
     showError(error);
   }
@@ -294,6 +307,7 @@ async function remove(instance: Instance): Promise<void> {
   if (!confirmed) return;
   try {
     await removeInstance(instance.id);
+    health.delete(instance.id);
     await refreshInstances();
     await refreshTabs();
   } catch (error) {
@@ -337,6 +351,11 @@ document
 
 void onToggleSidebar(() => {
   toggleSidebar();
+});
+
+void onHealthChanged((report) => {
+  health.set(report.instance_id, report);
+  renderInstances();
 });
 
 void onInstancesChanged((next) => {
@@ -410,11 +429,13 @@ void onTabState((event) => {
 async function init(): Promise<void> {
   try {
     await refreshInstances();
+    applyHealth(await listHealth());
     await refreshTabs();
     await syncStageBounds();
   } catch (error) {
     showError(error);
   }
+  void probeAll().then(applyHealth).catch(showError);
 }
 
 void init();
