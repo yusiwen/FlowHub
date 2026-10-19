@@ -29,6 +29,7 @@ make desktop-build     # release bundle (after the packaging slice lands)
 | `src/` | shell UI, running only in the local webview |
 | `src-tauri/src/main.rs` | window and webview wiring |
 | `src-tauri/src/tabs.rs` | tab manager: one child webview per instance, stage bounds, activate/close |
+| `src-tauri/src/menu.rs` | macOS menu, accelerators, and the window-close lifecycle |
 | `src-tauri/capabilities/shell.json` | IPC grant for the `shell` webview only |
 | `src-tauri/tauri.conf.json` | Tauri configuration |
 
@@ -39,6 +40,19 @@ child WebView labelled `tab-<uuid>`; switching tabs hides the inactive webview
 instead of destroying it, so scroll and input state survive. The shell measures
 the `#stage` rectangle and Rust applies it to every content webview. A content
 webview matches no capability, so the page has no Tauri IPC.
+
+## Shortcuts
+
+The macOS menu owns the accelerators because a focused content webview receives
+keyboard events before the shell:
+
+- `Cmd+T` open the first instance without a tab (or cycle when every instance is open)
+- `Cmd+W` close the active tab; with no tabs, close the window
+- `Cmd+R` reload the active tab
+- `Cmd+B` toggle the sidebar
+- `Cmd+1..9` activate a tab by position; `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle
+- `Cmd+Shift+O` open the active page in the system browser
+- `Cmd+Shift+W` close the window; the Edit menu provides the standard clipboard items
 
 ## Registry
 

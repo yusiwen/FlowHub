@@ -117,6 +117,31 @@ impl TabOrder {
     pub fn ids(&self) -> &[Uuid] {
         &self.order
     }
+
+    pub fn activate_index(&mut self, index: usize) -> Option<Uuid> {
+        let id = *self.order.get(index)?;
+        self.active = Some(id);
+        Some(id)
+    }
+
+    pub fn cycle(&mut self, delta: isize) -> Option<Uuid> {
+        if self.order.is_empty() {
+            return None;
+        }
+        let current = self
+            .active
+            .and_then(|id| self.order.iter().position(|candidate| *candidate == id))
+            .unwrap_or(0);
+        let len = self.order.len() as isize;
+        let next = (current as isize + delta).rem_euclid(len) as usize;
+        self.active = Some(self.order[next]);
+        self.active
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.active = None;
+    }
 }
 
 fn tab_label(id: Uuid) -> String {
@@ -227,6 +252,64 @@ impl TabManager {
             return Err("no such tab".to_string());
         }
         self.apply_visibility()
+    }
+
+    pub fn activate_index(&mut self, index: usize) -> Result<(), String> {
+        self.order
+            .activate_index(index)
+            .ok_or_else(|| format!("no tab at index {index}"))?;
+        self.apply_visibility()
+    }
+
+    pub fn cycle(&mut self, delta: isize) -> Result<(), String> {
+        self.order
+            .cycle(delta)
+            .ok_or_else(|| "no tabs are open".to_string())?;
+        self.apply_visibility()
+    }
+
+    pub fn reload_active(&self) -> Result<(), String> {
+        let id = self.order.active().ok_or("no active tab")?;
+        self.tabs
+            .get(&id)
+            .ok_or("no active tab")?
+            .webview
+            .reload()
+            .map_err(|error| format!("reload tab: {error}"))
+    }
+
+    pub fn active_url(&self) -> Option<String> {
+        let id = self.order.active()?;
+        let tab = self.tabs.get(&id)?;
+        tab.webview
+            .url()
+            .ok()
+            .map(|url| url.to_string())
+            .or_else(|| Some(tab.url.clone()))
+    }
+
+    /// Close the active tab. Returns false when there was no tab to close, so
+    /// the caller can decide to close the window instead.
+    pub fn close_active(&mut self, app: &AppHandle) -> Result<bool, String> {
+        let Some(id) = self.order.active() else {
+            return Ok(false);
+        };
+        self.close(id)?;
+        if self.order.active().is_none() {
+            if let Some(shell) = app.get_webview("shell") {
+                shell
+                    .set_focus()
+                    .map_err(|error| format!("focus shell webview: {error}"))?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn close_all(&mut self) {
+        for (_, tab) in self.tabs.drain() {
+            let _ = tab.webview.close();
+        }
+        self.order.clear();
     }
 
     pub fn rename(&mut self, id: Uuid, name: &str) {
@@ -383,6 +466,30 @@ mod tests {
         assert!(StageBounds::new(-1.0, 0.0, 100.0, 100.0).is_err());
         assert!(StageBounds::new(0.0, 0.0, 0.0, 100.0).is_err());
         assert!(StageBounds::new(0.0, 0.0, f64::NAN, 100.0).is_err());
+    }
+
+    #[test]
+    fn cycling_wraps_in_both_directions() {
+        let mut order = TabOrder::default();
+        let first = id();
+        let second = id();
+        let third = id();
+        order.open(first);
+        order.open(second);
+        order.open(third);
+        assert_eq!(order.cycle(1), Some(first));
+        assert_eq!(order.cycle(1), Some(second));
+        assert_eq!(order.cycle(-1), Some(first));
+        assert_eq!(order.cycle(-1), Some(third));
+    }
+
+    #[test]
+    fn activating_by_index_rejects_out_of_range() {
+        let mut order = TabOrder::default();
+        let first = id();
+        order.open(first);
+        assert_eq!(order.activate_index(0), Some(first));
+        assert_eq!(order.activate_index(1), None);
     }
 
     #[test]

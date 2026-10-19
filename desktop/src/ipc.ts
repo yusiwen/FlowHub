@@ -65,3 +65,6 @@ export const onTabTitle = (
   handler: (title: TabTitleEvent) => void,
 ): Promise<UnlistenFn> =>
   listen<TabTitleEvent>("tab://title", (event) => handler(event.payload));
+
+export const onToggleSidebar = (handler: () => void): Promise<UnlistenFn> =>
+  listen("menu://toggle-sidebar", () => handler());

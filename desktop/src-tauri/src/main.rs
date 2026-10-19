@@ -2,6 +2,7 @@
 // bar) and one remote child webview per instance. The shell is the only webview
 // in a capability; remote pages must never reach the IPC layer.
 mod commands;
+mod menu;
 mod model;
 mod state;
 mod store;
@@ -13,6 +14,7 @@ use tauri::{LogicalPosition, Manager, WebviewUrl};
 
 fn main() {
     tauri::Builder::default()
+        .on_menu_event(|app, event| menu::handle(app, event.id().as_ref()))
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             app.manage(state::AppState::load(&config_dir)?);
@@ -27,6 +29,8 @@ fn main() {
                 WebviewBuilder::new("shell", WebviewUrl::App("index.html".into())).auto_resize();
 
             window.add_child(shell, LogicalPosition::new(0.0, 0.0), window.inner_size()?)?;
+            menu::install(app)?;
+            menu::watch_window(&window);
 
             Ok(())
         })
