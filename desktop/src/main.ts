@@ -43,7 +43,7 @@ app.innerHTML = `
       </div>
       <div class="stage" id="stage">
         <div class="stage-empty" id="stage-empty">
-          <h2>Agent Hub</h2>
+          <h2>FlowHub</h2>
           <p>Pick an instance on the left to open its page in a tab.</p>
         </div>
         <div class="auth-panel" id="auth-panel" hidden>

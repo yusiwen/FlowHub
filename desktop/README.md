@@ -1,4 +1,4 @@
-# Agent Hub (desktop)
+# FlowHub (desktop)
 
 A macOS-first Tauri app for opening agent UIs (dsh web, opencode, and other
 pages) in one window: a sidebar registry on the left, one native WebView per
@@ -132,9 +132,15 @@ opencode and `other` instances keep the credential-less probe; `200` is green.
 ## Registry
 
 The sidebar is backed by `instances.json` in the app config directory
-(`~/Library/Application Support/dev.flowhub.agenthub/` on macOS). The file is
-versioned, written atomically with mode `0600`, and holds no secret: a dsh launch
-token is never persisted, only exchanged for a cookie in the webview.
+(`~/Library/Application Support/cn.yusiwen.flowhub/` on macOS, named after the
+bundle identifier). The file is versioned, written atomically with mode `0600`,
+and holds no secret: a dsh launch token is never persisted, only exchanged for a
+cookie in the webview.
+
+While the app was called "Agent Hub" it used the `dev.flowhub.agenthub`
+directory. On the first start after the rename, `instances.json` and
+`session.json` are copied from there when the new directory has none; the legacy
+directory is left untouched, so nothing is lost either way.
 
 ## App icon
 
