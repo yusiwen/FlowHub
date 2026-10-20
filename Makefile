@@ -3,6 +3,13 @@ BINDIR=bin
 VERSION=$(shell git --no-pager describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT_SHA=$(shell git --no-pager rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILDTIME=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+# Never trust an inherited GOROOT. Another Go on the host (mise, a /opt/go
+# tarball) exports its own, and cmd/go would then run that tree's compiler
+# against the `go` binary this shell resolves: "compile: version ... does not
+# match go tool version ...". Empty means "derive it from the go binary", so
+# every target below is consistent whichever toolchain PATH points at.
+export GOROOT :=
+
 GOBUILD=CGO_ENABLED=0 go build -trimpath -ldflags '-X "main.Version=$(VERSION)" \
 		-X "main.CommitSHA=$(COMMIT_SHA)" \
 		-X "main.BuildTime=$(BUILDTIME)" \

@@ -47,7 +47,13 @@
           export GOTOOLCHAIN=local
           # Drop any host GOROOT (e.g. /opt/go) so the Nix Go resolves its own
           # stdlib/tools — otherwise the compile tool versions mismatch.
-          unset GOROOT
+          unset GOROOT GOBIN
+          # Unsetting once is not enough on a host where mise manages Go: its
+          # per-prompt hook re-exports GOROOT/GOBIN from the mise toolchain
+          # after this hook ran, so `go` stays the Nix one while GOROOT points
+          # at the other install. Disabling mise's Go (mise's own supported
+          # mechanism) makes each prompt unset those variables instead.
+          export MISE_DISABLE_TOOLS="''${MISE_DISABLE_TOOLS:+$MISE_DISABLE_TOOLS,}go"
           # Shared, persistent module/build caches; respect a pre-set value.
           if [ -z "$GOMODCACHE" ]; then export GOMODCACHE="$HOME/.cache/go-mod"; fi
           if [ -z "$GOCACHE" ]; then export GOCACHE="$HOME/.cache/go-build"; fi
