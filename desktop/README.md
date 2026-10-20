@@ -1,8 +1,8 @@
 # FlowHub (desktop)
 
 A macOS-first Tauri app for opening the pages FlowHub works with in one window: a
-sidebar registry split into view scopes (upstream trackers and agent instances
-today; the hub view follows), one native WebView per page in a tab on the right.
+sidebar registry split into three view scopes (upstream trackers, agent instances,
+and the FlowHub service itself), one tab per page on the right.
 
 The Go service and this app share a repository, not a build: the app lives in
 `desktop/` and has its own Rust and Node toolchain. No cgo, no FFI.
@@ -36,6 +36,7 @@ check for a Go-only pull request.
 | `src-tauri/src/session.rs` | the versioned `session.json`: open tab ids, active tab, sidebar visibility |
 | `src-tauri/src/auth.rs` | dsh launch-token parsing, the token URL, and the authority-hashed cookie name |
 | `src-tauri/src/health.rs` | reachability probes and the `ok` / `auth` / `http` / `unreachable` classes |
+| `src-tauri/src/hub.rs` | read-only `/healthz` client behind the Hub dashboard |
 | `src-tauri/src/menu.rs` | macOS menu, accelerators, and the window-close lifecycle |
 | `src-tauri/capabilities/shell.json` | IPC grant for the `shell` webview only |
 | `src-tauri/icons/icon.svg` | the icon master, and the generated PNG/ICNS/ICO set next to it |
@@ -44,9 +45,10 @@ check for a Go-only pull request.
 
 ## Views
 
-The sidebar has two scopes, switched at its top or with `Cmd+Shift+1/2`:
-`Upstream` for tracker pages and `Instances` for agent pages. A scope is a filter
-over one registry — it does not own a second store.
+The sidebar has three scopes, switched at its top or with `Cmd+Shift+1/2/3`:
+`Upstream` for tracker pages, `Instances` for agent pages, and `Hub` for the FlowHub
+services the app reads. A scope is a filter over one registry — it does not own a
+second store.
 
 The tab strip stays global. Switching a scope activates the page that scope was last
 on and changes only the list when it has none: replacing a page the user is reading
@@ -65,6 +67,25 @@ shared webview store like any other login. The token is never written to the
 registry. The health probe is the credential-less one, so a green dot means
 "reachable" — a login page answers `200` too — not "signed in".
 
+## Hub
+
+A Hub row is the base address of a FlowHub service. Its tab is native shell
+content, not a webview, because the service has no page. The dashboard reads
+`<base>/healthz` (a full `.../healthz` also works) every 5 s while the tab is
+active and shows the version, uptime, address, dispatch queue and per-runtime
+state, the runtime inventory, project mappings, counters and the three log paths.
+A failed read keeps the last snapshot and shows its age; a `200` that is not the
+FlowHub payload is reported as "not a FlowHub service", never as connected.
+
+While a Hub tab is active every content webview is hidden: a native child webview
+always paints above the shell, so the dashboard would otherwise be covered.
+Switching back shows the page again without a reload.
+
+The dashboard is read-only and unauthenticated. It does not call the control API
+and stores no admin token. `/healthz` lives on the webhook listener, which nginx
+never proxies, so a remote hub must expose that listener (or go through a tunnel).
+Logs are the next slice (#77).
+
 ## Tabs
 
 Clicking an instance row opens its page in a tab. Each tab is a separate native
@@ -80,7 +101,8 @@ CSS viewport below the title bar. The shell therefore also reports
 points too high and covers the bottom of the tab bar.
 
 A tab carries the role of its instance, which is what lets the shell move the sidebar
-selector when the tab is activated. A tab label is the page title followed by
+selector when the tab is activated. A Hub tab has no webview: it is loaded as soon as
+the tab exists, and the shell renders the dashboard in the stage instead. A tab label is the page title followed by
 `[<instance name>]`, or just
 `[<instance name>]` before a title arrives. The tab is capped at 230 px and only
 the title ellipsizes, so the instance suffix stays visible and two instances
@@ -93,9 +115,9 @@ The macOS menu owns the accelerators because a focused content webview receives
 keyboard events before the shell:
 
 - `Cmd+T` open the first row of the current view without a tab (or cycle that view's tabs)
-- `Cmd+Shift+1` / `Cmd+Shift+2` switch to Upstream / Instances
+- `Cmd+Shift+1/2/3` switch to Upstream / Instances / Hub
 - `Cmd+W` close the active tab; with no tabs, close the window
-- `Cmd+R` reload the active tab
+- `Cmd+R` reload the active tab, or refetch the Hub dashboard
 - `Cmd+B` toggle the sidebar
 - `Cmd+1..9` activate a tab by position; `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle
 - `Cmd+Shift+O` open the active page in the system browser
@@ -155,7 +177,7 @@ or returned to the shell. The report records only whether a credential was used
 
 YouTrack and `opencode`/`other` instances keep the credential-less probe; `200` is
 green. A YouTrack login page also answers `200`/`302`, so the dot means reachable,
-not signed in.
+not signed in. A `flowhub` row probes `<base>/healthz`; `200` is green.
 
 ## Registry
 
@@ -163,9 +185,10 @@ The sidebar is backed by `instances.json` in the app config directory
 (`~/Library/Application Support/cn.yusiwen.flowhub/` on macOS, named after the
 bundle identifier). The file is versioned, written atomically with mode `0600`,
 and holds no secret: a dsh launch token is never persisted, only exchanged for a
-cookie in the webview. It holds both roles; `kind` decides the view — `youtrack` is
-upstream, `dsh-web`/`opencode`/`other` are downstream — and the registry version
-stays 1 because the role is derived rather than stored.
+cookie in the webview. It holds all three roles; `kind` decides the view —
+`youtrack` is upstream, `flowhub` is the hub, `dsh-web`/`opencode`/`other` are
+downstream — and the registry version stays 1 because the role is derived rather
+than stored.
 
 While the app was called "Agent Hub" it used the `dev.flowhub.agenthub`
 directory. On the first start after the rename, `instances.json` and
@@ -203,5 +226,7 @@ the Dock tile from `icon.icns` — Tauri's codegen reads that list in developmen
   refused in the tab manager.
 - No token or password is written to `instances.json` or the logs; a YouTrack
   sign-in is a webview cookie, not a registry field.
+- The Hub dashboard is read-only: it calls `/healthz` and nothing else, and the app
+  stores no control API token.
 
 See `docs/adr/0008-desktop-agent-hub.md` for the decision record.

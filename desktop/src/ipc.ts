@@ -10,6 +10,7 @@ import type {
   AuthOkEvent,
   AuthFailedEvent,
   HealthReport,
+  HubSnapshot,
   Role,
   SessionView,
 } from "./types";
@@ -118,6 +119,12 @@ export const listHealth = (): Promise<HealthReport[]> =>
 
 export const probeAll = (): Promise<HealthReport[]> =>
   invoke<HealthReport[]>("probe_all");
+
+export const hubSnapshot = (id: string): Promise<HubSnapshot> =>
+  invoke<HubSnapshot>("hub_snapshot", { id });
+
+export const onHubReload = (handler: () => void): Promise<UnlistenFn> =>
+  listen("hub://reload", () => handler());
 
 export const onHealthChanged = (
   handler: (report: HealthReport) => void,

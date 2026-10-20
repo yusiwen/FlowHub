@@ -11,20 +11,26 @@ export interface SidebarActions {
   onScope: (scope: Role) => void;
 }
 
-const SCOPES: ReadonlyArray<{ value: Role; label: string }> = [
-  { value: "upstream", label: "Upstream" },
-  { value: "downstream", label: "Instances" },
+const SCOPES: ReadonlyArray<{ value: Role; label: string; shortcut: number }> = [
+  { value: "upstream", label: "Upstream", shortcut: 1 },
+  { value: "downstream", label: "Instances", shortcut: 2 },
+  { value: "hub", label: "Hub", shortcut: 3 },
 ];
 
 function countLabel(scope: Role, count: number): string {
-  const noun = scope === "upstream" ? "upstream" : "instance";
+  const noun = scope === "upstream" ? "upstream" : scope === "hub" ? "hub" : "instance";
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
 function emptyLabel(scope: Role): string {
-  return scope === "upstream"
-    ? "No upstream yet. Add the YouTrack URL you work from."
-    : "No instances yet. Add the dsh web and opencode URLs you use.";
+  switch (scope) {
+    case "upstream":
+      return "No upstream yet. Add the YouTrack URL you work from.";
+    case "hub":
+      return "No Hub yet. Add your FlowHub service address (for example http://127.0.0.1:8080/).";
+    default:
+      return "No instances yet. Add the dsh web and opencode URLs you use.";
+  }
 }
 
 function button(label: string, action: string, title: string): HTMLButtonElement {
@@ -146,7 +152,7 @@ export function renderSidebar(
     option.dataset.scope = candidate.value;
     option.setAttribute("role", "tab");
     option.setAttribute("aria-selected", String(candidate.value === scope));
-    option.title = `${candidate.label} view (Cmd+Shift+${candidate.value === "upstream" ? 1 : 2})`;
+    option.title = `${candidate.label} view (Cmd+Shift+${candidate.shortcut})`;
     option.textContent = candidate.label;
     switcher.append(option);
   }

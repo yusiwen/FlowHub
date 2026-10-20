@@ -4,6 +4,7 @@
 mod auth;
 mod commands;
 mod health;
+mod hub;
 mod menu;
 mod model;
 mod session;
@@ -66,6 +67,7 @@ fn main() {
             commands::submit_token,
             commands::list_health,
             commands::probe_all,
+            commands::hub_snapshot,
             commands::load_session,
             commands::set_sidebar_visible,
         ])

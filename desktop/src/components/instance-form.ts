@@ -5,10 +5,18 @@ const KINDS: ReadonlyArray<{ value: InstanceKind; label: string; role: Role }> =
   { value: "opencode", label: "opencode", role: "downstream" },
   { value: "other", label: "other", role: "downstream" },
   { value: "youtrack", label: "YouTrack", role: "upstream" },
+  { value: "flowhub", label: "FlowHub", role: "hub" },
 ];
 
 function scopeName(scope: Role): string {
-  return scope === "upstream" ? "upstream" : "instance";
+  switch (scope) {
+    case "upstream":
+      return "upstream";
+    case "hub":
+      return "hub";
+    default:
+      return "instance";
+  }
 }
 
 function fieldValue(form: HTMLFormElement, name: string): string {
@@ -37,7 +45,13 @@ export function openInstanceForm(
           </select>
         </label>
         <label>URL
-          <input name="url" autocomplete="off" placeholder="${scope === "upstream" ? "https://youtrack.example.com/" : "http://127.0.0.1:3080/"}" />
+          <input name="url" autocomplete="off" placeholder="${
+            scope === "upstream"
+              ? "https://youtrack.example.com/"
+              : scope === "hub"
+                ? "http://127.0.0.1:8080/"
+                : "http://127.0.0.1:3080/"
+          }" />
         </label>
         <label>Group <span class="optional">(optional)</span>
           <input name="group" autocomplete="off" placeholder="local" />
@@ -76,6 +90,9 @@ export function openInstanceForm(
       } else if (kindSelect.value === "youtrack") {
         hint.textContent =
           "YouTrack signs in inside the tab; no token is stored by the app.";
+      } else if (kindSelect.value === "flowhub") {
+        hint.textContent =
+          "The app reads /healthz from this address; no token is stored.";
       } else {
         hint.textContent = "Loaded directly; no token is needed.";
       }

@@ -264,6 +264,7 @@ impl TabManager {
             return Err(error);
         }
         self.apply_visibility()?;
+        self.focus_shell_if_dashboard(app)?;
         self.info(instance.id).ok_or("tab disappeared".to_string())
     }
 
@@ -271,6 +272,9 @@ impl TabManager {
         let Some(tab) = self.tabs.get(&id) else {
             return Err("no such tab".to_string());
         };
+        if tab.instance.is_dashboard() {
+            return Ok(());
+        }
         if tab.webview.is_some() {
             return Ok(());
         }
@@ -379,6 +383,28 @@ impl TabManager {
         Ok(())
     }
 
+    /// Whether the active tab renders shell HTML rather than a webview. The
+    /// dashboard has no webview to focus, so the shell must take focus itself.
+    pub fn active_is_dashboard(&self) -> bool {
+        self.order
+            .active()
+            .and_then(|id| self.tabs.get(&id))
+            .map(|tab| tab.instance.is_dashboard())
+            .unwrap_or(false)
+    }
+
+    fn focus_shell_if_dashboard(&self, app: &AppHandle) -> Result<(), String> {
+        if !self.active_is_dashboard() {
+            return Ok(());
+        }
+        if let Some(shell) = app.get_webview("shell") {
+            shell
+                .set_focus()
+                .map_err(|error| format!("focus shell webview: {error}"))?;
+        }
+        Ok(())
+    }
+
     pub fn activate(&mut self, app: &AppHandle, id: Uuid) -> Result<(), String> {
         if !self.tabs.contains_key(&id) {
             return Err("no such tab".to_string());
@@ -393,6 +419,7 @@ impl TabManager {
             self.ensure_webview(app, id)?;
         }
         self.apply_visibility()?;
+        self.focus_shell_if_dashboard(app)?;
         self.announce_auth(app, id);
         Ok(())
     }
@@ -411,6 +438,7 @@ impl TabManager {
                 self.ensure_webview(app, id)?;
             }
             self.apply_visibility()?;
+            self.focus_shell_if_dashboard(app)?;
             self.announce_auth(app, id);
         } else {
             self.apply_visibility()?;
@@ -432,6 +460,7 @@ impl TabManager {
                 self.ensure_webview(app, id)?;
             }
             self.apply_visibility()?;
+            self.focus_shell_if_dashboard(app)?;
             self.announce_auth(app, id);
         } else {
             self.apply_visibility()?;
@@ -488,6 +517,13 @@ impl TabManager {
     pub fn active_url(&self) -> Option<String> {
         let id = self.order.active()?;
         let tab = self.tabs.get(&id)?;
+        if tab.instance.is_dashboard() {
+            // There is no page to open; the service's own JSON is the closest
+            // thing to "open this in a browser" and is useful for debugging.
+            return crate::model::healthz_url(&tab.instance.url)
+                .ok()
+                .map(|url| url.to_string());
+        }
         tab.webview
             .as_ref()
             .and_then(|webview| webview.url().ok())
@@ -621,7 +657,7 @@ impl TabManager {
             url: tab.url.clone(),
             loading: tab.loading,
             auth_required: tab.auth_required,
-            loaded: tab.webview.is_some(),
+            loaded: tab.webview.is_some() || tab.instance.is_dashboard(),
             active: self.order.active() == Some(id),
         }
     }
@@ -831,6 +867,17 @@ mod tests {
         let tabs = manager.list();
         assert_eq!(tabs[0].role, Role::Upstream);
         assert_eq!(tabs[1].role, Role::Downstream);
+    }
+
+    #[test]
+    fn a_hub_tab_is_loaded_without_a_webview() {
+        let hub = instance("hub", InstanceKind::FlowHub, "http://127.0.0.1:8080/");
+        let manager = TabManager::restore(std::slice::from_ref(&hub), &[hub.id], Some(hub.id));
+        let tabs = manager.list();
+        assert_eq!(tabs.len(), 1);
+        assert!(tabs[0].loaded);
+        assert_eq!(tabs[0].role, Role::Hub);
+        assert!(manager.active_is_dashboard());
     }
 
     #[test]

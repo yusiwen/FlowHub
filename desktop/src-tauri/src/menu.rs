@@ -83,6 +83,7 @@ pub fn build(app: &App) -> tauri::Result<Menu<tauri::Wry>> {
                 true,
                 Some("CmdOrCtrl+Shift+2"),
             )?,
+            &MenuItem::with_id(app, "scope-hub", "Hub", true, Some("CmdOrCtrl+Shift+3"))?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(
                 app,
@@ -177,13 +178,16 @@ pub fn handle(app: &AppHandle, id: &str) {
             Ok(false) => close_window(app),
             Err(error) => Err(error),
         },
-        "reload-tab" => commands::reload_active(&state),
+        "reload-tab" => commands::reload_active(app, &state),
         "open-browser" => commands::open_in_browser(&state),
         "scope-upstream" => app
             .emit("scope://select", "upstream")
             .map_err(|error| error.to_string()),
         "scope-instances" => app
             .emit("scope://select", "instances")
+            .map_err(|error| error.to_string()),
+        "scope-hub" => app
+            .emit("scope://select", "hub")
             .map_err(|error| error.to_string()),
         "toggle-sidebar" => app
             .emit("menu://toggle-sidebar", ())

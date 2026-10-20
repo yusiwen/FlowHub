@@ -15,17 +15,27 @@ pub enum InstanceKind {
     Opencode,
     Other,
     Youtrack,
+    FlowHub,
 }
 
 /// The role an instance plays in FlowHub's three views: the upstream trackers
-/// that produce work, and the downstream agents that perform it. The role is
-/// derived from the kind so a registry row cannot claim one role and behave like
-/// another; the Hub kind and its `Self` role arrive with the dashboard slice.
+/// that produce work, the downstream agents that perform it, and the hub itself.
+/// The role is derived from the kind so a registry row cannot claim one role and
+/// behave like another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
     Upstream,
     Downstream,
+    Hub,
+}
+
+/// What a tab shows. A webview is a remote page; a dashboard is shell HTML fed by
+/// an API, which cannot be a webview because it has no page to load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Content {
+    Webview,
+    Dashboard,
 }
 
 impl InstanceKind {
@@ -34,14 +44,22 @@ impl InstanceKind {
     pub fn default_auth(self) -> AuthMode {
         match self {
             Self::DshWeb => AuthMode::DshToken,
-            Self::Opencode | Self::Other | Self::Youtrack => AuthMode::None,
+            Self::Opencode | Self::Other | Self::Youtrack | Self::FlowHub => AuthMode::None,
         }
     }
 
     pub fn role(self) -> Role {
         match self {
             Self::Youtrack => Role::Upstream,
+            Self::FlowHub => Role::Hub,
             Self::DshWeb | Self::Opencode | Self::Other => Role::Downstream,
+        }
+    }
+
+    pub fn content(self) -> Content {
+        match self {
+            Self::FlowHub => Content::Dashboard,
+            Self::DshWeb | Self::Opencode | Self::Other | Self::Youtrack => Content::Webview,
         }
     }
 }
@@ -160,6 +178,29 @@ impl Instance {
     pub fn role(&self) -> Role {
         self.kind.role()
     }
+
+    pub fn is_dashboard(&self) -> bool {
+        self.kind.content() == Content::Dashboard
+    }
+}
+
+/// The `/healthz` address of a FlowHub service. The registry stores the base URL
+/// (a trailing slash is optional) and a full `.../healthz` is accepted as-is, so
+/// a pasted URL from a browser address bar works either way.
+pub fn healthz_url(base: &str) -> Result<Url, String> {
+    let mut url = Url::parse(base.trim()).map_err(|error| format!("url is not valid: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("url must use http or https".to_string());
+    }
+    if url.path().ends_with("/healthz") {
+        return Ok(url);
+    }
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    url.join("healthz")
+        .map_err(|error| format!("url is not valid: {error}"))
 }
 
 fn normalize_url(raw: &str) -> Result<String, String> {
@@ -272,6 +313,55 @@ mod tests {
         ] {
             assert_eq!(kind.role(), Role::Downstream);
         }
+    }
+
+    #[test]
+    fn flowhub_is_the_hub_role_and_renders_natively() {
+        assert_eq!(InstanceKind::FlowHub.role(), Role::Hub);
+        assert_eq!(InstanceKind::FlowHub.content(), Content::Dashboard);
+        assert_eq!(InstanceKind::Youtrack.content(), Content::Webview);
+
+        let hub = Instance::from_input(
+            &input("hub", InstanceKind::FlowHub, "http://127.0.0.1:8080"),
+            0,
+        )
+        .expect("valid");
+        assert_eq!(hub.auth, AuthMode::None);
+        assert!(hub.is_dashboard());
+    }
+
+    #[test]
+    fn healthz_url_accepts_a_base_or_a_full_healthz_url() {
+        assert_eq!(
+            healthz_url("http://127.0.0.1:8080").expect("base").as_str(),
+            "http://127.0.0.1:8080/healthz"
+        );
+        assert_eq!(
+            healthz_url("http://127.0.0.1:8080/")
+                .expect("base with slash")
+                .as_str(),
+            "http://127.0.0.1:8080/healthz"
+        );
+        assert_eq!(
+            healthz_url("http://host/flowhub")
+                .expect("prefix without slash")
+                .as_str(),
+            "http://host/flowhub/healthz"
+        );
+        assert_eq!(
+            healthz_url("http://host/flowhub/")
+                .expect("prefix")
+                .as_str(),
+            "http://host/flowhub/healthz"
+        );
+        assert_eq!(
+            healthz_url("http://host/flowhub/healthz")
+                .expect("full url")
+                .as_str(),
+            "http://host/flowhub/healthz"
+        );
+        assert!(healthz_url("ftp://host/").is_err());
+        assert!(healthz_url("not a url").is_err());
     }
 
     #[test]
