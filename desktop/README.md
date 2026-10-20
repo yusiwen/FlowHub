@@ -1,8 +1,8 @@
 # FlowHub (desktop)
 
-A macOS-first Tauri app for opening agent UIs (dsh web, opencode, and other
-pages) in one window: a sidebar registry on the left, one native WebView per
-instance in a tab on the right.
+A macOS-first Tauri app for opening the pages FlowHub works with in one window: a
+sidebar registry split into view scopes (upstream trackers and agent instances
+today; the hub view follows), one native WebView per page in a tab on the right.
 
 The Go service and this app share a repository, not a build: the app lives in
 `desktop/` and has its own Rust and Node toolchain. No cgo, no FFI.
@@ -42,6 +42,29 @@ check for a Go-only pull request.
 | `scripts/build-icons.sh` | regenerates that set from the master |
 | `src-tauri/tauri.conf.json` | Tauri configuration |
 
+## Views
+
+The sidebar has two scopes, switched at its top or with `Cmd+Shift+1/2`:
+`Upstream` for tracker pages and `Instances` for agent pages. A scope is a filter
+over one registry — it does not own a second store.
+
+The tab strip stays global. Switching a scope activates the page that scope was last
+on and changes only the list when it has none: replacing a page the user is reading
+with an empty stage would also make the tab strip name a tab that is not on screen.
+Activating a tab moves the selector to that tab's role, so the list beside the stage
+is always the one that owns the visible page.
+
+The scope's header shows the row count and its Add button. The form opened from a
+scope offers only that scope's kinds, so editing cannot move a row between views.
+
+## Upstream
+
+YouTrack is the first upstream kind. A row stores the tracker's base URL and nothing
+else: the tracker signs in inside its tab, and the resulting cookie lives in the
+shared webview store like any other login. The token is never written to the
+registry. The health probe is the credential-less one, so a green dot means
+"reachable" — a login page answers `200` too — not "signed in".
+
 ## Tabs
 
 Clicking an instance row opens its page in a tab. Each tab is a separate native
@@ -56,7 +79,9 @@ CSS viewport below the title bar. The shell therefore also reports
 `y` before positioning a child webview. Without that inset the page starts 32
 points too high and covers the bottom of the tab bar.
 
-A tab label is the page title followed by `[<instance name>]`, or just
+A tab carries the role of its instance, which is what lets the shell move the sidebar
+selector when the tab is activated. A tab label is the page title followed by
+`[<instance name>]`, or just
 `[<instance name>]` before a title arrives. The tab is capped at 230 px and only
 the title ellipsizes, so the instance suffix stays visible and two instances
 with the same page title remain distinguishable. Hovering a tab shows the full,
@@ -67,7 +92,8 @@ untruncated page title, the instance name, and the URL.
 The macOS menu owns the accelerators because a focused content webview receives
 keyboard events before the shell:
 
-- `Cmd+T` open the first instance without a tab (or cycle when every instance is open)
+- `Cmd+T` open the first row of the current view without a tab (or cycle that view's tabs)
+- `Cmd+Shift+1` / `Cmd+Shift+2` switch to Upstream / Instances
 - `Cmd+W` close the active tab; with no tabs, close the window
 - `Cmd+R` reload the active tab
 - `Cmd+B` toggle the sidebar
@@ -127,7 +153,9 @@ or returned to the shell. The report records only whether a credential was used
 - No `dsh-web` tab loaded at all — the dot stays yellow and never claims `ok`
   without evidence.
 
-opencode and `other` instances keep the credential-less probe; `200` is green.
+YouTrack and `opencode`/`other` instances keep the credential-less probe; `200` is
+green. A YouTrack login page also answers `200`/`302`, so the dot means reachable,
+not signed in.
 
 ## Registry
 
@@ -135,7 +163,9 @@ The sidebar is backed by `instances.json` in the app config directory
 (`~/Library/Application Support/cn.yusiwen.flowhub/` on macOS, named after the
 bundle identifier). The file is versioned, written atomically with mode `0600`,
 and holds no secret: a dsh launch token is never persisted, only exchanged for a
-cookie in the webview.
+cookie in the webview. It holds both roles; `kind` decides the view — `youtrack` is
+upstream, `dsh-web`/`opencode`/`other` are downstream — and the registry version
+stays 1 because the role is derived rather than stored.
 
 While the app was called "Agent Hub" it used the `dev.flowhub.agenthub`
 directory. On the first start after the rename, `instances.json` and
@@ -171,6 +201,7 @@ the Dock tile from `icon.icns` — Tauri's codegen reads that list in developmen
   no Tauri IPC.
 - Content webviews load `http`/`https` only; navigation to `file:` or `data:` is
   refused in the tab manager.
-- No token or password is written to `instances.json` or the logs.
+- No token or password is written to `instances.json` or the logs; a YouTrack
+  sign-in is a webview cookie, not a registry field.
 
 See `docs/adr/0008-desktop-agent-hub.md` for the decision record.

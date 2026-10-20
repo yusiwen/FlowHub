@@ -88,12 +88,13 @@ Nix flakes in a git repository only see files in the git index. New files must b
 The desktop app under `desktop/` is a separate Tauri/Rust/Node toolchain. It is
 not part of the Go module or its build: no cgo, no FFI edge. Use
 `make desktop-install`, `make desktop-dev` and `make desktop-check`; the design is
-recorded in `docs/adr/0008-desktop-agent-hub.md` and `desktop/README.md`.
+recorded in `docs/adr/0008-desktop-agent-hub.md`,
+`docs/adr/0009-desktop-three-views.md` and `desktop/README.md`.
 
 ## Project Structure
 
 ```
-desktop/            macOS Tauri app (FlowHub): sidebar registry + one native WebView per instance tab; separate Rust/Node toolchain
+desktop/            macOS Tauri app (FlowHub): upstream/agent views over one registry + one native WebView per page tab; separate Rust/Node toolchain
 cmd/flowhub/        CLI entry: wiring, flags, HTTP server, /healthz, shutdown, activation prober
 internal/config/    Environment parsing, validation, masked reporting
 internal/logging/   Application logger: stderr tee + size-rotated log file

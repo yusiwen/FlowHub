@@ -26,7 +26,7 @@ the agent may call (ADR 0001 step 1).
 | Path | Responsibility |
 | --- | --- |
 | `cmd/flowhub/main.go` | Wiring, flags (`-version`, `-print-config`), HTTP server, `/healthz`, graceful shutdown, dedupe sweeper, and the activation prober that decides whether a host claiming a runtime name can actually run the work |
-| `desktop/` | macOS Tauri app (FlowHub): sidebar registry, one native WebView per instance tab, dsh token authentication. A separate Rust/Node build with no cgo or FFI edge to the Go service (ADR 0008) |
+| `desktop/` | macOS Tauri app (FlowHub): three view scopes (upstream trackers, agent instances, the hub) over one registry, one native WebView per page tab, dsh token authentication. A separate Rust/Node build with no cgo or FFI edge to the Go service (ADR 0008, ADR 0009) |
 | `internal/config/config.go` | Environment parsing, validation, `Warnings()`, masked `Report()` |
 | `internal/config/envfile.go` | The environment file (ADR 0005): `ApplyEnvFile` reads `~/.config/flowhub/.env` (or `FLOWHUB_ENV_FILE`) and sets what the real environment does not already have — the environment wins — before the subcommand dispatch, so `runtime init` sees the same values. The parser is the documented subset (`KEY=VALUE`, `#` comments, optional `export `, surrounding quotes) and refuses a malformed line by number and a duplicate key; the file carries the same `0600` floor as the credentials file because it holds the URL key and the token, and only variable **names** ever reach the log or the report |
 | `internal/logging/` | Application logger: stderr tee plus a size-rotated log file (`flowhub.log`) |

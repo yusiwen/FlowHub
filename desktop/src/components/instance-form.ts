@@ -1,18 +1,25 @@
-import type { Instance, InstanceInput, InstanceKind } from "../types";
+import type { Instance, InstanceInput, InstanceKind, Role } from "../types";
 
-const KINDS: ReadonlyArray<{ value: InstanceKind; label: string }> = [
-  { value: "dsh-web", label: "dsh web" },
-  { value: "opencode", label: "opencode" },
-  { value: "other", label: "other" },
+const KINDS: ReadonlyArray<{ value: InstanceKind; label: string; role: Role }> = [
+  { value: "dsh-web", label: "dsh web", role: "downstream" },
+  { value: "opencode", label: "opencode", role: "downstream" },
+  { value: "other", label: "other", role: "downstream" },
+  { value: "youtrack", label: "YouTrack", role: "upstream" },
 ];
+
+function scopeName(scope: Role): string {
+  return scope === "upstream" ? "upstream" : "instance";
+}
 
 function fieldValue(form: HTMLFormElement, name: string): string {
   return (form.elements.namedItem(name) as HTMLInputElement | null)?.value ?? "";
 }
 
 export function openInstanceForm(
+  scope: Role,
   existing?: Instance,
 ): Promise<InstanceInput | null> {
+  const kinds = KINDS.filter((kind) => kind.role === scope);
   return new Promise((resolve) => {
     let result: InstanceInput | null = null;
 
@@ -20,17 +27,17 @@ export function openInstanceForm(
     dialog.className = "dialog";
     dialog.innerHTML = `
       <form class="form">
-        <h2>${existing === undefined ? "Add instance" : "Edit instance"}</h2>
+        <h2>${existing === undefined ? `Add ${scopeName(scope)}` : `Edit ${scopeName(scope)}`}</h2>
         <label>Name
           <input name="name" autocomplete="off" placeholder="dsh 3080" />
         </label>
         <label>Kind
           <select name="kind">
-            ${KINDS.map((kind) => `<option value="${kind.value}">${kind.label}</option>`).join("")}
+            ${kinds.map((kind) => `<option value="${kind.value}">${kind.label}</option>`).join("")}
           </select>
         </label>
         <label>URL
-          <input name="url" autocomplete="off" placeholder="http://127.0.0.1:3080/" />
+          <input name="url" autocomplete="off" placeholder="${scope === "upstream" ? "https://youtrack.example.com/" : "http://127.0.0.1:3080/"}" />
         </label>
         <label>Group <span class="optional">(optional)</span>
           <input name="group" autocomplete="off" placeholder="local" />
@@ -57,16 +64,21 @@ export function openInstanceForm(
     const error = dialog.querySelector(".form-error") as HTMLElement;
 
     nameInput.value = existing?.name ?? "";
-    kindSelect.value = existing?.kind ?? "dsh-web";
+    kindSelect.value = existing?.kind ?? kinds[0].value;
     urlInput.value = existing?.url ?? "";
     groupInput.value = existing?.group ?? "";
     notesInput.value = existing?.notes ?? "";
 
     const updateHint = (): void => {
-      hint.textContent =
-        kindSelect.value === "dsh-web"
-          ? "dsh web signs in with the URL printed by the dsh web command (the launch token)."
-          : "Loaded directly; no token is needed.";
+      if (kindSelect.value === "dsh-web") {
+        hint.textContent =
+          "dsh web signs in with the URL printed by the dsh web command (the launch token).";
+      } else if (kindSelect.value === "youtrack") {
+        hint.textContent =
+          "YouTrack signs in inside the tab; no token is stored by the app.";
+      } else {
+        hint.textContent = "Loaded directly; no token is needed.";
+      }
     };
     updateHint();
     kindSelect.addEventListener("change", updateHint);
@@ -123,13 +135,13 @@ export function openInstanceForm(
   });
 }
 
-export function confirmRemove(name: string): Promise<boolean> {
+export function confirmRemove(name: string, scope: Role): Promise<boolean> {
   return new Promise((resolve) => {
     const dialog = document.createElement("dialog");
     dialog.className = "dialog";
     dialog.innerHTML = `
       <form class="form">
-        <h2>Delete instance</h2>
+        <h2>Delete ${scopeName(scope)}</h2>
         <p class="dialog-text"></p>
         <div class="dialog-actions">
           <button type="button" class="ghost-button" data-cancel>Cancel</button>
@@ -138,7 +150,9 @@ export function confirmRemove(name: string): Promise<boolean> {
       </form>
     `;
     (dialog.querySelector(".dialog-text") as HTMLElement).textContent =
-      `Remove “${name}” from the sidebar?`;
+      scope === "upstream"
+        ? `Remove “${name}” from Upstream?`
+        : `Remove “${name}” from the sidebar?`;
 
     const form = dialog.querySelector("form") as HTMLFormElement;
     form.addEventListener("submit", (event) => {

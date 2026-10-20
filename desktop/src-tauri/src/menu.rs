@@ -68,13 +68,30 @@ pub fn build(app: &App) -> tauri::Result<Menu<tauri::Wry>> {
         app,
         "View",
         true,
-        &[&MenuItem::with_id(
-            app,
-            "toggle-sidebar",
-            "Toggle Sidebar",
-            true,
-            Some("CmdOrCtrl+B"),
-        )?],
+        &[
+            &MenuItem::with_id(
+                app,
+                "scope-upstream",
+                "Upstream",
+                true,
+                Some("CmdOrCtrl+Shift+1"),
+            )?,
+            &MenuItem::with_id(
+                app,
+                "scope-instances",
+                "Instances",
+                true,
+                Some("CmdOrCtrl+Shift+2"),
+            )?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(
+                app,
+                "toggle-sidebar",
+                "Toggle Sidebar",
+                true,
+                Some("CmdOrCtrl+B"),
+            )?,
+        ],
     )?;
 
     let next = MenuItem::with_id(app, "next-tab", "Next Tab", true, Some("Ctrl+Tab"))?;
@@ -152,7 +169,9 @@ fn close_window(app: &AppHandle) -> Result<(), String> {
 pub fn handle(app: &AppHandle, id: &str) {
     let state = app.state::<AppState>();
     let result = match id {
-        "new-tab" => commands::open_next_instance(app, &state).map(|_| ()),
+        "new-tab" => app
+            .emit("menu://new-tab", ())
+            .map_err(|error| error.to_string()),
         "close-tab" => match commands::close_active(app, &state) {
             Ok(true) => Ok(()),
             Ok(false) => close_window(app),
@@ -160,6 +179,12 @@ pub fn handle(app: &AppHandle, id: &str) {
         },
         "reload-tab" => commands::reload_active(&state),
         "open-browser" => commands::open_in_browser(&state),
+        "scope-upstream" => app
+            .emit("scope://select", "upstream")
+            .map_err(|error| error.to_string()),
+        "scope-instances" => app
+            .emit("scope://select", "instances")
+            .map_err(|error| error.to_string()),
         "toggle-sidebar" => app
             .emit("menu://toggle-sidebar", ())
             .map_err(|error| error.to_string()),

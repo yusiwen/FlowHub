@@ -14,6 +14,8 @@ import {
   onAuthRequired,
   onHealthChanged,
   onInstancesChanged,
+  onNewTab,
+  onScopeSelect,
   onTabState,
   onTabTitle,
   onTabsChanged,
@@ -28,7 +30,8 @@ import {
   submitToken,
   updateInstance,
 } from "./ipc";
-import type { HealthReport, Instance, TabInfo } from "./types";
+import { roleOf } from "./types";
+import type { HealthReport, Instance, Role, TabInfo } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (app === null) throw new Error("shell: missing #app");
@@ -44,7 +47,7 @@ app.innerHTML = `
       <div class="stage" id="stage">
         <div class="stage-empty" id="stage-empty">
           <h2>FlowHub</h2>
-          <p>Pick an instance on the left to open its page in a tab.</p>
+          <p>Pick a page on the left to open it in a tab.</p>
         </div>
         <div class="auth-panel" id="auth-panel" hidden>
           <form class="auth-card" id="auth-form">
@@ -81,6 +84,8 @@ const authCancel = document.querySelector<HTMLButtonElement>("#auth-cancel")!;
 let instances: Instance[] = [];
 let tabs: TabInfo[] = [];
 const health = new Map<string, HealthReport>();
+const lastActive = new Map<Role, string>();
+let scope: Role = "downstream";
 let stageKey = "";
 let authInstanceId: string | null = null;
 
@@ -108,8 +113,12 @@ function hideAuth(): void {
   authInstanceId = null;
 }
 
+function scopedInstances(): Instance[] {
+  return instances.filter((instance) => roleOf(instance.kind) === scope);
+}
+
 function renderInstances(): void {
-  renderSidebar(sidebar, instances, health, {
+  renderSidebar(sidebar, scope, scopedInstances(), health, {
     onAdd: () => {
       void add();
     },
@@ -124,6 +133,9 @@ function renderInstances(): void {
     },
     onOpen: (instance) => {
       void open(instance);
+    },
+    onScope: (next) => {
+      switchScope(next);
     },
   });
 }
@@ -233,6 +245,13 @@ function applyTabs(next: TabInfo[]): void {
     return { ...tab, title: old.title, url: old.url, loading: old.loading };
   });
   const active = tabs.find((tab) => tab.active);
+  if (active !== undefined) {
+    lastActive.set(active.role, active.instance_id);
+    if (active.role !== scope) {
+      scope = active.role;
+      renderInstances();
+    }
+  }
   if (
     authInstanceId !== null &&
     active !== undefined &&
@@ -313,7 +332,7 @@ async function closeOne(tab: TabInfo): Promise<void> {
 
 async function add(): Promise<void> {
   hideAuth();
-  const input = await withHiddenContent(() => openInstanceForm());
+  const input = await withHiddenContent(() => openInstanceForm(scope));
   if (input === null) return;
   try {
     await addInstance(input);
@@ -327,7 +346,9 @@ async function add(): Promise<void> {
 
 async function edit(instance: Instance): Promise<void> {
   hideAuth();
-  const input = await withHiddenContent(() => openInstanceForm(instance));
+  const input = await withHiddenContent(() =>
+    openInstanceForm(scope, instance),
+  );
   if (input === null) return;
   try {
     await updateInstance(instance.id, input);
@@ -342,7 +363,7 @@ async function edit(instance: Instance): Promise<void> {
 async function remove(instance: Instance): Promise<void> {
   hideAuth();
   const confirmed = await withHiddenContent(() =>
-    confirmRemove(instance.name),
+    confirmRemove(instance.name, scope),
   );
   if (!confirmed) return;
   try {
@@ -356,12 +377,19 @@ async function remove(instance: Instance): Promise<void> {
 }
 
 async function move(instance: Instance, direction: -1 | 1): Promise<void> {
-  const index = instances.findIndex((candidate) => candidate.id === instance.id);
+  // The registry order is global; a scope only decides which neighbours are
+  // visible. Swapping the two visible rows in the full id list keeps every
+  // other row where it was.
+  const visible = scopedInstances();
+  const index = visible.findIndex((candidate) => candidate.id === instance.id);
   const target = index + direction;
-  if (index < 0 || target < 0 || target >= instances.length) return;
+  if (index < 0 || target < 0 || target >= visible.length) return;
 
   const ids = instances.map((candidate) => candidate.id);
-  [ids[index], ids[target]] = [ids[target], ids[index]];
+  const from = ids.indexOf(visible[index].id);
+  const to = ids.indexOf(visible[target].id);
+  if (from < 0 || to < 0) return;
+  [ids[from], ids[to]] = [ids[to], ids[from]];
   try {
     await reorderInstances(ids);
     await refreshInstances();
@@ -392,6 +420,14 @@ document
 
 void onToggleSidebar(() => {
   toggleSidebar();
+});
+
+void onNewTab(() => {
+  openNext();
+});
+
+void onScopeSelect((next) => {
+  if (next === "upstream" || next === "downstream") switchScope(next);
 });
 
 void onHealthChanged((report) => {
@@ -466,6 +502,45 @@ void onTabState((event) => {
   tab.loading = event.loading;
   renderTabs();
 });
+
+/// A scope switch activates the page this view was last on. A view with no open
+/// page only changes the list: blanking the stage for it would hide the page the
+/// user is reading, and the tab strip would still name it as active.
+function switchScope(next: Role): void {
+  if (next === scope) {
+    renderInstances();
+    return;
+  }
+  scope = next;
+  renderInstances();
+  const remembered = lastActive.get(next);
+  if (remembered === undefined) return;
+  const tab = tabs.find((candidate) => candidate.instance_id === remembered);
+  if (tab === undefined) {
+    lastActive.delete(next);
+    return;
+  }
+  void activate(tab);
+}
+
+/// Cmd+T: the first row of this view without a tab; when every row is open,
+/// cycle through this view's tabs instead of opening a duplicate.
+function openNext(): void {
+  const rows = scopedInstances();
+  const openIds = new Set(tabs.map((tab) => tab.instance_id));
+  const next = rows.find((row) => !openIds.has(row.id));
+  if (next !== undefined) {
+    void open(next);
+    return;
+  }
+  const visible = tabs.filter((tab) => tab.role === scope);
+  if (visible.length === 0) return;
+  const active = tabs.find((tab) => tab.active);
+  const index = visible.findIndex(
+    (tab) => active !== undefined && tab.instance_id === active.instance_id,
+  );
+  void activate(visible[(index + 1) % visible.length]);
+}
 
 async function init(): Promise<void> {
   try {
