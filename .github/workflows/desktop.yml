@@ -2,7 +2,8 @@
 # a Go-only change does not run it, so it must not be a required check.
 #
 # The runner is the arm64 macOS image. The Rust steps mirror `make desktop-check`
-# and the final build proves the Tauri app still compiles without bundling.
+# and the final build bundles the app and asserts the bundle carries the icon and
+# the identifier — an .app is the application record macOS takes both from.
 name: desktop
 
 on:
@@ -71,6 +72,23 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
-      - name: Build app without bundling
+      # The .app is what gives this app an identity: its Info.plist is the record
+      # macOS resolves the name, the identifier and the icon from. A build that
+      # compiles but bundles nothing is exactly the regression that left a bare
+      # executable with a placeholder icon in Stage Manager, so these assertions
+      # are the gate, not the build exit code.
+      - name: Build the app bundle and assert it carries the icon
         working-directory: desktop
-        run: pnpm tauri build --debug --no-bundle
+        run: |
+          pnpm tauri build --debug --bundles app
+          # Trace the assertions: a bare `test -f` that fails says nothing about
+          # which file was missing.
+          set -x
+          app=src-tauri/target/debug/bundle/macos/FlowHub.app
+          test -x "$app/Contents/MacOS/flowhub-desktop"
+          test -f "$app/Contents/Resources/icon.icns"
+          cmp "$app/Contents/Resources/icon.icns" src-tauri/icons/icon.icns
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist" \
+            | grep -qx icon.icns
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" \
+            | grep -qx cn.yusiwen.flowhub
