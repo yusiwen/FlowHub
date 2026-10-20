@@ -10,10 +10,10 @@ use tauri::{App, AppHandle, Emitter, Manager, Window, WindowEvent};
 pub fn build(app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     let app_menu = Submenu::with_items(
         app,
-        "Agent Hub",
+        "FlowHub",
         true,
         &[
-            &PredefinedMenuItem::about(app, Some("About Agent Hub"), None)?,
+            &PredefinedMenuItem::about(app, Some("About FlowHub"), None)?,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::hide(app, None)?,
             &PredefinedMenuItem::hide_others(app, None)?,

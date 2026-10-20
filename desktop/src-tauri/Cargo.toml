@@ -1,7 +1,7 @@
 [package]
-name = "agent-hub"
+name = "flowhub-desktop"
 version = "0.1.0"
-description = "Agent Hub desktop shell"
+description = "FlowHub desktop shell"
 edition = "2021"
 rust-version = "1.77"
 

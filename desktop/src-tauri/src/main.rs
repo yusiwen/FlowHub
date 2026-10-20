@@ -20,6 +20,12 @@ fn main() {
         .on_menu_event(|app, event| menu::handle(app, event.id().as_ref()))
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
+            // The app was called "Agent Hub" under a `dev.flowhub.agenthub`
+            // identifier until the rename to FlowHub; keep the registry it left
+            // behind instead of starting empty.
+            if let Err(error) = state::migrate_legacy_config(&config_dir) {
+                eprintln!("migrate the Agent Hub registry: {error}");
+            }
             app.manage(state::AppState::load(&config_dir)?);
 
             let probe_app = app.handle().clone();
@@ -31,7 +37,7 @@ fn main() {
             });
 
             let window = WindowBuilder::new(app, "main")
-                .title("Agent Hub")
+                .title("FlowHub")
                 .inner_size(1280.0, 800.0)
                 .min_inner_size(900.0, 600.0)
                 .build()?;
@@ -64,5 +70,5 @@ fn main() {
             commands::set_sidebar_visible,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Agent Hub");
+        .expect("error while running FlowHub");
 }
