@@ -8,7 +8,10 @@
 use crate::model::healthz_url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs::File;
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::time::Duration;
+use url::Url;
 
 /// The service's `/healthz` payload. Scalars are typed; the four nested reports
 /// stay `Value` because their keys are runtime names and rejection reasons.
@@ -94,6 +97,137 @@ pub async fn fetch(base: &str) -> Result<HubSnapshot, String> {
     serde_json::from_value(value).map_err(|error| format!("{url}: unexpected payload: {error}"))
 }
 
+/// The log tail: the last 256 KiB, at most 1000 lines.
+pub const LOG_TAIL_BYTES: u64 = 256 * 1024;
+pub const MAX_LOG_LINES: usize = 1000;
+pub const DEFAULT_LOG_LINES: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogState {
+    Ok,
+    NeedsPath,
+    Disabled,
+    Missing,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HubLogs {
+    pub state: LogState,
+    /// The path actually read (empty when nothing was read).
+    pub path: String,
+    /// What `/healthz` reports, shown even when it is not trusted to open.
+    pub service_path: String,
+    /// True when the service is loopback and reports a usable path.
+    pub can_use_service_path: bool,
+    pub lines: Vec<String>,
+    pub truncated: bool,
+    pub detail: String,
+}
+
+fn usable_service_path(path: &str) -> bool {
+    !path.is_empty() && path != "-" && path != "none"
+}
+
+/// A loopback service runs on this machine as this user, so its own `app_log`
+/// may be read. Any other address may only use a path the user confirmed: a
+/// remote endpoint must not be able to make the app display a local file.
+pub fn resolve_log_path(base: &str, service_path: &str, confirmed: Option<&str>) -> Option<String> {
+    if let Some(path) = confirmed.map(str::trim).filter(|path| !path.is_empty()) {
+        return Some(path.to_string());
+    }
+    if is_loopback(base) && usable_service_path(service_path) {
+        return Some(service_path.to_string());
+    }
+    None
+}
+
+pub fn is_loopback(base: &str) -> bool {
+    let Ok(url) = Url::parse(base.trim()) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        // `localhost` is the user's intent even if /etc/hosts points it
+        // elsewhere; the path still came from a service on this machine in
+        // every configuration the app supports.
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Read the end of the file. The first line is dropped when the window starts
+/// mid-file, so a returned line is always a whole log record.
+fn read_tail(path: &str, wanted: usize) -> std::io::Result<(Vec<String>, bool)> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(LOG_TAIL_BYTES);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+
+    let mut text = String::from_utf8_lossy(&buffer).into_owned();
+    if start > 0 {
+        match text.find('\n') {
+            Some(index) => {
+                text.drain(..=index);
+            }
+            None => text.clear(),
+        }
+    }
+    let mut lines: Vec<String> = text.lines().map(ToOwned::to_owned).collect();
+    let truncated = start > 0 || lines.len() > wanted;
+    if lines.len() > wanted {
+        lines.drain(..lines.len() - wanted);
+    }
+    Ok((lines, truncated))
+}
+
+pub async fn logs(base: &str, confirmed: Option<&str>, wanted: usize) -> Result<HubLogs, String> {
+    let snapshot = fetch(base).await?;
+    let can_use_service_path = is_loopback(base) && usable_service_path(&snapshot.app_log);
+    let mut report = HubLogs {
+        state: LogState::NeedsPath,
+        path: String::new(),
+        service_path: snapshot.app_log.clone(),
+        can_use_service_path,
+        lines: Vec::new(),
+        truncated: false,
+        detail: String::new(),
+    };
+
+    let Some(path) = resolve_log_path(base, &snapshot.app_log, confirmed) else {
+        report.state = if matches!(snapshot.app_log.as_str(), "-" | "none") {
+            LogState::Disabled
+        } else {
+            LogState::NeedsPath
+        };
+        return Ok(report);
+    };
+    report.path = path.clone();
+
+    match read_tail(&path, wanted.clamp(1, MAX_LOG_LINES)) {
+        Ok((lines, truncated)) => {
+            report.state = LogState::Ok;
+            report.lines = lines;
+            report.truncated = truncated;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            report.state = LogState::Missing;
+            report.detail = error.to_string();
+        }
+        Err(error) => {
+            report.state = LogState::Unreadable;
+            report.detail = error.to_string();
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,7 +236,7 @@ mod tests {
     use std::thread::JoinHandle;
 
     /// Serve exactly one request with a fixed body and return the head received.
-    fn serve(status: u16, body: &'static str) -> (String, JoinHandle<String>) {
+    fn serve(status: u16, body: String) -> (String, JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}/", listener.local_addr().expect("addr"));
         let handle = std::thread::spawn(move || {
@@ -143,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_healthz_payload_becomes_a_snapshot() {
-        let (url, server) = serve(200, PAYLOAD);
+        let (url, server) = serve(200, PAYLOAD.to_string());
         let snapshot = tauri::async_runtime::block_on(fetch(&url)).expect("snapshot");
         assert_eq!(snapshot.status, "ok");
         assert_eq!(snapshot.version, "0.2.1-rc.2");
@@ -157,7 +291,7 @@ mod tests {
 
     #[test]
     fn a_full_healthz_url_is_not_doubled() {
-        let (url, server) = serve(200, PAYLOAD);
+        let (url, server) = serve(200, PAYLOAD.to_string());
         let full = format!("{url}healthz");
         let snapshot = tauri::async_runtime::block_on(fetch(&full)).expect("snapshot");
         assert_eq!(snapshot.status, "ok");
@@ -166,7 +300,7 @@ mod tests {
 
     #[test]
     fn a_200_that_is_not_a_flowhub_payload_is_refused() {
-        let (url, server) = serve(200, r#"{"hello":"world"}"#);
+        let (url, server) = serve(200, r#"{"hello":"world"}"#.to_string());
         let error = tauri::async_runtime::block_on(fetch(&url)).expect_err("refused");
         assert!(
             error.contains("did not return a FlowHub payload"),
@@ -177,7 +311,7 @@ mod tests {
 
     #[test]
     fn a_non_json_200_is_refused() {
-        let (url, server) = serve(200, "<html>hello</html>");
+        let (url, server) = serve(200, "<html>hello</html>".to_string());
         let error = tauri::async_runtime::block_on(fetch(&url)).expect_err("refused");
         assert!(
             error.contains("did not return a FlowHub payload"),
@@ -188,7 +322,7 @@ mod tests {
 
     #[test]
     fn an_http_error_carries_its_status() {
-        let (url, server) = serve(500, "{}");
+        let (url, server) = serve(500, "{}".to_string());
         let error = tauri::async_runtime::block_on(fetch(&url)).expect_err("refused");
         assert!(error.contains("HTTP 500"), "{error}");
         server.join().expect("server");
@@ -196,10 +330,138 @@ mod tests {
 
     #[test]
     fn a_status_only_payload_parses_with_defaults() {
-        let (url, server) = serve(200, r#"{"status":"ok"}"#);
+        let (url, server) = serve(200, r#"{"status":"ok"}"#.to_string());
         let snapshot = tauri::async_runtime::block_on(fetch(&url)).expect("snapshot");
         assert_eq!(snapshot.version, "");
         assert_eq!(snapshot.uptime_seconds, 0);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn loopback_is_the_trust_boundary() {
+        for base in [
+            "http://127.0.0.1:8080/",
+            "http://127.9.9.9:1/",
+            "http://[::1]:8080/",
+            "http://localhost:8080/",
+            "http://LOCALHOST:1/",
+        ] {
+            assert!(is_loopback(base), "{base}");
+        }
+        for base in [
+            "http://10.1.2.3:8080/",
+            "https://youtrack.example.com/",
+            "http://[::2]/",
+            "not a url",
+        ] {
+            assert!(!is_loopback(base), "{base}");
+        }
+    }
+
+    #[test]
+    fn a_remote_service_path_is_never_opened() {
+        let remote = "http://10.1.2.3:8080/";
+        assert_eq!(
+            resolve_log_path(remote, "/Users/you/.ssh/id_rsa", None),
+            None
+        );
+        assert_eq!(resolve_log_path(remote, "/var/log/flowhub.log", None), None);
+        // The user's own choice is the only thing that opens a remote path.
+        assert_eq!(
+            resolve_log_path(remote, "/var/log/flowhub.log", Some("/tmp/local.log")),
+            Some("/tmp/local.log".to_string())
+        );
+    }
+
+    #[test]
+    fn a_loopback_service_path_is_used_and_an_explicit_choice_wins() {
+        let local = "http://127.0.0.1:8080/";
+        assert_eq!(
+            resolve_log_path(local, "/tmp/flowhub.log", None),
+            Some("/tmp/flowhub.log".to_string())
+        );
+        assert_eq!(
+            resolve_log_path(local, "/tmp/flowhub.log", Some("/tmp/other.log")),
+            Some("/tmp/other.log".to_string())
+        );
+        assert_eq!(resolve_log_path(local, "-", None), None);
+        assert_eq!(resolve_log_path(local, "none", None), None);
+        assert_eq!(resolve_log_path(local, "", None), None);
+        assert_eq!(
+            resolve_log_path(local, "/tmp/flowhub.log", Some("  ")),
+            Some("/tmp/flowhub.log".to_string())
+        );
+    }
+
+    #[test]
+    fn a_tail_is_bounded_and_reported_as_truncated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("flowhub.log");
+        let body: String = (1..=300).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&path, body).expect("write");
+
+        let (lines, truncated) = read_tail(path.to_str().expect("path"), 200).expect("read");
+        assert_eq!(lines.len(), 200);
+        assert!(truncated);
+        assert_eq!(lines.last().expect("last"), "line 300");
+        assert_eq!(lines.first().expect("first"), "line 101");
+    }
+
+    #[test]
+    fn a_small_tail_is_not_truncated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("flowhub.log");
+        std::fs::write(&path, "one\ntwo\n").expect("write");
+        let (lines, truncated) = read_tail(path.to_str().expect("path"), 200).expect("read");
+        assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
+        assert!(!truncated);
+    }
+
+    fn payload_with_log(path: &str) -> String {
+        PAYLOAD.replace("/tmp/flowhub.log", path)
+    }
+
+    #[test]
+    fn a_loopback_hub_tail_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("flowhub.log");
+        std::fs::write(&log, "alpha\nbeta\n").expect("write");
+        let (url, server) = serve(200, payload_with_log(log.to_str().expect("path")));
+        let report = tauri::async_runtime::block_on(logs(&url, None, 200)).expect("logs");
+        assert_eq!(report.state, LogState::Ok);
+        assert_eq!(report.lines, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(report.can_use_service_path);
+        assert!(!report.truncated);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn a_disabled_log_and_a_missing_file_are_states() {
+        let (url, server) = serve(200, PAYLOAD.replace("/tmp/flowhub.log", "-"));
+        let report = tauri::async_runtime::block_on(logs(&url, None, 200)).expect("logs");
+        assert_eq!(report.state, LogState::Disabled);
+        assert!(report.lines.is_empty());
+        server.join().expect("server");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-yet.log");
+        let (url, server) = serve(200, payload_with_log(missing.to_str().expect("path")));
+        let report = tauri::async_runtime::block_on(logs(&url, None, 200)).expect("logs");
+        assert_eq!(report.state, LogState::Missing);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn a_confirmed_path_beats_the_service_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("local.log");
+        std::fs::write(&log, "chosen\n").expect("write");
+        let (url, server) = serve(200, PAYLOAD.to_string());
+        let report =
+            tauri::async_runtime::block_on(logs(&url, Some(log.to_str().expect("path")), 200))
+                .expect("logs");
+        assert_eq!(report.state, LogState::Ok);
+        assert_eq!(report.lines, vec!["chosen".to_string()]);
         server.join().expect("server");
     }
 }

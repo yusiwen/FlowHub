@@ -172,6 +172,23 @@ export interface HubCounters {
   reject_reasons?: Record<string, number>;
 }
 
+export type HubLogState =
+  | "ok"
+  | "needs-path"
+  | "disabled"
+  | "missing"
+  | "unreadable";
+
+export interface HubLogs {
+  state: HubLogState;
+  path: string;
+  service_path: string;
+  can_use_service_path: boolean;
+  lines: string[];
+  truncated: boolean;
+  detail: string;
+}
+
 export interface SessionView {
   sidebar_visible: boolean;
   active: string | null;

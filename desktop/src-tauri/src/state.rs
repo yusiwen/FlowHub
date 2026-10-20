@@ -1,4 +1,5 @@
 use crate::health::HealthReport;
+use crate::prefs::PrefsStore;
 use crate::session::SessionStore;
 use crate::store::{Store, StoreError};
 use crate::tabs::TabManager;
@@ -15,6 +16,7 @@ pub struct AppState {
     pub store: Mutex<Store>,
     pub tabs: Mutex<TabManager>,
     pub session: Mutex<SessionStore>,
+    pub prefs: Mutex<PrefsStore>,
     pub health: Mutex<HashMap<Uuid, HealthReport>>,
     pub probing: AtomicBool,
 }
@@ -22,6 +24,12 @@ pub struct AppState {
 impl AppState {
     pub fn load(dir: &Path) -> Result<Self, StoreError> {
         let store = Store::load(dir)?;
+        let prefs = PrefsStore::load(dir);
+        if prefs.needs_save() {
+            if let Err(error) = prefs.save() {
+                eprintln!("prefs: {error}");
+            }
+        }
         let mut session = SessionStore::load(dir);
 
         let valid: HashSet<Uuid> = store
@@ -46,10 +54,18 @@ impl AppState {
             store: Mutex::new(store),
             tabs: Mutex::new(tabs),
             session: Mutex::new(session),
+            prefs: Mutex::new(prefs),
             health: Mutex::new(HashMap::new()),
             probing: AtomicBool::new(false),
         })
     }
+}
+
+pub fn lock_prefs<'a>(state: &'a AppState) -> Result<MutexGuard<'a, PrefsStore>, String> {
+    state
+        .prefs
+        .lock()
+        .map_err(|_| "preferences lock poisoned".to_string())
 }
 
 pub fn lock_tabs<'a>(state: &'a AppState) -> Result<MutexGuard<'a, TabManager>, String> {

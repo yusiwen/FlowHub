@@ -10,6 +10,7 @@ import type {
   AuthOkEvent,
   AuthFailedEvent,
   HealthReport,
+  HubLogs,
   HubSnapshot,
   Role,
   SessionView,
@@ -122,6 +123,14 @@ export const probeAll = (): Promise<HealthReport[]> =>
 
 export const hubSnapshot = (id: string): Promise<HubSnapshot> =>
   invoke<HubSnapshot>("hub_snapshot", { id });
+
+export const hubLogs = (id: string): Promise<HubLogs> =>
+  invoke<HubLogs>("hub_logs", { id });
+
+export const setHubLogPath = (
+  id: string,
+  path: string | null,
+): Promise<void> => invoke<void>("set_hub_log_path", { id, path });
 
 export const onHubReload = (handler: () => void): Promise<UnlistenFn> =>
   listen("hub://reload", () => handler());

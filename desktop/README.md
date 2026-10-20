@@ -36,7 +36,8 @@ check for a Go-only pull request.
 | `src-tauri/src/session.rs` | the versioned `session.json`: open tab ids, active tab, sidebar visibility |
 | `src-tauri/src/auth.rs` | dsh launch-token parsing, the token URL, and the authority-hashed cookie name |
 | `src-tauri/src/health.rs` | reachability probes and the `ok` / `auth` / `http` / `unreachable` classes |
-| `src-tauri/src/hub.rs` | read-only `/healthz` client behind the Hub dashboard |
+| `src-tauri/src/hub.rs` | read-only `/healthz` client and the log tail behind the Hub dashboard |
+| `src-tauri/src/prefs.rs` | local preferences: the confirmed log path per Hub |
 | `src-tauri/src/menu.rs` | macOS menu, accelerators, and the window-close lifecycle |
 | `src-tauri/capabilities/shell.json` | IPC grant for the `shell` webview only |
 | `src-tauri/icons/icon.svg` | the icon master, and the generated PNG/ICNS/ICO set next to it |
@@ -84,7 +85,14 @@ Switching back shows the page again without a reload.
 The dashboard is read-only and unauthenticated. It does not call the control API
 and stores no admin token. `/healthz` lives on the webhook listener, which nginx
 never proxies, so a remote hub must expose that listener (or go through a tunnel).
-Logs are the next slice (#77).
+
+The Logs card reads the service's `app_log`. A loopback Hub (`127.0.0.0/8`, `::1`,
+`localhost`) is trusted to name its own file because it runs on this machine as
+this user; any other address is only ever *shown* the reported path and needs a
+path the user confirms in the dashboard. That choice is stored per instance in
+`prefs.json` (`0644`, no secret). The reader returns the last 256 KiB / 200 lines,
+drops a partial first line, and reports truncation; it never writes or follows.
+Clearing the path falls back to the loopback rule.
 
 ## Tabs
 
@@ -228,5 +236,8 @@ the Dock tile from `icon.icns` — Tauri's codegen reads that list in developmen
   sign-in is a webview cookie, not a registry field.
 - The Hub dashboard is read-only: it calls `/healthz` and nothing else, and the app
   stores no control API token.
+- The path a *remote* Hub reports for its log is never opened; only a path the user
+  confirmed locally is read. A configured URL must not become an arbitrary-file-read
+  primitive.
 
 See `docs/adr/0008-desktop-agent-hub.md` for the decision record.

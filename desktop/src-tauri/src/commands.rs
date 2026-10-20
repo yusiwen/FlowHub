@@ -1,9 +1,9 @@
 use crate::auth;
 use crate::health::{self, HealthReport};
-use crate::hub::{self, HubSnapshot};
+use crate::hub::{self, HubLogs, HubSnapshot};
 use crate::model::{AuthMode, Instance, InstanceInput};
 use crate::session::SessionView;
-use crate::state::{lock_session, lock_tabs, AppState};
+use crate::state::{lock_prefs, lock_session, lock_tabs, AppState};
 use crate::store::lock;
 use crate::tabs::{viewport_top_inset, StageBounds, TabInfo};
 use serde::Serialize;
@@ -161,6 +161,9 @@ pub fn remove_instance(id: Uuid, state: State<'_, AppState>, app: AppHandle) -> 
     lock(&state.store)?
         .remove(id)
         .map_err(|error| error.to_string())?;
+    if let Ok(mut prefs) = lock_prefs(&state) {
+        let _ = prefs.remove(id);
+    }
     if let Ok(mut health) = state.health.lock() {
         health.remove(&id);
     }
@@ -201,6 +204,60 @@ pub async fn hub_snapshot(id: Uuid, state: State<'_, AppState>) -> Result<HubSna
         return Err("instance is not a FlowHub service".to_string());
     }
     hub::fetch(&instance.url).await
+}
+
+/// The Hub's log tail. The path decision lives here, not in the shell: a
+/// loopback service's `app_log` is read, a remote one may only use a path the
+/// user confirmed in `prefs.json`.
+#[tauri::command]
+pub async fn hub_logs(id: Uuid, state: State<'_, AppState>) -> Result<HubLogs, String> {
+    let instance = {
+        let guard = lock(&state.store)?;
+        guard
+            .instances()
+            .iter()
+            .find(|instance| instance.id == id)
+            .cloned()
+            .ok_or_else(|| format!("no such instance: {id}"))?
+    };
+    if !instance.is_dashboard() {
+        return Err("instance is not a FlowHub service".to_string());
+    }
+    let confirmed = {
+        let prefs = lock_prefs(&state)?;
+        prefs.hub_log_path(id).map(ToOwned::to_owned)
+    };
+    hub::logs(&instance.url, confirmed.as_deref(), hub::DEFAULT_LOG_LINES).await
+}
+
+#[tauri::command]
+pub fn set_hub_log_path(
+    id: Uuid,
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let is_hub = {
+        let guard = lock(&state.store)?;
+        guard
+            .instances()
+            .iter()
+            .find(|instance| instance.id == id)
+            .map(|instance| instance.is_dashboard())
+            .unwrap_or(false)
+    };
+    if !is_hub {
+        return Err("instance is not a FlowHub service".to_string());
+    }
+    let trimmed = path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    if let Some(path) = trimmed {
+        if !std::path::Path::new(path).is_absolute() {
+            return Err("the log path must be absolute".to_string());
+        }
+    }
+    lock_prefs(&state)?.set_hub_log_path(id, trimmed)
 }
 
 #[tauri::command]
