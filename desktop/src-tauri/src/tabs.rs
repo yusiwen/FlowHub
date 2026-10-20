@@ -9,6 +9,7 @@
 //! the webview; the rest stay placeholders until first use.
 
 use crate::auth;
+use crate::health;
 use crate::model::{AuthMode, Instance};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -331,6 +332,16 @@ impl TabManager {
             tab.auth_required = auth_required;
         }
 
+        // A cookie can be present and still be dead — expired, or signed with a
+        // secret the dsh data directory no longer has. Verify this tab with its
+        // own cookie once, so a page that only answers 401 is replaced by the
+        // token panel instead of waiting for the next periodic probe.
+        if !auth_required {
+            if let Some(instance) = self.tabs.get(&id).map(|tab| tab.instance.clone()) {
+                health::verify_tab(app.clone(), instance);
+            }
+        }
+
         if auth_required {
             if let Some(webview) = self.tabs.get(&id).and_then(|tab| tab.webview.as_ref()) {
                 webview
@@ -380,7 +391,9 @@ impl TabManager {
         {
             self.ensure_webview(app, id)?;
         }
-        self.apply_visibility()
+        self.apply_visibility()?;
+        self.announce_auth(app, id);
+        Ok(())
     }
 
     pub fn activate_index(&mut self, app: &AppHandle, index: usize) -> Result<(), String> {
@@ -396,8 +409,12 @@ impl TabManager {
             {
                 self.ensure_webview(app, id)?;
             }
+            self.apply_visibility()?;
+            self.announce_auth(app, id);
+        } else {
+            self.apply_visibility()?;
         }
-        self.apply_visibility()
+        Ok(())
     }
 
     pub fn cycle(&mut self, app: &AppHandle, delta: isize) -> Result<(), String> {
@@ -413,8 +430,48 @@ impl TabManager {
             {
                 self.ensure_webview(app, id)?;
             }
+            self.apply_visibility()?;
+            self.announce_auth(app, id);
+        } else {
+            self.apply_visibility()?;
         }
-        self.apply_visibility()
+        Ok(())
+    }
+
+    /// Put a tab back into sign-in because a probe proved its session dead. The
+    /// page is hidden and the shell is asked for a token, exactly as when the
+    /// cookie is missing. Returns whether the state changed.
+    pub fn request_sign_in(&mut self, app: &AppHandle, id: Uuid) -> bool {
+        let Some(tab) = self.tabs.get(&id) else {
+            return false;
+        };
+        if tab.auth_required || tab.webview.is_none() {
+            return false;
+        }
+        if let Some(tab) = self.tabs.get_mut(&id) {
+            tab.auth_required = true;
+        }
+        let _ = self.apply_visibility();
+        self.announce_auth(app, id);
+        true
+    }
+
+    /// Ask the shell for a token for a tab that is waiting for one. Re-emitting
+    /// when the tab is activated is what makes a cancelled panel recoverable.
+    fn announce_auth(&self, app: &AppHandle, id: Uuid) {
+        let Some(tab) = self.tabs.get(&id) else {
+            return;
+        };
+        if !tab.auth_required {
+            return;
+        }
+        let _ = app.emit(
+            "auth://required",
+            AuthRequiredEvent {
+                instance_id: id,
+                instance_name: tab.instance.name.clone(),
+            },
+        );
     }
 
     pub fn reload_active(&self) -> Result<(), String> {

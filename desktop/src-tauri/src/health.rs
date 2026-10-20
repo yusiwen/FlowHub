@@ -55,6 +55,16 @@ pub fn classify(code: u16) -> HealthStatus {
     }
 }
 
+/// A probe that carried the tab's own cookie and came back `Auth` has proved the
+/// session dead: the shell must ask for a token again instead of keeping a page
+/// that only answers 401. A rejection without a credential says nothing about the
+/// session and never triggers a prompt.
+pub fn session_rejected(auth: AuthMode, report: &HealthReport) -> bool {
+    auth == AuthMode::DshToken
+        && report.status == HealthStatus::Auth
+        && report.credential == Credential::Cookie
+}
+
 pub async fn probe_all(app: &AppHandle) -> Vec<HealthReport> {
     if app.state::<AppState>().probing.swap(true, Ordering::SeqCst) {
         return Vec::new();
@@ -89,8 +99,8 @@ pub async fn probe_all(app: &AppHandle) -> Vec<HealthReport> {
 
     let mut reports = Vec::with_capacity(instances.len());
     for instance in instances {
-        let cookie = cookies.get(&instance.id).map(String::as_str);
-        let report = probe_one(&client, &instance, cookie).await;
+        let probe_cookie = cookies.get(&instance.id).cloned();
+        let report = probe_one(&client, &instance, probe_cookie.as_deref()).await;
         {
             let state = app.state::<AppState>();
             let guard = state.health.lock();
@@ -99,6 +109,20 @@ pub async fn probe_all(app: &AppHandle) -> Vec<HealthReport> {
             }
         }
         let _ = app.emit("health://changed", report.clone());
+        if session_rejected(instance.auth, &report) {
+            // The tab may have been signed in again while this probe was in
+            // flight, so only a verdict about the cookie the tab holds *now* may
+            // put it back into sign-in. The health lock is released above; the
+            // tab manager is taken after it and never the other way round.
+            let current = dsh_cookies(app, std::slice::from_ref(&instance));
+            if current.get(&instance.id) == probe_cookie.as_ref() {
+                let state = app.state::<AppState>();
+                let tabs = lock_tabs(&state);
+                if let Ok(mut tabs) = tabs {
+                    tabs.request_sign_in(app, instance.id);
+                }
+            }
+        }
         reports.push(report);
     }
 
@@ -145,6 +169,50 @@ fn cookie_header(webview: &Webview, base: &Url) -> Option<String> {
         .iter()
         .find(|cookie| cookie.name() == expected.as_str())?;
     Some(format!("{}={}", cookie.name(), cookie.value()))
+}
+
+/// Verify a freshly loaded tab with the cookie it holds, and put it back into
+/// sign-in when the server rejects that cookie. Runs on the async runtime because
+/// reading cookies blocks on the main thread, and the caller may hold the tab
+/// manager's lock.
+pub fn verify_tab(app: AppHandle, instance: Instance) {
+    if instance.auth != AuthMode::DshToken {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let Some(cookie) = tab_cookie(&app, &instance) else {
+            return;
+        };
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        else {
+            return;
+        };
+        let report = probe_one(&client, &instance, Some(&cookie)).await;
+        if session_rejected(instance.auth, &report) {
+            let state = app.state::<AppState>();
+            let tabs = lock_tabs(&state);
+            if let Ok(mut tabs) = tabs {
+                tabs.request_sign_in(&app, instance.id);
+            }
+        }
+    });
+}
+
+/// The `Cookie` header a loaded tab holds for this instance.
+fn tab_cookie(app: &AppHandle, instance: &Instance) -> Option<String> {
+    let base = Url::parse(&instance.url).ok()?;
+    let webview = {
+        let state = app.state::<AppState>();
+        let tabs = lock_tabs(&state).ok()?;
+        tabs.loaded_webviews()
+            .into_iter()
+            .find(|(id, _, _)| *id == instance.id)
+            .map(|(_, webview, _)| webview)
+    };
+    cookie_header(&webview?, &base)
 }
 
 async fn probe_one(
@@ -229,6 +297,32 @@ mod tests {
         assert_eq!(classify(403), HealthStatus::Auth);
         assert_eq!(classify(404), HealthStatus::Http);
         assert_eq!(classify(500), HealthStatus::Http);
+    }
+
+    #[test]
+    fn only_a_rejected_session_asks_for_a_token_again() {
+        let report = |status, credential| HealthReport {
+            instance_id: Uuid::new_v4(),
+            status,
+            latency_ms: 1,
+            credential,
+        };
+        assert!(session_rejected(
+            AuthMode::DshToken,
+            &report(HealthStatus::Auth, Credential::Cookie)
+        ));
+        assert!(!session_rejected(
+            AuthMode::DshToken,
+            &report(HealthStatus::Auth, Credential::None)
+        ));
+        assert!(!session_rejected(
+            AuthMode::DshToken,
+            &report(HealthStatus::Ok, Credential::Cookie)
+        ));
+        assert!(!session_rejected(
+            AuthMode::None,
+            &report(HealthStatus::Auth, Credential::Cookie)
+        ));
     }
 
     #[test]
