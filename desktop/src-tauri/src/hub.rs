@@ -408,6 +408,19 @@ mod tests {
     }
 
     #[test]
+    fn a_second_read_sees_an_appended_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("flowhub.log");
+        std::fs::write(&path, "first\n").expect("write");
+        let (lines, _) = read_tail(path.to_str().expect("path"), 200).expect("read");
+        assert_eq!(lines, vec!["first".to_string()]);
+
+        std::fs::write(&path, "first\nsecond\n").expect("append");
+        let (lines, _) = read_tail(path.to_str().expect("path"), 200).expect("read");
+        assert_eq!(lines, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
     fn a_small_tail_is_not_truncated() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("flowhub.log");
