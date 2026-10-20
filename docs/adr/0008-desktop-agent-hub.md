@@ -92,8 +92,10 @@ webview. Other platforms are out of scope for now.
   top. Removing that offset makes each tab cover the tab bar.
 - The app is not part of the Go binary or its release artifacts. The only shared
   contract is the repository and the documentation.
-- M2 polish (downloads, popups, tab hibernation, packaging) is tracked as
-  follow-up issues after the usable M1 app lands.
+- M2 polish (downloads, popups, tab hibernation) is tracked as follow-up issues
+  after the usable M1 app lands. Packaging landed as #83: a build writes
+  `FlowHub.app`, whose `Info.plist` is the application record macOS resolves the
+  name and the icon from — a bare executable gets neither.
 
 ## Alternatives considered
 

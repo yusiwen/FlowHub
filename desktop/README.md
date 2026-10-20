@@ -19,12 +19,18 @@ The Go service and this app share a repository, not a build: the app lives in
 make desktop-install   # pnpm install
 make desktop-dev       # Vite + Tauri dev window
 make desktop-check     # tsc --noEmit, cargo fmt, clippy, cargo test
-make desktop-build     # release bundle (after the packaging slice lands)
+make desktop-app       # build the debug bundle and open it
+make desktop-build     # release app bundle
 ```
 
+`pnpm tauri dev` runs the compiled binary directly, so a development window is not an
+application as far as macOS is concerned. `make desktop-app` builds the same debug
+binary into `FlowHub.app` and opens it.
+
 The same checks run in `.github/workflows/desktop.yml` on an arm64 macOS runner
-for `desktop/**` changes. The workflow is path-filtered, so it is not a required
-check for a Go-only pull request.
+for `desktop/**` changes: `make desktop-check`, then a debug bundle that the job
+asserts carries the icon and the bundle identifier. The workflow is path-filtered, so
+it is not a required check for a Go-only pull request.
 
 ## Layout
 
@@ -232,9 +238,18 @@ The script renders each size natively in a headless Chromium-family browser
 `icon.icns` through `iconutil`, and `icon.ico` through ImageMagick when it is
 installed. `sips` and `iconutil` ship with macOS; no other tool is required.
 
-`bundle.icon` lists the generated files, which is what makes `pnpm tauri dev` set
-the Dock tile from `icon.icns` — Tauri's codegen reads that list in development.
-`bundle.active` stays `false` until the packaging slice lands.
+`bundle.icon` lists the generated files and `bundle.active` is on, so a build writes
+`FlowHub.app` with `CFBundleIconFile = icon.icns`, the same icns in
+`Contents/Resources`, and `CFBundleIdentifier = cn.yusiwen.flowhub`. That Info.plist is
+the application record LaunchServices resolves the name and the icon from, and it is
+what the Dock, the app switcher and Stage Manager draw.
+
+`pnpm tauri dev` cannot have one: it runs `target/debug/flowhub-desktop`, a bare
+executable, and macOS gives a bundle-less process the generic placeholder icon. Tauri's
+development code path also calls `NSApplication.setApplicationIconImage` with the same
+icns (the bytes are compiled into the binary), but that overrides the Dock tile only —
+Stage Manager still asks LaunchServices. `make desktop-app` is the development run that
+has the icon.
 
 ## Security invariants
 

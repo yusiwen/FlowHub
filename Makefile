@@ -28,7 +28,7 @@ PLATFORM_LIST = \
 
 .PHONY: default build run secrets test test-race test-live test-repeat lint staticcheck \
 	fmt fmt-check smoke clean all releases \
-	desktop-install desktop-dev desktop-build desktop-check desktop-clean
+	desktop-install desktop-dev desktop-app desktop-build desktop-check desktop-clean
 
 default: build
 
@@ -168,6 +168,13 @@ desktop-dev:
 
 desktop-build:
 	cd desktop && pnpm tauri build
+
+# Run the app as an app. `tauri dev` launches a bare executable, so macOS has no
+# application record to take the name and the icon from — Stage Manager draws a
+# placeholder for it. This bundles the debug build and opens the bundle instead.
+desktop-app:
+	cd desktop && pnpm tauri build --debug --bundles app
+	open "$(CURDIR)/desktop/src-tauri/target/debug/bundle/macos/FlowHub.app"
 
 desktop-check:
 	cd desktop && pnpm exec tsc --noEmit

@@ -87,7 +87,8 @@ Nix flakes in a git repository only see files in the git index. New files must b
 
 The desktop app under `desktop/` is a separate Tauri/Rust/Node toolchain. It is
 not part of the Go module or its build: no cgo, no FFI edge. Use
-`make desktop-install`, `make desktop-dev` and `make desktop-check`; the design is
+`make desktop-install`, `make desktop-dev`, `make desktop-app` and
+`make desktop-check`; the design is
 recorded in `docs/adr/0008-desktop-agent-hub.md`,
 `docs/adr/0009-desktop-three-views.md`, `docs/adr/0010-role-colour.md` and
 `desktop/README.md`.
@@ -463,6 +464,7 @@ builds linux/amd64, linux/arm64 and darwin/arm64 and asserts each artifact's for
 `test-darwin` runs `make test` on macOS, where path handling differs (`/tmp` is a symlink
 to `/private/tmp`, which `localworktree` canonicalises). The action pins are kept current
 by Dependabot (`.github/dependabot.yml`). A separate path-filtered workflow,
-`.github/workflows/desktop.yml`, runs `make desktop-check` and a no-bundle Tauri build on
+`.github/workflows/desktop.yml`, runs `make desktop-check`, then builds a debug
+`FlowHub.app` and asserts the bundle carries the icon and the bundle identifier, on
 an arm64 macOS runner for `desktop/**` changes; because it is filtered, it is not a
 required check for a Go-only pull request.
