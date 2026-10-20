@@ -14,6 +14,18 @@ pub enum InstanceKind {
     DshWeb,
     Opencode,
     Other,
+    Youtrack,
+}
+
+/// The role an instance plays in FlowHub's three views: the upstream trackers
+/// that produce work, and the downstream agents that perform it. The role is
+/// derived from the kind so a registry row cannot claim one role and behave like
+/// another; the Hub kind and its `Self` role arrive with the dashboard slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
+    Upstream,
+    Downstream,
 }
 
 impl InstanceKind {
@@ -22,7 +34,14 @@ impl InstanceKind {
     pub fn default_auth(self) -> AuthMode {
         match self {
             Self::DshWeb => AuthMode::DshToken,
-            Self::Opencode | Self::Other => AuthMode::None,
+            Self::Opencode | Self::Other | Self::Youtrack => AuthMode::None,
+        }
+    }
+
+    pub fn role(self) -> Role {
+        match self {
+            Self::Youtrack => Role::Upstream,
+            Self::DshWeb | Self::Opencode | Self::Other => Role::Downstream,
         }
     }
 }
@@ -137,6 +156,10 @@ impl Instance {
         normalize_url(&self.url)?;
         Ok(())
     }
+
+    pub fn role(&self) -> Role {
+        self.kind.role()
+    }
 }
 
 fn normalize_url(raw: &str) -> Result<String, String> {
@@ -237,5 +260,33 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(oc.auth, AuthMode::None);
+    }
+
+    #[test]
+    fn roles_are_derived_from_the_kind() {
+        assert_eq!(InstanceKind::Youtrack.role(), Role::Upstream);
+        for kind in [
+            InstanceKind::DshWeb,
+            InstanceKind::Opencode,
+            InstanceKind::Other,
+        ] {
+            assert_eq!(kind.role(), Role::Downstream);
+        }
+    }
+
+    #[test]
+    fn youtrack_needs_no_token_and_keeps_its_kind_on_disk() {
+        let tracker = Instance::from_input(
+            &input("yt", InstanceKind::Youtrack, "https://youtrack.example.com"),
+            0,
+        )
+        .expect("valid");
+        assert_eq!(tracker.auth, AuthMode::None);
+
+        let json = serde_json::to_string(&tracker).expect("serialize");
+        assert!(json.contains(r#""kind":"youtrack""#), "{json}");
+        let parsed: Instance = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.kind, InstanceKind::Youtrack);
+        assert_eq!(parsed.role(), Role::Upstream);
     }
 }

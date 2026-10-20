@@ -10,6 +10,7 @@ import type {
   AuthOkEvent,
   AuthFailedEvent,
   HealthReport,
+  Role,
   SessionView,
 } from "./types";
 
@@ -81,6 +82,14 @@ export const onTabTitle = (
 
 export const onToggleSidebar = (handler: () => void): Promise<UnlistenFn> =>
   listen("menu://toggle-sidebar", () => handler());
+
+export const onNewTab = (handler: () => void): Promise<UnlistenFn> =>
+  listen("menu://new-tab", () => handler());
+
+export const onScopeSelect = (
+  handler: (scope: Role) => void,
+): Promise<UnlistenFn> =>
+  listen<Role>("scope://select", (event) => handler(event.payload));
 
 export const submitToken = (id: string, input: string): Promise<void> =>
   invoke<void>("submit_token", { id, input });

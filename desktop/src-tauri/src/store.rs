@@ -296,6 +296,25 @@ mod tests {
     }
 
     #[test]
+    fn a_youtrack_row_round_trips_through_version_1() {
+        let (dir, mut store) = temp_store();
+        store
+            .add(&input(
+                "yt",
+                InstanceKind::Youtrack,
+                "https://youtrack.example.com",
+            ))
+            .expect("add");
+        let raw = fs::read_to_string(dir.path().join(REGISTRY_FILE)).expect("read");
+        assert!(raw.contains("\"version\": 1"), "{raw}");
+        assert!(raw.contains("\"kind\": \"youtrack\""), "{raw}");
+
+        let reloaded = Store::load(dir.path()).expect("reload");
+        assert_eq!(reloaded.instances()[0].kind, InstanceKind::Youtrack);
+        assert_eq!(reloaded.instances()[0].role(), crate::model::Role::Upstream);
+    }
+
+    #[test]
     fn unknown_version_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(

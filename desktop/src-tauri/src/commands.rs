@@ -6,7 +6,6 @@ use crate::state::{lock_session, lock_tabs, AppState};
 use crate::store::lock;
 use crate::tabs::{viewport_top_inset, StageBounds, TabInfo};
 use serde::Serialize;
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
@@ -112,34 +111,6 @@ pub(crate) fn open_in_browser(state: &AppState) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("open in browser: {error}"))
-}
-
-/// Cmd+T: open the first instance that has no tab. When every instance is
-/// already open, cycle to the next tab instead of creating a duplicate (one
-/// instance owns one tab).
-pub(crate) fn open_next_instance(
-    app: &AppHandle,
-    state: &AppState,
-) -> Result<Option<TabInfo>, String> {
-    let instances = snapshot(state)?;
-    if instances.is_empty() {
-        return Ok(None);
-    }
-    let open: HashSet<Uuid> = lock_tabs(state)?
-        .list()
-        .iter()
-        .map(|tab| tab.instance_id)
-        .collect();
-    if let Some(instance) = instances
-        .iter()
-        .find(|instance| !open.contains(&instance.id))
-    {
-        return open_instance(app, state, instance.id).map(Some);
-    }
-    lock_tabs(state)?.cycle(app, 1)?;
-    broadcast_tabs(app, state)?;
-    persist_session(state)?;
-    Ok(None)
 }
 
 #[tauri::command]

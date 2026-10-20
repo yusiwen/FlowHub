@@ -10,7 +10,7 @@
 
 use crate::auth;
 use crate::health;
-use crate::model::{AuthMode, Instance};
+use crate::model::{AuthMode, Instance, Role};
 use serde::Serialize;
 use std::collections::HashMap;
 use tauri::webview::{NewWindowResponse, PageLoadEvent, Webview, WebviewBuilder};
@@ -61,6 +61,7 @@ impl StageBounds {
 pub struct TabInfo {
     pub instance_id: Uuid,
     pub instance_name: String,
+    pub role: Role,
     pub title: String,
     pub url: String,
     pub loading: bool,
@@ -615,6 +616,7 @@ impl TabManager {
         TabInfo {
             instance_id: id,
             instance_name: tab.instance.name.clone(),
+            role: tab.instance.role(),
             title: tab.title.clone(),
             url: tab.url.clone(),
             loading: tab.loading,
@@ -668,7 +670,7 @@ impl TabManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{InstanceInput, InstanceKind};
+    use crate::model::{InstanceInput, InstanceKind, Role};
 
     fn id() -> Uuid {
         Uuid::new_v4()
@@ -811,6 +813,24 @@ mod tests {
             manager.session_snapshot(),
             (vec![second.id, first.id], Some(first.id))
         );
+    }
+
+    #[test]
+    fn restored_tabs_carry_the_role_of_their_instance() {
+        let tracker = instance(
+            "yt",
+            InstanceKind::Youtrack,
+            "https://youtrack.example.com/",
+        );
+        let agent = instance("oc", InstanceKind::Opencode, "http://127.0.0.1:4096");
+        let manager = TabManager::restore(
+            &[tracker.clone(), agent.clone()],
+            &[tracker.id, agent.id],
+            None,
+        );
+        let tabs = manager.list();
+        assert_eq!(tabs[0].role, Role::Upstream);
+        assert_eq!(tabs[1].role, Role::Downstream);
     }
 
     #[test]

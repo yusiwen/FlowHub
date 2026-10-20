@@ -1,5 +1,6 @@
 import type { HealthReport, Instance } from "../types";
 import { kindLabel } from "../types";
+import type { Role } from "../types";
 
 export interface SidebarActions {
   onAdd: () => void;
@@ -7,6 +8,23 @@ export interface SidebarActions {
   onRemove: (instance: Instance) => void;
   onMove: (instance: Instance, direction: -1 | 1) => void;
   onOpen: (instance: Instance) => void;
+  onScope: (scope: Role) => void;
+}
+
+const SCOPES: ReadonlyArray<{ value: Role; label: string }> = [
+  { value: "upstream", label: "Upstream" },
+  { value: "downstream", label: "Instances" },
+];
+
+function countLabel(scope: Role, count: number): string {
+  const noun = scope === "upstream" ? "upstream" : "instance";
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+function emptyLabel(scope: Role): string {
+  return scope === "upstream"
+    ? "No upstream yet. Add the YouTrack URL you work from."
+    : "No instances yet. Add the dsh web and opencode URLs you use.";
 }
 
 function button(label: string, action: string, title: string): HTMLButtonElement {
@@ -110,17 +128,35 @@ function row(
 
 export function renderSidebar(
   root: HTMLElement,
+  scope: Role,
   instances: Instance[],
   health: Map<string, HealthReport>,
   actions: SidebarActions,
 ): void {
   root.replaceChildren();
 
+  const switcher = document.createElement("div");
+  switcher.className = "scope-switch";
+  switcher.setAttribute("role", "tablist");
+  switcher.setAttribute("aria-label", "View");
+  for (const candidate of SCOPES) {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = `scope-option${candidate.value === scope ? " active" : ""}`;
+    option.dataset.scope = candidate.value;
+    option.setAttribute("role", "tab");
+    option.setAttribute("aria-selected", String(candidate.value === scope));
+    option.title = `${candidate.label} view (Cmd+Shift+${candidate.value === "upstream" ? 1 : 2})`;
+    option.textContent = candidate.label;
+    switcher.append(option);
+  }
+
   const header = document.createElement("div");
   header.className = "sidebar-header";
 
-  const title = document.createElement("h1");
-  title.textContent = "Instances";
+  const summary = document.createElement("span");
+  summary.className = "scope-summary";
+  summary.textContent = countLabel(scope, instances.length);
 
   const add = document.createElement("button");
   add.type = "button";
@@ -128,31 +164,32 @@ export function renderSidebar(
   add.dataset.action = "add";
   add.textContent = "Add";
 
-  header.append(title, add);
+  header.append(summary, add);
 
   const list = document.createElement("ul");
   list.className = "instance-list";
 
+  root.append(switcher, header);
+
   if (instances.length === 0) {
     const empty = document.createElement("p");
     empty.className = "sidebar-empty";
-    empty.textContent =
-      "No instances yet. Add the dsh web and opencode URLs you use.";
-    root.append(header, empty);
-    root.onclick = (event) => {
-      const target = event.target as HTMLElement;
-      if (target.closest('[data-action="add"]') !== null) actions.onAdd();
-    };
-    return;
+    empty.textContent = emptyLabel(scope);
+    root.append(empty);
+  } else {
+    instances.forEach((instance, index) => {
+      list.append(row(instance, index, instances.length, health));
+    });
+    root.append(list);
   }
-
-  instances.forEach((instance, index) => {
-    list.append(row(instance, index, instances.length, health));
-  });
-  root.append(header, list);
 
   root.onclick = (event) => {
     const element = event.target as HTMLElement;
+    const scopeButton = element.closest<HTMLButtonElement>("button[data-scope]");
+    if (scopeButton !== null) {
+      actions.onScope(scopeButton.dataset.scope as Role);
+      return;
+    }
     const button = element.closest<HTMLButtonElement>("button[data-action]");
     if (button === null) {
       const owner = element.closest<HTMLLIElement>("li[data-id]");
