@@ -66,9 +66,12 @@ function row(
   index: number,
   total: number,
   health: Map<string, HealthReport>,
+  activeId: string | null,
 ): HTMLLIElement {
   const item = document.createElement("li");
-  item.className = "instance";
+  // The row backing the active tab owns the 3px marker; every other row is
+  // plain, so the list and the strip always name the same object.
+  item.className = instance.id === activeId ? "instance active" : "instance";
   item.dataset.id = instance.id;
   item.tabIndex = 0;
   item.title = "Open in a tab";
@@ -137,6 +140,7 @@ export function renderSidebar(
   scope: Role,
   instances: Instance[],
   health: Map<string, HealthReport>,
+  activeId: string | null,
   actions: SidebarActions,
 ): void {
   root.replaceChildren();
@@ -175,19 +179,29 @@ export function renderSidebar(
   const list = document.createElement("ul");
   list.className = "instance-list";
 
-  root.append(switcher, header);
+  const top = document.createElement("div");
+  top.className = "sidebar-top";
+  top.append(switcher);
+
+  // The count/Add row sits below the band, so the band can be exactly as tall
+  // as the tab strip and the two colour lines meet at one y.
+  const body = document.createElement("div");
+  body.className = "sidebar-body";
+  body.append(header);
 
   if (instances.length === 0) {
     const empty = document.createElement("p");
     empty.className = "sidebar-empty";
     empty.textContent = emptyLabel(scope);
-    root.append(empty);
+    body.append(empty);
   } else {
     instances.forEach((instance, index) => {
-      list.append(row(instance, index, instances.length, health));
+      list.append(row(instance, index, instances.length, health, activeId));
     });
-    root.append(list);
+    body.append(list);
   }
+
+  root.append(top, body);
 
   root.onclick = (event) => {
     const element = event.target as HTMLElement;
