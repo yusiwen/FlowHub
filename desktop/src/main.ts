@@ -5,6 +5,7 @@ import {
   activateTab,
   addInstance,
   closeTab,
+  hubLogs,
   hubSnapshot,
   listHealth,
   listInstances,
@@ -27,6 +28,7 @@ import {
   removeInstance,
   reorderInstances,
   setContentVisible,
+  setHubLogPath,
   setSidebarVisible,
   setStageBounds,
   submitToken,
@@ -35,6 +37,7 @@ import {
 import { roleOf } from "./types";
 import type {
   HealthReport,
+  HubLogs,
   HubSnapshot,
   Instance,
   Role,
@@ -72,6 +75,18 @@ app.innerHTML = `
           <p class="hub-warning" id="hub-warning" hidden></p>
           <p class="hub-error" id="hub-error" role="alert" hidden></p>
           <div class="hub-grid" id="hub-cards"></div>
+          <section class="hub-card hub-logs" id="hub-logs">
+            <h3>Logs</h3>
+            <p class="hub-log-path" id="hub-log-path"></p>
+            <p class="hub-log-state" id="hub-log-state"></p>
+            <pre class="hub-log" id="hub-log-lines" hidden></pre>
+            <div class="hub-log-form">
+              <input id="hub-log-input" autocomplete="off" spellcheck="false" placeholder="/path/to/flowhub.log" />
+              <button type="button" class="ghost-button" id="hub-log-save">Save</button>
+              <button type="button" class="ghost-button" id="hub-log-use" hidden>Use service path</button>
+              <button type="button" class="ghost-button" id="hub-log-refresh">Refresh</button>
+            </div>
+          </section>
         </section>
         <div class="auth-panel" id="auth-panel" hidden>
           <form class="auth-card" id="auth-form">
@@ -113,6 +128,13 @@ const hubWarning = document.querySelector<HTMLElement>("#hub-warning")!;
 const hubError = document.querySelector<HTMLElement>("#hub-error")!;
 const hubCards = document.querySelector<HTMLElement>("#hub-cards")!;
 const hubRefresh = document.querySelector<HTMLButtonElement>("#hub-refresh")!;
+const hubLogPath = document.querySelector<HTMLElement>("#hub-log-path")!;
+const hubLogState = document.querySelector<HTMLElement>("#hub-log-state")!;
+const hubLogLines = document.querySelector<HTMLElement>("#hub-log-lines")!;
+const hubLogInput = document.querySelector<HTMLInputElement>("#hub-log-input")!;
+const hubLogSave = document.querySelector<HTMLButtonElement>("#hub-log-save")!;
+const hubLogUse = document.querySelector<HTMLButtonElement>("#hub-log-use")!;
+const hubLogRefresh = document.querySelector<HTMLButtonElement>("#hub-log-refresh")!;
 
 let instances: Instance[] = [];
 let tabs: TabInfo[] = [];
@@ -129,6 +151,9 @@ let hubFailed = false;
 let hubLoading = false;
 let hubRequest = 0;
 let hubTimer: number | null = null;
+let hubLogsValue: HubLogs | null = null;
+let hubLogsError: string | null = null;
+let hubLogsRequest = 0;
 
 function showError(error: unknown): void {
   errorBar.textContent = error instanceof Error ? error.message : String(error);
@@ -481,6 +506,28 @@ void onHubReload(() => {
 
 hubRefresh.addEventListener("click", () => {
   void fetchHub();
+  void fetchHubLogs();
+});
+
+hubLogSave.addEventListener("click", () => {
+  const value = hubLogInput.value.trim();
+  void saveHubLogPath(value === "" ? null : value);
+});
+
+hubLogInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    hubLogSave.click();
+  }
+});
+
+hubLogUse.addEventListener("click", () => {
+  const servicePath = hubLogsValue?.service_path ?? "";
+  if (servicePath !== "") void saveHubLogPath(servicePath);
+});
+
+hubLogRefresh.addEventListener("click", () => {
+  void fetchHubLogs();
 });
 
 void onHealthChanged((report) => {
@@ -774,6 +821,82 @@ function renderHub(): void {
   hubCards.append(paths.card);
 }
 
+async function fetchHubLogs(): Promise<void> {
+  const id = hubTabId;
+  if (id === null) return;
+  const sequence = ++hubLogsRequest;
+  try {
+    const logs = await hubLogs(id);
+    if (sequence !== hubLogsRequest || hubTabId !== id) return;
+    hubLogsValue = logs;
+    hubLogsError = null;
+    renderHubLogs();
+  } catch (error) {
+    if (sequence !== hubLogsRequest || hubTabId !== id) return;
+    hubLogsValue = null;
+    hubLogsError = error instanceof Error ? error.message : String(error);
+    renderHubLogs();
+  }
+}
+
+function renderHubLogs(): void {
+  const logs = hubLogsValue;
+  hubLogPath.textContent =
+    logs === null ? "" : `Path: ${logs.path || logs.service_path || "—"}`;
+  hubLogLines.hidden = logs === null || logs.state !== "ok";
+  hubLogLines.textContent =
+    logs !== null && logs.state === "ok" ? logs.lines.join("\n") : "";
+  hubLogUse.hidden =
+    logs === null ||
+    !logs.can_use_service_path ||
+    logs.path === "" ||
+    logs.path === logs.service_path;
+
+  if (hubLogsError !== null) {
+    hubLogState.textContent = hubLogsError;
+  } else if (logs === null) {
+    hubLogState.textContent = "Reading the service log…";
+  } else {
+    switch (logs.state) {
+      case "ok":
+        hubLogState.textContent =
+          logs.lines.length === 0
+            ? "The log file is empty."
+            : `${logs.lines.length} lines${logs.truncated ? " (truncated to the end of the file)" : ""}.`;
+        break;
+      case "needs-path":
+        hubLogState.textContent = `This Hub is not loopback. Confirm the log file path to read it; the service reports ${logs.service_path || "no path"}.`;
+        break;
+      case "disabled":
+        hubLogState.textContent =
+          "The service reports that file logging is disabled (FLOWHUB_LOG_FILE is - or none).";
+        break;
+      case "missing":
+        hubLogState.textContent = `No log file yet at ${logs.path}.`;
+        break;
+      case "unreadable":
+        hubLogState.textContent = `Could not read ${logs.path}: ${logs.detail}`;
+        break;
+    }
+  }
+
+  if (document.activeElement !== hubLogInput) {
+    hubLogInput.value = logs?.path ?? "";
+  }
+  hubLogInput.placeholder = logs?.service_path || "/path/to/flowhub.log";
+}
+
+async function saveHubLogPath(path: string | null): Promise<void> {
+  const id = hubTabId;
+  if (id === null) return;
+  try {
+    await setHubLogPath(id, path);
+    await fetchHubLogs();
+  } catch (error) {
+    showError(error);
+  }
+}
+
 async function fetchHub(): Promise<void> {
   const id = hubTabId;
   if (id === null || hubLoading) return;
@@ -834,7 +957,12 @@ function showHub(tab: TabInfo): void {
   hubStatus.textContent = "Connecting…";
   hubDot.className = "health-dot unknown";
   hubCards.replaceChildren();
+  hubLogsValue = null;
+  hubLogsError = null;
+  hubLogsRequest += 1;
+  renderHubLogs();
   void fetchHub();
+  void fetchHubLogs();
 }
 
 function hideHub(): void {
@@ -845,6 +973,9 @@ function hideHub(): void {
   hubSnapshotValue = null;
   hubRequest += 1;
   hubLoading = false;
+  hubLogsValue = null;
+  hubLogsError = null;
+  hubLogsRequest += 1;
 }
 
 /// The dashboard follows the active tab, not the sidebar scope: switching to a

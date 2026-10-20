@@ -7,6 +7,7 @@ mod health;
 mod hub;
 mod menu;
 mod model;
+mod prefs;
 mod session;
 mod state;
 mod store;
@@ -68,6 +69,8 @@ fn main() {
             commands::list_health,
             commands::probe_all,
             commands::hub_snapshot,
+            commands::hub_logs,
+            commands::set_hub_log_path,
             commands::load_session,
             commands::set_sidebar_visible,
         ])

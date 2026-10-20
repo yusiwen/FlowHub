@@ -707,3 +707,61 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10px;
 }
+
+.hub-logs {
+  margin-top: 12px;
+}
+
+.hub-log-path {
+  margin: 0 0 4px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.hub-log-state {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.hub-log {
+  max-height: 260px;
+  margin: 0 0 10px;
+  padding: 10px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.hub-log[hidden] {
+  display: none;
+}
+
+.hub-log-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.hub-log-form input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+
+.hub-log-form .ghost-button {
+  flex: none;
+}
