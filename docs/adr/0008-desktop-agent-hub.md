@@ -58,7 +58,12 @@ dsh rejects every credential-less request, so a loaded `dsh-web` tab lends the
 probe its `dsh-auth-` cookie — read at probe time, never persisted, logged, or
 exposed to the shell — and the report says only whether a credential was used.
 Without a loaded tab there is no cookie to send, so the dot stays `auth` instead
-of guessing `ok` (issue #65).
+of guessing `ok` (issue #65). A `401` for a probe that *did* carry the cookie has
+proved the session dead, so the tab is put back into sign-in — page hidden, token
+panel reopened — rather than left as a page that only answers `401`. The same
+probe runs once when a tab's webview is created, so a dead session never reaches
+the screen; activating such a tab asks again, so a cancelled panel is not a dead
+end.
 
 **State.** `instances.json` (mode `0600`) holds the registry; `session.json`
 (mode `0644`) holds the open tabs and sidebar state. Both live under the app

@@ -114,9 +114,13 @@ or returned to the shell. The report records only whether a credential was used
 (`none` or `cookie`), which is what lets the tooltip separate the yellow states:
 
 - `cookie` + `200` — green, "reachable, signed in".
-- `cookie` + `401` — yellow, "session expired". The tab still holds a cookie the
-  server rejects; the sign-in panel is triggered by a *missing* cookie, so
-  re-opening the tab does not re-prompt yet (#60 tracks re-authentication).
+- `cookie` + `401` — yellow, "session expired". The server rejected the cookie
+  the tab still holds, so the tab goes back to sign-in: the page is hidden and
+  the token panel reopens. That happens as soon as the verdict arrives for a
+  loaded tab, when the tab's webview is created (it is verified with its own
+  cookie before its page counts as signed in), and on activation — which also
+  makes cancelling the panel recoverable, since activating a tab that waits for
+  a token asks again.
 - `none` + `401` — yellow, "sign-in required". No webview has been loaded for
   that instance in this app run, so there is nothing to send; opening the tab
   runs the sign-in panel.
