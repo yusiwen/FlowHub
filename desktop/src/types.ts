@@ -69,10 +69,14 @@ export interface AuthFailedEvent {
 
 export type HealthStatus = "ok" | "auth" | "http" | "unreachable";
 
+/// What the probe carried: the tab's dsh cookie, or nothing.
+export type HealthCredential = "none" | "cookie";
+
 export interface HealthReport {
   instance_id: string;
   status: HealthStatus;
   latency_ms: number;
+  credential: HealthCredential;
 }
 
 export interface SessionView {

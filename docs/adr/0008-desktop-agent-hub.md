@@ -51,6 +51,15 @@ exactly one token on the root path, navigates, and confirms success when the
 `303` drops the token parameter. The token is never persisted; the cookie is the
 session.
 
+**Health.** The sidebar dot comes from a reachability probe in the Rust process,
+not from the page: one `GET` per instance every 30 s, `200-399` = `ok`,
+`401/403` = `auth`, any other status = `http`, a transport error = `unreachable`.
+dsh rejects every credential-less request, so a loaded `dsh-web` tab lends the
+probe its `dsh-auth-` cookie — read at probe time, never persisted, logged, or
+exposed to the shell — and the report says only whether a credential was used.
+Without a loaded tab there is no cookie to send, so the dot stays `auth` instead
+of guessing `ok` (issue #65).
+
 **State.** `instances.json` (mode `0600`) holds the registry; `session.json`
 (mode `0644`) holds the open tabs and sidebar state. Both live under the app
 config directory and are written atomically. No secret is written to either.

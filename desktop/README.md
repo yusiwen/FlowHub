@@ -103,7 +103,27 @@ timeout and redirects disabled. `200-399` is `ok`, `401`/`403` is `auth`
 (reachable but sign-in required), any other HTTP status is `http`, and a
 timeout or connection error is `unreachable`. The sidebar dot is green, yellow,
 orange or red; its tooltip includes the latency. The probe runs in the Rust
-process, so it is not subject to page CORS or a missing webview cookie.
+process, so it is not subject to page CORS.
+
+dsh answers `401` to every request that does not carry its
+`dsh-auth-<authority hash>` cookie, so a credential-less probe would report
+"sign-in required" for a tab that is signed in and working. A loaded `dsh-web`
+tab therefore lends its cookie to the probe: the value is read from the tab's
+webview at probe time, used for that one request, and never logged, persisted,
+or returned to the shell. The report records only whether a credential was used
+(`none` or `cookie`), which is what lets the tooltip separate the yellow states:
+
+- `cookie` + `200` — green, "reachable, signed in".
+- `cookie` + `401` — yellow, "session expired". The tab still holds a cookie the
+  server rejects; the sign-in panel is triggered by a *missing* cookie, so
+  re-opening the tab does not re-prompt yet (#60 tracks re-authentication).
+- `none` + `401` — yellow, "sign-in required". No webview has been loaded for
+  that instance in this app run, so there is nothing to send; opening the tab
+  runs the sign-in panel.
+- No `dsh-web` tab loaded at all — the dot stays yellow and never claims `ok`
+  without evidence.
+
+opencode and `other` instances keep the credential-less probe; `200` is green.
 
 ## Registry
 

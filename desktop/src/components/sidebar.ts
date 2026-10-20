@@ -19,12 +19,17 @@ function button(label: string, action: string, title: string): HTMLButtonElement
   return element;
 }
 
-function statusLabel(status: HealthReport["status"]): string {
-  switch (status) {
+function statusLabel(report: HealthReport, kind: Instance["kind"]): string {
+  switch (report.status) {
     case "ok":
-      return "reachable";
+      return kind === "dsh-web" ? "reachable, signed in" : "reachable";
     case "auth":
-      return "reachable, sign-in required";
+      if (kind !== "dsh-web") return "reachable, sign-in required";
+      // A dsh 401 either means the app has no session yet (no cookie to send) or
+      // that the server rejected the one the tab still holds.
+      return report.credential === "cookie"
+        ? "reachable, session expired — open the tab to sign in"
+        : "reachable, sign-in required — open the tab";
     case "http":
       return "reachable, HTTP error";
     case "unreachable":
@@ -64,7 +69,7 @@ function row(
   dot.title =
     report === undefined
       ? "Not checked yet"
-      : `${statusLabel(report.status)} · ${report.latency_ms} ms`;
+      : `${statusLabel(report, instance.kind)} · ${report.latency_ms} ms`;
 
   heading.append(dot, name, badge);
 

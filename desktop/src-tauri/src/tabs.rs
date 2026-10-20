@@ -481,6 +481,21 @@ impl TabManager {
             .map_err(|error| format!("hide tab during sign-in: {error}"))
     }
 
+    /// The loaded content webviews with the instance id and base URL they belong
+    /// to. The caller must read cookies after this lock is released:
+    /// `Webview::cookies()` blocks on the main thread, which can be waiting for
+    /// this mutex.
+    pub fn loaded_webviews(&self) -> Vec<(Uuid, Webview, Url)> {
+        self.tabs
+            .iter()
+            .filter_map(|(id, tab)| {
+                let webview = tab.webview.clone()?;
+                let url = Url::parse(&tab.url).ok()?;
+                Some((*id, webview, url))
+            })
+            .collect()
+    }
+
     /// `(url still carries a token, dsh cookie is present)`. The poll loop needs
     /// both: a successful exchange removes the token and sets the cookie.
     pub fn auth_status(&self, id: Uuid) -> Option<(bool, bool)> {
