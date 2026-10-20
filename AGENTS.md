@@ -94,7 +94,7 @@ recorded in `docs/adr/0008-desktop-agent-hub.md`,
 ## Project Structure
 
 ```
-desktop/            macOS Tauri app (FlowHub): upstream/agent views over one registry + one native WebView per page tab; separate Rust/Node toolchain
+desktop/            macOS Tauri app (FlowHub): upstream/agent/hub views over one registry, native WebView or dashboard per tab; separate Rust/Node toolchain
 cmd/flowhub/        CLI entry: wiring, flags, HTTP server, /healthz, shutdown, activation prober
 internal/config/    Environment parsing, validation, masked reporting
 internal/logging/   Application logger: stderr tee + size-rotated log file

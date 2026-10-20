@@ -226,13 +226,26 @@ async fn probe_one(
         Credential::None
     };
     let started = Instant::now();
-    let mut request = client.get(&instance.url);
-    if let Some(cookie) = cookie {
-        request = request.header(reqwest::header::COOKIE, cookie);
-    }
-    let status = match request.send().await {
-        Ok(response) => classify(response.status().as_u16()),
-        Err(_) => HealthStatus::Unreachable,
+    // A hub has no page of its own; /healthz is what says whether it is alive.
+    let target = if instance.is_dashboard() {
+        crate::model::healthz_url(&instance.url)
+            .ok()
+            .map(|url| url.to_string())
+    } else {
+        Some(instance.url.clone())
+    };
+    let status = match target {
+        None => HealthStatus::Unreachable,
+        Some(target) => {
+            let mut request = client.get(target);
+            if let Some(cookie) = cookie {
+                request = request.header(reqwest::header::COOKIE, cookie);
+            }
+            match request.send().await {
+                Ok(response) => classify(response.status().as_u16()),
+                Err(_) => HealthStatus::Unreachable,
+            }
+        }
     };
     HealthReport {
         instance_id: instance.id,
@@ -363,6 +376,24 @@ mod tests {
         assert_eq!(report.status, HealthStatus::Auth);
         assert_eq!(report.credential, Credential::Cookie);
         assert!(server.join().expect("server").contains("\r\ncookie:"));
+    }
+
+    #[test]
+    fn a_hub_probe_requests_healthz() {
+        let (url, server) = serve(200);
+        let hub = Instance {
+            id: Uuid::new_v4(),
+            name: "hub".to_string(),
+            kind: InstanceKind::FlowHub,
+            url,
+            auth: AuthMode::None,
+            group: None,
+            order: 0,
+            notes: String::new(),
+        };
+        let report = tauri::async_runtime::block_on(probe_one(&client(), &hub, None));
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert!(server.join().expect("server").contains("get /healthz "));
     }
 
     #[test]

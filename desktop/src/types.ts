@@ -1,11 +1,23 @@
-export type InstanceKind = "dsh-web" | "opencode" | "other" | "youtrack";
+export type InstanceKind =
+  | "dsh-web"
+  | "opencode"
+  | "other"
+  | "youtrack"
+  | "flowhub";
 
 /// Which of the three views an instance belongs to. Derived from the kind in
 /// Rust; the shell keeps the same table so a row is never listed twice.
-export type Role = "upstream" | "downstream";
+export type Role = "upstream" | "downstream" | "hub";
 
 export function roleOf(kind: InstanceKind): Role {
-  return kind === "youtrack" ? "upstream" : "downstream";
+  switch (kind) {
+    case "youtrack":
+      return "upstream";
+    case "flowhub":
+      return "hub";
+    default:
+      return "downstream";
+  }
 }
 
 export type AuthMode = "none" | "dsh-token";
@@ -37,6 +49,8 @@ export function kindLabel(kind: InstanceKind): string {
       return "opencode";
     case "youtrack":
       return "YouTrack";
+    case "flowhub":
+      return "FlowHub";
     default:
       return "other";
   }
@@ -89,6 +103,73 @@ export interface HealthReport {
   status: HealthStatus;
   latency_ms: number;
   credential: HealthCredential;
+}
+
+/// The typed scalars plus the four operational reports from `/healthz`.
+export interface HubSnapshot {
+  status: string;
+  version: string;
+  uptime_seconds: number;
+  addr: string;
+  data_dir: string;
+  listens_on_all_interfaces: boolean;
+  audit_file: string;
+  payload_log: string;
+  app_log: string;
+  queue_depth: number;
+  queue_capacity: number;
+  dedupe_keys: number;
+  projects: HubProjects | null;
+  dispatch: HubDispatch | null;
+  runtimes: HubRuntimes | null;
+  counters: HubCounters | null;
+}
+
+export interface HubProjects {
+  file?: string;
+  mappings?: number;
+  routable?: number;
+  keys?: string[];
+}
+
+export interface HubRuntimeDispatch {
+  pending?: number;
+  running?: number;
+  breadth?: number;
+  in_flight?: number;
+  last_error?: string;
+}
+
+export interface HubDispatch {
+  enabled?: boolean;
+  queued?: number;
+  handled?: number;
+  ignored?: number;
+  dropped?: number;
+  queue_depth?: number;
+  paused?: boolean;
+  agent?: string;
+  in_flight?: Record<string, number>;
+  runtimes?: Record<string, HubRuntimeDispatch>;
+}
+
+export interface HubRuntimes {
+  enabled?: boolean;
+  file?: string;
+  counts?: Record<string, number>;
+  runtimes?: string[];
+  states?: Record<string, string>;
+}
+
+export interface HubCounters {
+  received?: number;
+  accepted?: number;
+  rejected?: number;
+  duplicates?: number;
+  persisted?: number;
+  persist_errors?: number;
+  dropped?: number;
+  reject_reasons?: Record<string, number>;
 }
 
 export interface SessionView {

@@ -572,3 +572,138 @@ body {
   background: #ff453a;
   opacity: 1;
 }
+
+.hub-panel {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  padding: 20px 24px 28px;
+  background: var(--bg);
+}
+
+.hub-panel[hidden] {
+  display: none;
+}
+
+.hub-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.hub-identity h2 {
+  margin: 0 0 2px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.hub-url {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.hub-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.hub-status {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.hub-warning {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 159, 10, 0.14);
+  color: #8a4b00;
+  font-size: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .hub-warning {
+    color: #ffb340;
+  }
+}
+
+.hub-error {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(215, 0, 21, 0.1);
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.hub-warning[hidden],
+.hub-error[hidden] {
+  display: none;
+}
+
+.hub-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.hub-card {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.hub-card h3 {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.hub-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hub-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.hub-key {
+  flex: none;
+  color: var(--muted);
+}
+
+.hub-value {
+  text-align: right;
+  word-break: break-word;
+}
+
+.hub-row-block {
+  flex-direction: column;
+  gap: 2px;
+}
+
+.hub-row-block .hub-value {
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.hub-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+}

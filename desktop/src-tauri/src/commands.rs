@@ -1,5 +1,6 @@
 use crate::auth;
 use crate::health::{self, HealthReport};
+use crate::hub::{self, HubSnapshot};
 use crate::model::{AuthMode, Instance, InstanceInput};
 use crate::session::SessionView;
 use crate::state::{lock_session, lock_tabs, AppState};
@@ -98,7 +99,14 @@ pub(crate) fn activate_index(
     persist_session(state)
 }
 
-pub(crate) fn reload_active(state: &AppState) -> Result<(), String> {
+pub(crate) fn reload_active(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    if lock_tabs(state)?.active_is_dashboard() {
+        // The dashboard has no page to reload; ask the shell to fetch /healthz
+        // again so Cmd+R means "refresh what is on screen" for both tab kinds.
+        return app
+            .emit("hub://reload", ())
+            .map_err(|error| error.to_string());
+    }
     lock_tabs(state)?.reload_active()
 }
 
@@ -173,6 +181,26 @@ pub fn list_health(state: State<'_, AppState>) -> Result<Vec<HealthReport>, Stri
 #[tauri::command]
 pub async fn probe_all(app: AppHandle) -> Result<Vec<HealthReport>, String> {
     Ok(health::probe_all(&app).await)
+}
+
+/// The Hub dashboard's one data source: the service's own /healthz. The shell
+/// cannot fetch it (its CSP allows only Tauri IPC), and parsing here lets a
+/// wrong address be reported as "not a FlowHub service".
+#[tauri::command]
+pub async fn hub_snapshot(id: Uuid, state: State<'_, AppState>) -> Result<HubSnapshot, String> {
+    let instance = {
+        let guard = lock(&state.store)?;
+        guard
+            .instances()
+            .iter()
+            .find(|instance| instance.id == id)
+            .cloned()
+            .ok_or_else(|| format!("no such instance: {id}"))?
+    };
+    if !instance.is_dashboard() {
+        return Err("instance is not a FlowHub service".to_string());
+    }
+    hub::fetch(&instance.url).await
 }
 
 #[tauri::command]
