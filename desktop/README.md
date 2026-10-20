@@ -60,6 +60,16 @@ is always the one that owns the visible page.
 The scope's header shows the row count and its Add button. The form opened from a
 scope offers only that scope's kinds, so editing cannot move a row between views.
 
+Each view owns a colour: upstream violet, instances amber, hub teal. The sidebar
+header and the tab strip are the same 40px band with the same 2px line, so the hue
+runs across the whole window and a scope switch repaints the sidebar, the strip, the
+badges and the active row together. The strip is not per-view: a tab carries its own
+role, so a session holding an agent tab and a tracker tab shows both hues at once
+and the active tab keeps its own colour even while another view is selected. Role
+colour means identity only — the health dots, `--danger`, `--accent` and the Hub
+warning keep their own meaning (ADR 0010). The row backing the active tab carries the
+same 3px marker as its tab.
+
 ## Upstream
 
 YouTrack is the first upstream kind. A row stores the tracker's base URL and nothing

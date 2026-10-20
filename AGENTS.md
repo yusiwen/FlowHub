@@ -89,7 +89,8 @@ The desktop app under `desktop/` is a separate Tauri/Rust/Node toolchain. It is
 not part of the Go module or its build: no cgo, no FFI edge. Use
 `make desktop-install`, `make desktop-dev` and `make desktop-check`; the design is
 recorded in `docs/adr/0008-desktop-agent-hub.md`,
-`docs/adr/0009-desktop-three-views.md` and `desktop/README.md`.
+`docs/adr/0009-desktop-three-views.md`, `docs/adr/0010-role-colour.md` and
+`desktop/README.md`.
 
 ## Project Structure
 

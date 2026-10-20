@@ -10,6 +10,29 @@
   --danger: #d70015;
   --badge: rgba(10, 132, 255, 0.12);
   --badge-text: #0066cc;
+  /* Role identity, one hue per view (see ADR 0010). These are never a state:
+     the health dots, --danger, --accent and .hub-warning keep their own
+     meaning, so a colour alone never says "healthy" or "failed". Written as
+     explicit rgba because the shell builds for safari15, which has no
+     color-mix(). */
+  --upstream: #6b4ee6;
+  --upstream-pill: rgba(107, 78, 230, 0.1);
+  --upstream-edge: rgba(107, 78, 230, 0.5);
+  --upstream-line: rgba(107, 78, 230, 0.4);
+  --upstream-band: rgba(107, 78, 230, 0.06);
+  --upstream-badge: rgba(107, 78, 230, 0.12);
+  --downstream: #9c5b00;
+  --downstream-pill: rgba(156, 91, 0, 0.1);
+  --downstream-edge: rgba(156, 91, 0, 0.5);
+  --downstream-line: rgba(156, 91, 0, 0.4);
+  --downstream-band: rgba(156, 91, 0, 0.07);
+  --downstream-badge: rgba(156, 91, 0, 0.12);
+  --hub: #076b64;
+  --hub-pill: rgba(7, 107, 100, 0.1);
+  --hub-edge: rgba(7, 107, 100, 0.5);
+  --hub-line: rgba(7, 107, 100, 0.4);
+  --hub-band: rgba(7, 107, 100, 0.07);
+  --hub-badge: rgba(7, 107, 100, 0.12);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -23,6 +46,24 @@
     --danger: #ff453a;
     --badge: rgba(10, 132, 255, 0.22);
     --badge-text: #64b5ff;
+    --upstream: #b7a3ff;
+    --upstream-pill: rgba(183, 163, 255, 0.16);
+    --upstream-edge: rgba(183, 163, 255, 0.55);
+    --upstream-line: rgba(183, 163, 255, 0.42);
+    --upstream-band: rgba(183, 163, 255, 0.09);
+    --upstream-badge: rgba(183, 163, 255, 0.18);
+    --downstream: #ffc46b;
+    --downstream-pill: rgba(255, 196, 107, 0.14);
+    --downstream-edge: rgba(255, 196, 107, 0.55);
+    --downstream-line: rgba(255, 196, 107, 0.42);
+    --downstream-band: rgba(255, 196, 107, 0.08);
+    --downstream-badge: rgba(255, 196, 107, 0.16);
+    --hub: #4fd8cc;
+    --hub-pill: rgba(79, 216, 204, 0.14);
+    --hub-edge: rgba(79, 216, 204, 0.55);
+    --hub-line: rgba(79, 216, 204, 0.42);
+    --hub-band: rgba(79, 216, 204, 0.08);
+    --hub-badge: rgba(79, 216, 204, 0.16);
   }
 }
 
@@ -39,10 +80,38 @@ body {
   overflow: hidden;
 }
 
+/* The current view paints the chrome: the sidebar's header band, the tab
+   strip, the scope switch, the badges and the active row all read --view*.
+   A view without a data-view attribute falls back to Instances, which is the
+   scope the shell starts in. */
 .layout {
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr);
   height: 100%;
+  --view: var(--downstream);
+  --view-pill: var(--downstream-pill);
+  --view-edge: var(--downstream-edge);
+  --view-line: var(--downstream-line);
+  --view-band: var(--downstream-band);
+  --view-badge: var(--downstream-badge);
+}
+
+.layout[data-view="upstream"] {
+  --view: var(--upstream);
+  --view-pill: var(--upstream-pill);
+  --view-edge: var(--upstream-edge);
+  --view-line: var(--upstream-line);
+  --view-band: var(--upstream-band);
+  --view-badge: var(--upstream-badge);
+}
+
+.layout[data-view="hub"] {
+  --view: var(--hub);
+  --view-pill: var(--hub-pill);
+  --view-edge: var(--hub-edge);
+  --view-line: var(--hub-line);
+  --view-band: var(--hub-band);
+  --view-badge: var(--hub-badge);
 }
 
 .layout.sidebar-hidden {
@@ -50,7 +119,6 @@ body {
 }
 
 .layout.sidebar-hidden .sidebar {
-  padding: 0;
   border-right: none;
   visibility: hidden;
 }
@@ -62,14 +130,35 @@ body {
   min-height: 0;
 }
 
+/* The header band is exactly as tall as the tab strip (40px + the same 2px
+   line), so the view colour runs across the whole window at one y. */
 .sidebar {
   display: flex;
   flex-direction: column;
-  gap: 12px;
   min-height: 0;
-  padding: 16px 12px;
   border-right: 1px solid var(--border);
   background: var(--panel);
+}
+
+.sidebar-top {
+  display: flex;
+  flex: none;
+  align-items: center;
+  box-sizing: border-box;
+  height: 40px;
+  padding: 0 10px;
+  background-color: var(--panel);
+  background-image: linear-gradient(var(--view-band), var(--view-band));
+  border-bottom: 2px solid var(--view-line);
+}
+
+.sidebar-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  padding: 12px;
 }
 
 .sidebar-header {
@@ -91,8 +180,8 @@ body {
 
 .scope-option {
   flex: 1;
-  padding: 4px 6px;
-  border: none;
+  padding: 3px 5px;
+  border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
   color: var(--muted);
@@ -107,9 +196,9 @@ body {
 }
 
 .scope-option.active {
-  background: var(--panel);
-  color: var(--text);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  background: var(--view-pill);
+  border-color: var(--view-edge);
+  color: var(--view);
 }
 
 .scope-summary {
@@ -126,6 +215,7 @@ body {
 
 .instance-list {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 8px;
   min-height: 0;
@@ -136,6 +226,7 @@ body {
 }
 
 .instance {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -143,6 +234,27 @@ body {
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg);
+}
+
+/* The row backing the active tab: same 3px marker as its tab, so the list and
+   the strip name one object. */
+.instance.active {
+  border-color: var(--view-edge);
+}
+
+.instance.active::before {
+  content: "";
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: 4px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--view);
+}
+
+.instance.active .instance-main {
+  padding-left: 8px;
 }
 
 .instance-main {
@@ -176,6 +288,13 @@ body {
   font-size: 10px;
   letter-spacing: 0.03em;
   text-transform: uppercase;
+}
+
+/* A row's kind is its view's role: the badge says which of the three this
+   target belongs to, in the same hue as the band above it. */
+.instance .badge {
+  background: var(--view-badge);
+  color: var(--view);
 }
 
 .instance-url {
@@ -245,11 +364,13 @@ body {
   flex: none;
   align-items: center;
   gap: 8px;
-  min-height: 40px;
-  padding: 5px 10px;
+  box-sizing: border-box;
+  height: 40px;
+  padding: 0 10px;
   overflow: hidden;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel);
+  background-color: var(--panel);
+  background-image: linear-gradient(var(--view-band), var(--view-band));
+  border-bottom: 2px solid var(--view-line);
 }
 
 .tabs {
@@ -266,6 +387,8 @@ body {
   font-size: 11px;
 }
 
+/* A tab owns its role, not the strip: one session can hold an opencode tab and
+   a youtrack tab at once, and the marker is what tells them apart. */
 .tab {
   display: flex;
   flex: none;
@@ -275,11 +398,51 @@ body {
   overflow: hidden;
   border: 1px solid transparent;
   border-radius: 7px;
+  --role: var(--view);
+  --role-pill: var(--view-pill);
+  --role-edge: var(--view-edge);
+}
+
+.tab[data-role="upstream"] {
+  --role: var(--upstream);
+  --role-pill: var(--upstream-pill);
+  --role-edge: var(--upstream-edge);
+}
+
+.tab[data-role="downstream"] {
+  --role: var(--downstream);
+  --role-pill: var(--downstream-pill);
+  --role-edge: var(--downstream-edge);
+}
+
+.tab[data-role="hub"] {
+  --role: var(--hub);
+  --role-pill: var(--hub-pill);
+  --role-edge: var(--hub-edge);
+}
+
+.tab-marker {
+  flex: none;
+  width: 3px;
+  height: 16px;
+  margin-left: 5px;
+  border-radius: 2px;
+  background: var(--role);
+  opacity: 0.5;
 }
 
 .tab.active {
-  border-color: var(--border);
-  background: var(--bg);
+  border-color: var(--role-edge);
+  background: var(--role-pill);
+}
+
+.tab.active .tab-marker {
+  opacity: 1;
+}
+
+.tab.active .tab-title {
+  color: var(--role);
+  font-weight: 600;
 }
 
 .tab.loading .tab-label,

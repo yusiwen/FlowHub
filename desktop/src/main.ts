@@ -183,8 +183,13 @@ function scopedInstances(): Instance[] {
   return instances.filter((instance) => roleOf(instance.kind) === scope);
 }
 
+function activeInstanceId(): string | null {
+  return tabs.find((tab) => tab.active)?.instance_id ?? null;
+}
+
 function renderInstances(): void {
-  renderSidebar(sidebar, scope, scopedInstances(), health, {
+  layout.dataset.view = scope;
+  renderSidebar(sidebar, scope, scopedInstances(), health, activeInstanceId(), {
     onAdd: () => {
       void add();
     },
@@ -244,6 +249,10 @@ function renderTabs(): void {
       tab.loading ? " loading" : ""
     }${tab.loaded ? "" : " placeholder"}`;
     item.dataset.id = tab.instance_id;
+    item.dataset.role = tab.role;
+
+    const marker = document.createElement("span");
+    marker.className = "tab-marker";
 
     const label = document.createElement("button");
     label.type = "button";
@@ -275,7 +284,7 @@ function renderTabs(): void {
       void closeOne(tab);
     });
 
-    item.append(label);
+    item.append(marker, label);
     if (tab.auth_required) {
       const lock = document.createElement("span");
       lock.className = "tab-lock";
@@ -314,10 +323,7 @@ function applyTabs(next: TabInfo[]): void {
   const active = tabs.find((tab) => tab.active);
   if (active !== undefined) {
     lastActive.set(active.role, active.instance_id);
-    if (active.role !== scope) {
-      scope = active.role;
-      renderInstances();
-    }
+    if (active.role !== scope) scope = active.role;
   }
   if (
     authInstanceId !== null &&
@@ -329,6 +335,9 @@ function applyTabs(next: TabInfo[]): void {
   if (authInstanceId !== null && !tabs.some((tab) => tab.instance_id === authInstanceId)) {
     hideAuth();
   }
+  // The active row and the band follow the active tab, so a list refresh has to
+  // repaint the sidebar even when the scope did not change.
+  renderInstances();
   renderTabs();
   syncHubPanel();
 }
