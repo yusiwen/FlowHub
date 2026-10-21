@@ -8,6 +8,7 @@
 use crate::model::healthz_url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::error::Error as _;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::time::Duration;
@@ -54,6 +55,34 @@ pub struct HubSnapshot {
 /// A wrong address must not make the app allocate an arbitrary page.
 const MAX_PAYLOAD_BYTES: usize = 1 << 20;
 
+/// Why a request could not be sent, in the words of the layers that tried.
+///
+/// `reqwest::Error`'s own message names the request — "error sending request for
+/// uri (…)" — and puts the reason (connection refused, no route to host, DNS, TLS)
+/// in its `source` chain. Printing the error itself therefore told the operator
+/// nothing they could act on: measured 2026-10-21, a service bound to an address
+/// the host no longer owned produced a dashboard that said only "error sending
+/// request". The chain is joined instead, which ends in the layer that knows.
+fn unreachable_reason(error: &reqwest::Error) -> String {
+    let mut text = String::new();
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        let part = error.to_string();
+        if !part.is_empty() {
+            if !text.is_empty() {
+                text.push_str(": ");
+            }
+            text.push_str(&part);
+        }
+        cause = error.source();
+    }
+    if text.is_empty() {
+        error.to_string()
+    } else {
+        text
+    }
+}
+
 pub async fn fetch(base: &str) -> Result<HubSnapshot, String> {
     let url = healthz_url(base)?;
     let client = reqwest::Client::builder()
@@ -66,7 +95,7 @@ pub async fn fetch(base: &str) -> Result<HubSnapshot, String> {
         if error.is_timeout() {
             format!("{url} timed out")
         } else {
-            format!("{url} is unreachable: {error}")
+            format!("{url} is unreachable: {}", unreachable_reason(&error))
         }
     })?;
 
@@ -326,6 +355,27 @@ mod tests {
         let error = tauri::async_runtime::block_on(fetch(&url)).expect_err("refused");
         assert!(error.contains("HTTP 500"), "{error}");
         server.join().expect("server");
+    }
+
+    #[test]
+    fn an_unreachable_service_names_the_reason() {
+        // A port nobody listens on: bind, read the port, let it go. The point is not
+        // the number but that the reason reaches the panel — "error sending request"
+        // alone said nothing about a service bound to an address the host had lost.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let error = tauri::async_runtime::block_on(fetch(&format!("http://127.0.0.1:{port}")))
+            .expect_err("nothing listens there");
+        assert!(
+            error.contains(&format!(":{port}/healthz is unreachable: ")),
+            "{error}"
+        );
+        assert!(
+            error.to_lowercase().contains("refused"),
+            "the OS reason must reach the panel: {error}"
+        );
     }
 
     #[test]
