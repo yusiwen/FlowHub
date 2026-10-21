@@ -8,6 +8,12 @@ use uuid::Uuid;
 const MAX_NAME_CHARS: usize = 120;
 const MAX_NOTES_CHARS: usize = 2000;
 
+/// The kind an instance is, as it travels over IPC and sits in `instances.json`.
+/// These strings are the shell's own vocabulary (`src/types.ts`), and the brand
+/// names keep their spelling: `FlowHub` is one word, so the kebab-case rule would
+/// put `flow-hub` on the wire and the shell's `flowhub` was refused as an unknown
+/// variant — the Hub view's Add button was dead from the day it landed
+/// (2026-10-21, issue #87).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InstanceKind {
@@ -15,6 +21,7 @@ pub enum InstanceKind {
     Opencode,
     Other,
     Youtrack,
+    #[serde(rename = "flowhub")]
     FlowHub,
 }
 
@@ -378,5 +385,57 @@ mod tests {
         let parsed: Instance = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.kind, InstanceKind::Youtrack);
         assert_eq!(parsed.role(), Role::Upstream);
+    }
+
+    /// The `InstanceKind` union in `desktop/src/types.ts`. Both lists are written
+    /// by hand, which is how the shell came to send `flowhub` at a serde name of
+    /// `flow-hub` (issue #87); reading the shell's file is the only way this test
+    /// can notice the shell changing its vocabulary.
+    fn shell_kinds() -> Vec<String> {
+        let source = include_str!("../../src/types.ts");
+        let union = source
+            .find("export type InstanceKind")
+            .map(|start| &source[start..])
+            .expect("types.ts declares InstanceKind");
+        let body = &union[..union.find(';').expect("the union ends with a semicolon")];
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn every_kind_the_shell_sends_round_trips() {
+        let kinds = shell_kinds();
+        assert_eq!(kinds.len(), 5, "{kinds:?}");
+        for kind in kinds {
+            let wire = format!("\"{kind}\"");
+            let parsed: InstanceKind = serde_json::from_str(&wire)
+                .unwrap_or_else(|error| panic!("the shell sends {wire}: {error}"));
+            assert_eq!(
+                serde_json::to_string(&parsed).expect("serialize"),
+                wire,
+                "the shell's {wire} must be the kind the registry stores"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hub_payload_the_add_dialog_sends_is_accepted() {
+        // The shape `invoke("add_instance", { input })` builds from
+        // `src/components/instance-form.ts`; the Hub view is the only place the
+        // hub kind is offered, so a refusal here is "Add hub does not work".
+        let payload = r#"{"name":"dsh 3080","kind":"flowhub","url":"http://127.0.0.1:8080/","group":"local"}"#;
+        let candidate: InstanceInput = serde_json::from_str(payload).expect("the dialog's payload");
+        assert_eq!(candidate.kind, InstanceKind::FlowHub);
+
+        let valid = candidate.validate().expect("valid");
+        assert_eq!(valid.kind, InstanceKind::FlowHub);
+        assert_eq!(valid.group.as_deref(), Some("local"));
+
+        let stored = serde_json::to_string(&Instance::from_input(&candidate, 0).expect("valid"))
+            .expect("serialize");
+        assert!(stored.contains(r#""kind":"flowhub""#), "{stored}");
     }
 }
