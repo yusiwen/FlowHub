@@ -1,0 +1,37 @@
+{
+  "id": "evt_01J0000000000000000000004",
+  "schema": 1,
+  "upstream": "youtrack",
+  "kind": "comment.added",
+  "occurred_at": "2026-10-21T09:15:00Z",
+  "received_at": "2026-10-21T09:15:01Z",
+  "subject": {
+    "type": "issue",
+    "project": "TEST",
+    "key": "TEST-12",
+    "title": "Fix the widget",
+    "url": "https://youtrack.example/issue/TEST-12"
+  },
+  "actor": {
+    "login": "yusiwen",
+    "display": "Yusi Wen"
+  },
+  "changes": [],
+  "comment": {
+    "text": "/opencode permit",
+    "author": "yusiwen"
+  },
+  "payload": {
+    "id": "TEST-12",
+    "comments": [
+      {
+        "text": "/opencode permit",
+        "author": {
+          "login": "yusiwen"
+        }
+      }
+    ]
+  },
+  "dedupe_key": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "origin": "upstream:youtrack"
+}

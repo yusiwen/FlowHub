@@ -1,0 +1,33 @@
+{
+  "id": "evt_01J0000000000000000000001",
+  "schema": 1,
+  "upstream": "youtrack",
+  "kind": "issue.created",
+  "occurred_at": "2026-10-21T09:00:00Z",
+  "received_at": "2026-10-21T09:00:01Z",
+  "subject": {
+    "type": "issue",
+    "project": "TEST",
+    "key": "TEST-12",
+    "title": "Fix the widget",
+    "url": "https://youtrack.example/issue/TEST-12"
+  },
+  "actor": {
+    "login": "yusiwen",
+    "display": "Yusi Wen"
+  },
+  "changes": [],
+  "payload": {
+    "id": "TEST-12",
+    "summary": "Fix the widget",
+    "project": {
+      "shortName": "TEST",
+      "name": "Test"
+    },
+    "reporter": {
+      "login": "yusiwen"
+    }
+  },
+  "dedupe_key": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "origin": "upstream:youtrack"
+}

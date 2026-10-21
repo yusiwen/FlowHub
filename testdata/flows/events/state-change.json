@@ -1,0 +1,40 @@
+{
+  "id": "evt_01J0000000000000000000002",
+  "schema": 1,
+  "upstream": "youtrack",
+  "kind": "issue.updated",
+  "occurred_at": "2026-10-21T09:05:00Z",
+  "received_at": "2026-10-21T09:05:01Z",
+  "subject": {
+    "type": "issue",
+    "project": "TEST",
+    "key": "TEST-12",
+    "title": "Fix the widget",
+    "url": "https://youtrack.example/issue/TEST-12"
+  },
+  "actor": {
+    "login": "yusiwen",
+    "display": "Yusi Wen"
+  },
+  "changes": [
+    {
+      "field": "state",
+      "from": "Open",
+      "to": "In Progress"
+    }
+  ],
+  "payload": {
+    "id": "TEST-12",
+    "summary": "Fix the widget",
+    "customFields": [
+      {
+        "name": "State",
+        "value": {
+          "name": "In Progress"
+        }
+      }
+    ]
+  },
+  "dedupe_key": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "origin": "upstream:youtrack"
+}
