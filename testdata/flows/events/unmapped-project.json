@@ -1,0 +1,33 @@
+{
+  "id": "evt_01J0000000000000000000007",
+  "schema": 1,
+  "upstream": "youtrack",
+  "kind": "issue.created",
+  "occurred_at": "2026-10-21T09:30:00Z",
+  "received_at": "2026-10-21T09:30:01Z",
+  "subject": {
+    "type": "issue",
+    "project": "OTHER",
+    "key": "OTHER-1",
+    "title": "An issue in a project with no routing entry",
+    "url": "https://youtrack.example/issue/OTHER-1"
+  },
+  "actor": {
+    "login": "yusiwen",
+    "display": "Yusi Wen"
+  },
+  "changes": [],
+  "payload": {
+    "id": "OTHER-1",
+    "summary": "An issue in a project with no routing entry",
+    "project": {
+      "shortName": "OTHER",
+      "name": "Other"
+    },
+    "reporter": {
+      "login": "yusiwen"
+    }
+  },
+  "dedupe_key": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "origin": "upstream:youtrack"
+}

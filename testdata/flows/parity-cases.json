@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "issue created triggers analysis",
+      "event": "events/issue-created.json",
+      "task": null,
+      "expected": {
+        "action": "analyze",
+        "reason_contains": "issue was created"
+      }
+    },
+    {
+      "name": "a state change without a plan plans first",
+      "event": "events/state-change.json",
+      "task": {
+        "plan": "none",
+        "turns": 0
+      },
+      "expected": {
+        "action": "plan",
+        "reason_contains": "changed to"
+      }
+    },
+    {
+      "name": "a start comment without a plan plans first",
+      "event": "events/comment-start.json",
+      "task": {
+        "plan": "none",
+        "turns": 1
+      },
+      "expected": {
+        "action": "plan",
+        "reason_contains": "no plan exists"
+      }
+    },
+    {
+      "name": "a start comment with a draft plan executes",
+      "event": "events/comment-start.json",
+      "task": {
+        "plan": "draft",
+        "turns": 1
+      },
+      "expected": {
+        "action": "execute",
+        "reason_contains": "a plan exists"
+      }
+    },
+    {
+      "name": "a permit with refusals authorises them",
+      "event": "events/comment-permit.json",
+      "task": {
+        "plan": "draft",
+        "turns": 1,
+        "refusals": [
+          {
+            "permission": "bash",
+            "command": "git push",
+            "reason": "not on the allowlist"
+          }
+        ]
+      },
+      "expected": {
+        "action": "permit",
+        "reason_contains": "authorises"
+      }
+    },
+    {
+      "name": "a permit with nothing refused is ignored",
+      "event": "events/comment-permit.json",
+      "task": {
+        "plan": "draft",
+        "turns": 1,
+        "refusals": []
+      },
+      "expected": {
+        "action": "ignore",
+        "reason_contains": "nothing to authorise"
+      }
+    },
+    {
+      "name": "revoke is always answered",
+      "event": "events/comment-revoke.json",
+      "task": {
+        "plan": "draft",
+        "turns": 1
+      },
+      "expected": {
+        "action": "revoke",
+        "reason_contains": "revoke"
+      }
+    },
+    {
+      "name": "our own comment is ignored",
+      "event": "events/comment-self.json",
+      "task": {
+        "plan": "draft",
+        "turns": 1,
+        "last_reply": "Analysis posted."
+      },
+      "expected": {
+        "action": "ignore",
+        "reason_contains": "our own comment"
+      }
+    },
+    {
+      "name": "the turn budget stops a runaway task",
+      "event": "events/comment-start.json",
+      "task": {
+        "plan": "draft",
+        "turns": 8
+      },
+      "expected": {
+        "action": "ignore",
+        "reason_contains": "limit"
+      }
+    },
+    {
+      "name": "an unmapped project is ignored by the routing rule",
+      "event": "events/unmapped-project.json",
+      "task": null,
+      "compare": "routing",
+      "expected": {
+        "action": "ignore",
+        "reason_contains": "routing"
+      }
+    }
+  ]
+}
