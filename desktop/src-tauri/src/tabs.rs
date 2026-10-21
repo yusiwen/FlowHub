@@ -298,6 +298,10 @@ impl TabManager {
 
         let builder = WebviewBuilder::new(label, WebviewUrl::External(url))
             .devtools(cfg!(debug_assertions))
+            // Embedded pages decide "Enter sends" themselves and cannot read
+            // WebKit's composition order correctly; the host corrects it (ADR
+            // 0011).
+            .initialization_script(crate::ime::SCRIPT)
             .on_navigation(|url| matches!(url.scheme(), "http" | "https"))
             .on_new_window(|_, _| NewWindowResponse::Deny)
             .on_page_load(move |_webview, payload| {
