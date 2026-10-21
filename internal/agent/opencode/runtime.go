@@ -88,11 +88,17 @@ func (r *Runtime) Health(ctx context.Context) (string, error) {
 }
 
 // Run implements agent.Runtime: one unattended turn on this server.
+//
+// The ruleset is built in the server's own vocabulary. Both generations evaluate
+// it last-match-wins, so the catch-all still has to come first, but the field
+// names and the action names differ (ADR 0012) — and the transport refuses a
+// ruleset written in the other generation's vocabulary rather than creating a
+// session that ignores it.
 func (r *Runtime) Run(ctx context.Context, turn agent.Turn) (agent.Result, error) {
-	// The ruleset is the first permission layer and its ORDER is load bearing: the
-	// session ruleset is an array evaluated last-match-wins, so the catch-all has to
-	// come first and the specific entries after it.
-	ruleset := sessionRuleset(turn.AllowedTools)
+	proto, err := r.client.Protocol(ctx)
+	if err != nil {
+		return agent.Result{}, fmt.Errorf("opencode: %s: %w", r.name, err)
+	}
 
 	arbiter := NewAnalysisArbiter()
 	if turn.Phase == agent.PhaseExecution {
@@ -109,17 +115,23 @@ func (r *Runtime) Run(ctx context.Context, turn agent.Turn) (agent.Result, error
 	runner := NewRunner(r.client, arbiter, r.log)
 	runner.FirstResponse = r.FirstResponse
 
-	result, err := runner.Run(ctx, Task{
+	task := Task{
 		Directory: turn.Directory,
 		Prompt:    turn.Prompt,
 		Agent:     turn.Agent,
 		Model:     turn.Model,
 		Title:     turn.Title,
 		SessionID: turn.SessionID,
-		Ruleset:   ruleset,
 		Metadata:  turn.Metadata,
 		Deadline:  turn.Deadline,
-	})
+	}
+	if proto == protocolV2 {
+		task.RulesetV2 = sessionRulesetV2(turn.AllowedTools)
+	} else {
+		task.Ruleset = sessionRulesetV1(turn.AllowedTools)
+	}
+
+	result, err := runner.Run(ctx, task)
 	return projectResult(result), err
 }
 
@@ -162,13 +174,13 @@ func projectResult(result Result) agent.Result {
 	}
 }
 
-// sessionRuleset is the first permission layer.
+// sessionRulesetV1 is the first permission layer for an opencode 1.x server.
 //
 // The catch-all comes first on purpose: the session ruleset is an array evaluated
 // last-match-wins, so a trailing catch-all would override every specific entry
 // (measured: a trailing "*": ask made an allowed tool ask again). Everything the
 // specific entries do not permit still reaches the arbiter as an `ask`.
-func sessionRuleset(allowedTools []string) []PermissionRule {
+func sessionRulesetV1(allowedTools []string) []PermissionRule {
 	ruleset := []PermissionRule{
 		{Permission: "*", Pattern: "*", Action: "ask"},
 		{Permission: "read", Pattern: "*", Action: "allow"},
@@ -187,6 +199,34 @@ func sessionRuleset(allowedTools []string) []PermissionRule {
 	}
 	for _, tool := range allowedTools {
 		ruleset = append(ruleset, PermissionRule{Permission: tool, Pattern: "*", Action: "allow"})
+	}
+	return ruleset
+}
+
+// sessionRulesetV2 is the same policy in the v2 vocabulary.
+//
+// Two differences are load bearing. `external_directory` is allowed by default in
+// v2 (v1 asked), so the explicit deny is the only thing keeping read and edit
+// inside the task worktree — dropping it would silently widen every turn. And the
+// action names changed: `bash` is `shell`, and `list`/`todowrite` no longer exist
+// as actions, so they are not worth writing. Evaluation is still last-match-wins,
+// which is why the catch-all stays first.
+func sessionRulesetV2(allowedTools []string) []PermissionRuleV2 {
+	ruleset := []PermissionRuleV2{
+		{Action: "*", Resource: "*", Effect: "ask"},
+		{Action: "read", Resource: "*", Effect: "allow"},
+		{Action: "glob", Resource: "*", Effect: "allow"},
+		{Action: "grep", Resource: "*", Effect: "allow"},
+		// Gated so the phase can decide, exactly as in v1.
+		{Action: "edit", Resource: "*", Effect: "ask"},
+		{Action: "shell", Resource: "*", Effect: "ask"},
+		// v2 allows external paths unless told otherwise; this entry is the wall.
+		{Action: "external_directory", Resource: "*", Effect: "deny"},
+		{Action: "webfetch", Resource: "*", Effect: "deny"},
+		{Action: "websearch", Resource: "*", Effect: "deny"},
+	}
+	for _, tool := range allowedTools {
+		ruleset = append(ruleset, PermissionRuleV2{Action: tool, Resource: "*", Effect: "allow"})
 	}
 	return ruleset
 }

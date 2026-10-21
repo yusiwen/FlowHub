@@ -653,6 +653,10 @@ func TestTheRuntimeFactoryCarriesTheConfiguredShellWrappers(t *testing.T) {
 		defer mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/global/health":
+			// The runtime detects the API generation before its first turn; this
+			// fixture speaks v1 (the endpoints below), so it answers as v1 does.
+			_, _ = w.Write([]byte(`{"healthy":true,"version":"1.18.31"}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/session":
 			_, _ = w.Write([]byte(`{"id":"ses_1"}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/session/ses_1/prompt_async":

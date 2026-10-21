@@ -1,26 +1,35 @@
-// Package opencode is the opencode implementation of the agent seam: it talks to an
-// `opencode serve` instance over its v1 HTTP API — create a session bound to a
-// directory, deliver one prompt, answer the permission requests that arrive while
-// the turn runs, and report the result.
+// Package opencode is the opencode implementation of the agent seam: it talks to
+// an `opencode serve` instance — create a session bound to a directory, deliver
+// one prompt, answer the permission requests that arrive while the turn runs, and
+// report the result.
+//
+// opencode 2 removed the v1 HTTP surface outright: `/global/health` now answers
+// the web app's HTML shell, and everything lives under `/api/*`. Both generations
+// are implemented here, behind one Client, and the first call decides which one
+// the server speaks. The v1 transport is client_v1.go, the v2 one client_v2.go,
+// and the protocol-specific traps are documented on each.
 //
 // Runtime is the agent.Runtime this package offers; Client and Runner are its two
 // halves. The phase policy and the session ruleset belong to this product's
 // permission model and live here too, so the dispatcher never learns them
 // (ADR 0001).
 //
-// The protocol details encoded here were measured against opencode 1.18.31
+// The v1 protocol details encoded here were measured against opencode 1.18.31
 // (opencode-headless-automation-and-permissions.md, plus a live trial on
-// 2026-09-20). Four of them are load bearing and easy to get wrong:
+// 2026-09-20); the v2 ones against 2.0.32 on 2026-10-21 (ADR 0012). Four of them
+// are load bearing and easy to get wrong:
 //
-//   - every session-scoped endpoint needs ?directory=. Without it the server
-//     falls back to its own default location and returns empty results, which
-//     looks exactly like "nothing is pending".
-//   - the directory must be the canonical path: opencode treats /tmp and
-//     /private/tmp as two different projects.
-//   - v1 only. The v2 /api/* endpoints append the prompt to the event log but
-//     never execute it without a runner (the web UI is that runner).
-//   - a pending permission keeps the session busy, so "busy" alone never means
-//     "still working" and "idle" alone never means "finished".
+//   - a v1 session-scoped endpoint needs ?directory=, and the directory must be
+//     canonical (opencode treats /tmp and /private/tmp as two projects). v2
+//     carries the location in the session itself.
+//   - a v1 server accepts a prompt on a busy session and silently swallows it; a
+//     v2 server queues it durably. Neither makes it safe to prompt a busy session:
+//     one task, one turn.
+//   - v1 completion needs three signals (completed assistant message, status not
+//     busy, no pending permission); v2 writes an `idle` message whose `outcome` is
+//     the authoritative end of the turn.
+//   - the permission vocabulary changed (`bash`→`shell`, `task`→`subagent`) and so
+//     did the body a client replies with (`{decision}` instead of `{reply}`).
 package opencode
 
 import (
@@ -33,6 +42,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,12 +63,42 @@ type Options struct {
 	Timeout time.Duration
 }
 
-// Client is a thin, stateless HTTP client for one opencode server.
+// Client is a thin client for one opencode server.
+//
+// "Stateless" except for one fact: which API generation the server speaks. That
+// is discovered once, on the first call, and remembered for the life of the
+// Client — a server does not change generation without a restart, and probing it
+// for every request would double the request count of a turn.
 type Client struct {
 	baseURL  string
 	username string
 	password string
 	http     *http.Client
+
+	mu    sync.Mutex
+	proto protocol
+}
+
+// protocol is the HTTP API generation a server speaks.
+type protocol int
+
+const (
+	protocolUnknown protocol = iota
+	// protocolV1 is opencode 1.x: /global/health, /session, /permission.
+	protocolV1
+	// protocolV2 is opencode 2.x: /api/info, /api/session, /api/permission.
+	protocolV2
+)
+
+func (p protocol) String() string {
+	switch p {
+	case protocolV1:
+		return "v1"
+	case protocolV2:
+		return "v2"
+	default:
+		return "unknown"
+	}
 }
 
 // New builds a client.
@@ -82,11 +122,67 @@ func New(opts Options) *Client {
 // BaseURL returns the configured server root.
 func (c *Client) BaseURL() string { return c.baseURL }
 
+// Protocol reports which HTTP API the server speaks, probing it once.
+//
+// The order is deliberate: /api/info is tried first because a v2 server answers
+// /global/health with the web app's HTML page and status 200, so probing the v1
+// endpoint first would classify every v2 server as "v1, answering nonsense".
+// A 401 is reported as an authentication failure rather than falling through:
+// the server is alive and refusing this client, and the second probe would only
+// repeat the same 401.
+func (c *Client) Protocol(ctx context.Context) (protocol, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.proto != protocolUnknown {
+		return c.proto, nil
+	}
+
+	var info struct {
+		Version string `json:"version"`
+	}
+	v2Err := c.do(ctx, http.MethodGet, "/api/info", nil, nil, &info)
+	if v2Err == nil && strings.TrimSpace(info.Version) != "" {
+		c.proto = protocolV2
+		return c.proto, nil
+	}
+	if IsUnauthorized(v2Err) {
+		return protocolUnknown, fmt.Errorf("opencode: %s rejected the credentials on the v2 /api/info probe: %w", c.baseURL, v2Err)
+	}
+
+	var health Health
+	v1Err := c.do(ctx, http.MethodGet, "/global/health", nil, nil, &health)
+	if v1Err == nil && (health.Healthy || strings.TrimSpace(health.Version) != "") {
+		c.proto = protocolV1
+		return c.proto, nil
+	}
+	if IsUnauthorized(v1Err) {
+		return protocolUnknown, fmt.Errorf("opencode: %s rejected the credentials on the v1 /global/health probe: %w", c.baseURL, v1Err)
+	}
+
+	return protocolUnknown, fmt.Errorf(
+		"opencode: %s speaks neither API: /api/info (opencode 2) failed: %v; /global/health (opencode 1) failed: %v; a 200 with an HTML body on /global/health means an opencode 2 server whose v1 routes are gone",
+		c.baseURL, v2Err, v1Err)
+}
+
+// isV2 reports whether the server speaks the v2 API.
+func (c *Client) isV2(ctx context.Context) (bool, error) {
+	proto, err := c.Protocol(ctx)
+	if err != nil {
+		return false, err
+	}
+	return proto == protocolV2, nil
+}
+
 // Health reports whether the server is up and which version it runs.
 func (c *Client) Health(ctx context.Context) (Health, error) {
-	var health Health
-	err := c.do(ctx, http.MethodGet, "/global/health", nil, nil, &health)
-	return health, err
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return Health{}, err
+	}
+	if v2 {
+		return c.healthV2(ctx)
+	}
+	return c.healthV1(ctx)
 }
 
 // Agents lists the agents a server resolves names against.
@@ -96,70 +192,114 @@ func (c *Client) Health(ctx context.Context) (Health, error) {
 // why an agent file repaired on disk keeps answering with its old settings — the
 // model included — until the server restarts.
 func (c *Client) Agents(ctx context.Context) ([]AgentInfo, error) {
-	var agents []AgentInfo
-	err := c.do(ctx, http.MethodGet, "/agent", nil, nil, &agents)
-	return agents, err
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if v2 {
+		return c.agentsV2(ctx)
+	}
+	return c.agentsV1(ctx)
 }
 
-// CreateSession binds a new session to directory. The session-level ruleset in
-// req.Permission is the first line of defence: it overrides the project and
-// global configuration, and a "deny" on a wildcard pattern removes the tool
-// entirely instead of asking.
+// Catalogue lists the models each configured provider offers.
+func (c *Client) Catalogue(ctx context.Context) (map[string][]string, error) {
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if v2 {
+		return c.catalogueV2(ctx)
+	}
+	return c.catalogueV1(ctx)
+}
+
+// CreateSession binds a new session to directory. req.Permission (v1) or
+// req.Permissions (v2) is the session ruleset, whichever the server speaks.
 func (c *Client) CreateSession(ctx context.Context, directory string, req CreateSessionRequest) (Session, error) {
-	var session Session
-	query := url.Values{"directory": {directory}}
-	err := c.do(ctx, http.MethodPost, "/session", query, req, &session)
-	return session, err
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return Session{}, err
+	}
+	if v2 {
+		return c.createSessionV2(ctx, directory, req)
+	}
+	return c.createSessionV1(ctx, directory, req)
 }
 
-// PromptAsync delivers one user turn and returns as soon as it is admitted
-// (204). It does not wait for the model.
+// PromptAsync delivers one user turn and returns as soon as it is admitted. It
+// does not wait for the model.
 func (c *Client) PromptAsync(ctx context.Context, directory, sessionID string, req PromptRequest) error {
-	query := url.Values{"directory": {directory}}
-	return c.do(ctx, http.MethodPost, "/session/"+sessionID+"/prompt_async", query, req, nil)
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return err
+	}
+	if v2 {
+		return c.promptAsyncV2(ctx, sessionID, req)
+	}
+	return c.promptAsyncV1(ctx, directory, sessionID, req)
 }
 
 // Session returns the session record (cost and tokens are aggregated there).
 func (c *Client) Session(ctx context.Context, directory, sessionID string) (Session, error) {
-	var session Session
-	query := url.Values{"directory": {directory}}
-	err := c.do(ctx, http.MethodGet, "/session/"+sessionID, query, nil, &session)
-	return session, err
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return Session{}, err
+	}
+	if v2 {
+		return c.sessionV2(ctx, sessionID)
+	}
+	return c.sessionV1(ctx, directory, sessionID)
 }
 
-// SessionStatuses returns the status of every session in directory. Only busy
-// and retry mean "running"; anything else (including an absent entry) is idle.
-func (c *Client) SessionStatuses(ctx context.Context, directory string) (map[string]Status, error) {
-	var statuses map[string]Status
-	query := url.Values{"directory": {directory}}
-	err := c.do(ctx, http.MethodGet, "/session/status", query, nil, &statuses)
-	return statuses, err
+// SessionStatuses returns the status of one session. Only busy and retry mean
+// "running"; anything else (including an absent entry) is idle.
+func (c *Client) SessionStatuses(ctx context.Context, directory, sessionID string) (Status, error) {
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return Status{}, err
+	}
+	if v2 {
+		return c.sessionStatusV2(ctx, sessionID)
+	}
+	return c.sessionStatusV1(ctx, directory, sessionID)
 }
 
 // Messages returns the full message list for a session, oldest first.
 func (c *Client) Messages(ctx context.Context, directory, sessionID string) ([]Message, error) {
-	var messages []Message
-	query := url.Values{"directory": {directory}}
-	err := c.do(ctx, http.MethodGet, "/session/"+sessionID+"/message", query, nil, &messages)
-	return messages, err
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if v2 {
+		return c.messagesV2(ctx, sessionID)
+	}
+	return c.messagesV1(ctx, directory, sessionID)
 }
 
-// Permissions lists every pending permission request in directory, across all
-// sessions: the caller must filter by session ID.
-func (c *Client) Permissions(ctx context.Context, directory string) ([]PermissionRequest, error) {
-	var requests []PermissionRequest
-	query := url.Values{"directory": {directory}}
-	err := c.do(ctx, http.MethodGet, "/permission", query, nil, &requests)
-	return requests, err
+// Permissions lists the pending permission requests of one session.
+func (c *Client) Permissions(ctx context.Context, directory, sessionID string) ([]PermissionRequest, error) {
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if v2 {
+		return c.permissionsV2(ctx, sessionID)
+	}
+	return c.permissionsV1(ctx, directory, sessionID)
 }
 
-// ReplyPermission answers one request. The reply endpoint is keyed by request ID
-// only — it carries no session ID — so a caller running several sessions must
-// keep its own request-to-task mapping.
-func (c *Client) ReplyPermission(ctx context.Context, directory, requestID string, reply Reply, message string) error {
-	body := ReplyRequest{Reply: reply, Message: message}
-	query := url.Values{"directory": {directory}}
-	return c.do(ctx, http.MethodPost, "/permission/"+requestID+"/reply", query, body, nil)
+// ReplyPermission answers one request. The session is needed by v2, whose reply
+// route is session-scoped; v1 keys the reply by request ID alone and ignores it.
+func (c *Client) ReplyPermission(ctx context.Context, directory, sessionID, requestID string, reply Reply, message string) error {
+	v2, err := c.isV2(ctx)
+	if err != nil {
+		return err
+	}
+	if v2 {
+		return c.replyPermissionV2(ctx, sessionID, requestID, reply, message)
+	}
+	return c.replyPermissionV1(ctx, directory, requestID, reply, message)
 }
 
 // do performs one request, decoding a JSON response into out when it is non-nil.
@@ -238,6 +378,8 @@ func IsUnauthorized(err error) bool {
 // IsNotFound reports whether err is a 404. For a permission reply that means the
 // request no longer exists — an answer, not a failure: the server resolves a
 // permission itself when its turn ends, and a request can also be answered twice.
+// For a prompt it means the session the registry recorded does not exist on this
+// server (a v1 session after the server was upgraded to v2).
 func IsNotFound(err error) bool {
 	var httpErr *HTTPError
 	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound

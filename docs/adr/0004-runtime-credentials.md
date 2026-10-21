@@ -11,7 +11,8 @@ permission gate and `ResolveCredential`), the `credentials_file` field and the t
 
 An opencode server can require HTTP Basic Auth, and it does whenever
 `OPENCODE_SERVER_PASSWORD` is set on it: `/global/health` then answers `401` with
-`www-authenticate: Basic`. FlowHub has to send that pair on every call — the activation
+`www-authenticate: Basic` (on opencode 2.x, whose health probe is `/api/info`, the
+answer is the same `401`). FlowHub has to send that pair on every call — the activation
 probe, the agent-registry and model-catalogue reads, the session creation, the permission
 loop — or the runtime is unusable.
 

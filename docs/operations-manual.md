@@ -96,7 +96,8 @@ Without it, any Go 1.24+ toolchain works.
 
 ### 2.4 opencode
 
-* The `opencode` CLI on the host that runs turns, version 1.18 or newer.
+* The `opencode` CLI on the host that runs turns, version 1.18 or newer. FlowHub
+  speaks both API generations and detects which one a server offers (ADR 0012).
 * `opencode serve` listening on a port FlowHub can reach.
 * A model provider configured and working (`opencode` auth, or a self-hosted
   OpenAI-compatible endpoint).
@@ -104,8 +105,15 @@ Without it, any Go 1.24+ toolchain works.
 ```bash
 opencode --version
 opencode serve --hostname 127.0.0.1 --port 4096 &
+# opencode 2.x
+curl -s -u "opencode:$OPENCODE_SERVER_PASSWORD" http://127.0.0.1:4096/api/info
+# opencode 1.x
 curl -s http://127.0.0.1:4096/global/health
 ```
+
+`/global/health` still answers on a 2.x server, but with the web app's HTML page and
+status 200 — not JSON. A JSON `version` from `/api/info` is what proves a 2.x server
+is up.
 
 ---
 
@@ -130,10 +138,11 @@ machine-readable report, `--strict` to treat warnings as failures, and
 **Read the warnings, not just the exit code.** A check that could not run is
 deliberately *not* a failure: on the reference host `runtime init --check` exits
 `0` while warning that the model catalogue could not be read (`GET /provider: HTTP
-401`), because the agent server had not been given credentials. The turn would
-still run — but the profile's model would be unverified, which is exactly the
-failure mode `--strict` exists to catch. Use `--strict` in CI or before enrolling
-a host, and treat an "not checked" line as unfinished setup.
+401` on 1.x, `GET /api/model: HTTP 401` on 2.x), because the agent server had not
+been given credentials. The turn would still run — but the profile's model would be
+unverified, which is exactly the failure mode `--strict` exists to catch. Use
+`--strict` in CI or before enrolling a host, and treat an "not checked" line as
+unfinished setup.
 
 When the report looks right:
 
@@ -187,6 +196,10 @@ may be committed. `{env:...}` is resolved by opencode at load time.
 ### 3.3 Verify the agent is registered
 
 ```bash
+# opencode 2.x
+curl -s -u "opencode:$OPENCODE_SERVER_PASSWORD" http://127.0.0.1:4096/api/agent \
+  | python3 -m json.tool | grep -A3 '"devops"'
+# opencode 1.x
 curl -s http://127.0.0.1:4096/agent | python3 -m json.tool | grep -A2 '"devops"'
 ```
 
@@ -393,8 +406,9 @@ puts a secret here, which then requires mode `0600`.
 ### 5.4 Credentials for the agent server
 
 If `opencode serve` was started with `OPENCODE_SERVER_PASSWORD` set, every call to it
-must carry Basic Auth; `/global/health` answers `401` without it. Pick **one** source
-per runtime — naming two is refused at load:
+must carry Basic Auth; the health probe answers `401` without it (`/api/info` on
+2.x, `/global/health` on 1.x). Pick **one** source per runtime — naming two is
+refused at load:
 
 | Source | Written in the runtime block | Secret lives in |
 | --- | --- | --- |
@@ -604,7 +618,8 @@ Only after all four are true should you consider Phase 2.
 
 The dispatcher **refuses to start** unless all of these hold. Check them now:
 
-* `FLOWHUB_OPENCODE_URL` (or the runtime's `url`) answers `/global/health`;
+* `FLOWHUB_OPENCODE_URL` (or the runtime's `url`) answers its health probe
+  (`/api/info` on opencode 2.x, `/global/health` on 1.x);
 * every routable entry has a `default_branch`;
 * every routable entry has a `worktrees` directory or `FLOWHUB_WORKTREE_BASE`;
 * every `repo.path` is a git work tree whose `origin` matches `repo.remote`.
@@ -1107,7 +1122,7 @@ tail -5 /var/lib/flowhub/webhook-$(date -u +%F).jsonl | jq -c '{accepted,reason,
 | No turn, log says `no rule matched this event` | the event is not one that starts work | expected for field edits; use `/opencode start` or the configured state |
 | No turn, `dispatch.paused > 0` | the pause file exists | `rm <FLOWHUB_PAUSE_FILE>` |
 | No turn, `dropped > 0` | the dispatch queue is full | raise `FLOWHUB_DISPATCH_QUEUE`; investigate why turns are slow |
-| `no runtime answered` | the opencode server is down | `curl <runtime_url>/global/health` |
+| `no runtime answered` | the opencode server is down | `curl <runtime_url>/api/info` (2.x, with auth) or `<runtime_url>/global/health` (1.x) |
 | A turn sits for a long time and then fails with a connection error | the host stopped answering **without** closing the connection (black-holed packets, a wedged server), so only the client-side bound can end the call | check `FLOWHUB_OPENCODE_REQUEST_TIMEOUT` (`-print-config` shows it, and a value at or above the turn budget prints a `warning:`). It bounds one request, never a turn: a healthy slow turn is unaffected |
 | Task refused: *bound to runtime X, which is no longer configured* | the runtime was removed or renamed | restore it under the same name; the task cannot move |
 | Task refused: *mapping now points at …* | `repo.path` changed for an existing task | un-bind deliberately (new issue, or prune the registry row) rather than editing the path |
@@ -1184,7 +1199,7 @@ instead of the value.
 - [ ] opencode installed; `opencode serve` healthy; provider works
 - [ ] `flowhub runtime init --check` → exit `0`
 - [ ] `flowhub runtime init`; MCP snippet merged; `YOUTRACK_TOKEN` exported
-- [ ] `curl /agent` lists `devops`
+- [ ] `curl /api/agent` (2.x) or `/agent` (1.x) lists `devops`
 - [ ] YouTrack: Webhook Triggers installed, attached to the project, URL is a domain, no comma
 - [ ] `~/.config/flowhub/config.json` written; `prompt_file` lines removed or files created
 - [ ] **`authors` declared on every project you dispatch for.** It is the only gate on

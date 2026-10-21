@@ -52,10 +52,11 @@ type Task struct {
 	// session but never choose its ID, so the registry supplies it here. Empty
 	// means "create a new session".
 	SessionID string
-	// Ruleset is the session-level permission ruleset. It is the first line of
-	// defence and overrides project and global configuration, so it should at
-	// minimum deny edit, external_directory, webfetch and websearch.
+	// Ruleset is the session-level permission ruleset (v1 vocabulary). Exactly one
+	// of Ruleset and RulesetV2 is set, by the Runtime, for the server's API.
 	Ruleset []PermissionRule
+	// RulesetV2 is the same ruleset in the v2 vocabulary.
+	RulesetV2 []PermissionRuleV2
 	// Metadata is stored with the session; FlowHub puts the task key here.
 	Metadata map[string]any
 	// Deadline bounds the whole turn. A deadline is not a failure: the session
@@ -114,14 +115,26 @@ func NewRunner(client *Client, arbiter *Arbiter, log *slog.Logger) *Runner {
 
 // Run executes one task and returns its result.
 //
-// The loop is driven by three signals, all of which are needed:
-//
-//   - GET /permission?directory= for pending requests (a pending permission keeps
-//     the session busy, so it must be answered or the turn never ends);
-//   - GET /session/status?directory= to know whether the turn is still running;
-//   - a new assistant message with time.completed set, which is the only
-//     reliable "the turn really finished" marker, because status can lag.
+// The two API generations need different completion signals, so the turn is
+// driven by one of two loops. A v1 turn needs three: a pending permission (which
+// keeps the session busy), the status endpoint, and a new completed assistant
+// message, because status lags. A v2 turn has an explicit `idle` message whose
+// outcome is the end of the turn, so it needs the pending permissions and that
+// message. The protocol is discovered once by the client and the choice is not
+// revisited mid-turn.
 func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
+	v2, err := r.client.isV2(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if v2 {
+		return r.runV2(ctx, task)
+	}
+	return r.runV1(ctx, task)
+}
+
+// runV1 drives one turn on an opencode 1.x server.
+func (r *Runner) runV1(ctx context.Context, task Task) (Result, error) {
 	started := time.Now()
 	result := Result{}
 
@@ -199,11 +212,11 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 			return result, err
 		}
 		completed := completedAssistant(messages)
-		statuses, err := r.client.SessionStatuses(ctx, task.Directory)
+		status, err := r.client.SessionStatuses(ctx, task.Directory, sessionID)
 		if err != nil {
 			return result, err
 		}
-		busy := statuses[sessionID].Busy()
+		busy := status.Busy()
 		pending, err := r.pendingFor(ctx, task.Directory, sessionID)
 		if err != nil {
 			return result, err
@@ -285,7 +298,7 @@ func (r *Runner) answerPending(ctx context.Context, directory, sessionID string,
 			// read, so it can adapt instead of repeating the same call.
 			message = decision.Reason
 		}
-		if err := r.client.ReplyPermission(ctx, directory, request.ID, decision.Reply, message); err != nil {
+		if err := r.client.ReplyPermission(ctx, directory, sessionID, request.ID, decision.Reply, message); err != nil {
 			if IsNotFound(err) {
 				// The request was resolved between the list and the reply: the server
 				// answers a permission itself when the turn or the sibling tool call it
@@ -321,18 +334,15 @@ func (r *Runner) answerPending(ctx context.Context, directory, sessionID string,
 // for permission in a loop cannot make the worker spin inside a single pass.
 const maxPermissionsPerPass = 32
 
+// pendingFor returns the pending permission requests of this session. The client
+// already scopes them: v1 filters the directory-wide list, v2 asks the session's
+// own endpoint.
 func (r *Runner) pendingFor(ctx context.Context, directory, sessionID string) ([]PermissionRequest, error) {
-	all, err := r.client.Permissions(ctx, directory)
+	pending, err := r.client.Permissions(ctx, directory, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("opencode: list permissions: %w", err)
 	}
-	var mine []PermissionRequest
-	for _, request := range all {
-		if request.SessionID == sessionID {
-			mine = append(mine, request)
-		}
-	}
-	return mine, nil
+	return pending, nil
 }
 
 // withoutHandled drops the permission requests this turn has already dealt with.

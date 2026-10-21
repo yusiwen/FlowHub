@@ -185,7 +185,9 @@ admin API must return real errors and refusals.
    the host claims (a host without it would run every turn under the agent server's
    own default agent), and `/provider` for the model the host reported (a model the
    server no longer offers would kill the first turn). The refusal is returned to
-   `init`, which prints it, and the pending entry keeps the reason.
+   `init`, which prints it, and the pending entry keeps the reason. (opencode 2.x
+   serves the same three facts at `/api/info`, `/api/agent` and `/api/model`; the
+   generation is detected by the client, so this check does not change — ADR 0012.)
 4. **The worker keeps a long-lived secret** for heartbeat and re-registration; the
    service stores only its hash.
 5. **Revocation** is `DELETE`. A revoked host's next heartbeat gets a refusal that

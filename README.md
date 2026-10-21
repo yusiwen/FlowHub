@@ -311,7 +311,7 @@ switched on explicitly:
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
 | `FLOWHUB_DISPATCH` | `false` | Run opencode turns for accepted deliveries. Off means record-only |
-| `FLOWHUB_OPENCODE_URL` | `http://127.0.0.1:4096` | Base URL of the headless opencode server. Startup probes `/global/health` and refuses to start if it does not answer |
+| `FLOWHUB_OPENCODE_URL` | `http://127.0.0.1:4096` | Base URL of the headless opencode server. Startup probes the server's own API generation — `/api/info` on opencode 2, `/global/health` on 1.x — and refuses to start if neither answers |
 | `FLOWHUB_OPENCODE_USER` | *(unset)* | HTTP Basic Auth username for every call to an agent server. Set with the password or not at all; required before a runtime that is not on loopback is usable |
 | `FLOWHUB_OPENCODE_PASSWORD` | *(unset)* | HTTP Basic Auth password, matching the server's `OPENCODE_SERVER_PASSWORD`. Never printed: `-print-config` shows a fingerprint |
 | `FLOWHUB_DISPATCH_AGENT` | `devops` | opencode agent for turns whose routing entry names none |
@@ -646,18 +646,32 @@ spends tokens and creates real sessions.
 
 ### The turn lifecycle
 
+FlowHub speaks both HTTP API generations. The client probes `/api/info` first
+(opencode 2) and falls back to `/global/health` (opencode 1); the turn then uses the
+matching loop (ADR 0012). The probe order matters because a v2 server answers
+`/global/health` with the web app's HTML and status 200.
+
 ```
+opencode 1.x
 POST /session?directory=<worktree>   session-level ruleset, agent, task key
 POST /session/{id}/prompt_async      204, then the model works
   loop: GET /permission?directory=   answer what the ruleset chose to ask about
         GET /session/status?         busy / idle
         GET /session/{id}/message    a new assistant message with time.completed
+
+opencode 2.x
+POST /api/session                    location, agent, model, permissions
+POST /api/session/{id}/prompt        {text}; the server schedules the turn
+  loop: GET /api/session/{id}/permission
+        GET /api/session/{id}/message   until the turn's idle message appears
   -> final text, cost, tokens, and every permission decision
 ```
 
-Completion needs all three signals: `status` alone lags after a turn ends, and a
-pending permission keeps a session `busy` — so "busy" never means "working" and
-"idle" never means "finished".
+Completion needs all three v1 signals, because `status` lags after a turn ends and
+a pending permission keeps a session `busy` — so "busy" never means "working" and
+"idle" never means "finished". v2 states the end of the turn itself: an `idle`
+message carries `outcome: succeeded | failed | interrupted`. In both generations a
+pending permission keeps the turn alive and is answered before anything else.
 
 ### Permissions are decided in two layers
 
@@ -829,6 +843,13 @@ harmless even if the model decides to be helpful. Which tools are allowed at all
 which call counts as the reply and where a download may land come from the
 source's `ToolPolicy` (`internal/source/youtrack/tools.go`); the dispatcher only
 enforces them, so an adapter cannot widen the shell policy.
+
+The ruleset is written in the server's own vocabulary: `{permission, pattern,
+action}` on opencode 1.x, `{action, resource, effect}` on 2.x. The catch-all still
+comes first in both (evaluation is still last-match-wins), and the explicit
+`external_directory: deny` is load bearing on v2, where external paths are allowed
+by default — dropping it would let every turn read and write outside its worktree
+(ADR 0012).
 
 ### Measured on this host
 
@@ -1177,7 +1198,7 @@ Layout:
 | `internal/projectmap` | The configuration file: v1/v2 loader with the v1 translation, `sources`/`runtimes`/`projects`, the `(source, project)` index, per-level policy precedence with provenance, canonical paths, fail-closed validation, runtime addressing |
 | `internal/rules` | Trigger policy over the neutral event: ignore/analyze/plan/execute, self-comment detection, turn budget, reply basis |
 | `internal/agent` | The runtime seam: `Runtime`, the neutral `Turn`/`Result`, the turn phase and the download policy |
-| `internal/agent/opencode` | opencode client, permission arbiter (including the trusted command prefixes a host plugin may insert), session ruleset and the runner that drives one unattended turn |
+| `internal/agent/opencode` | opencode client for both HTTP API generations (v1 and v2 transports behind one protocol-detecting client, ADR 0012), permission arbiter (including the trusted command prefixes a host plugin may insert), session rulesets in each vocabulary and the runner that drives one unattended turn |
 | `internal/workspace` | The workspace seam: `Workspace`, `Handle`, the pinned `Base`, and entry validation |
 | `internal/workspace/localworktree` | The co-located provider: one git worktree per task, baseline pinned through the origin |
 | `internal/dispatch` | The workers: intake loop, one queue and worker per runtime, worktree, session, registry, audit |
