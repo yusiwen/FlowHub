@@ -18,7 +18,7 @@ The Go service and this app share a repository, not a build: the app lives in
 ```bash
 make desktop-install   # pnpm install
 make desktop-dev       # Vite + Tauri dev window
-make desktop-check     # tsc --noEmit, cargo fmt, clippy, cargo test
+make desktop-check     # tsc --noEmit, node --test, cargo fmt, clippy, cargo test
 make desktop-app       # build the debug bundle and open it
 make desktop-build     # release app bundle
 ```
@@ -38,6 +38,9 @@ it is not a required check for a Go-only pull request.
 | --- | --- |
 | `src/` | shell UI, running only in the local webview |
 | `src-tauri/src/main.rs` | window and webview wiring |
+| `src-tauri/src/ime.rs` | the document-start IME correction every webview runs (ADR 0011) |
+| `src-tauri/src/webview-ime.js` | that script: makes `isComposing` truthful under WebKit |
+| `scripts/ime-shim.test.mjs` | the `node --test` suite over the script's three signals |
 | `src-tauri/src/tabs.rs` | tab manager: one child webview per instance, stage bounds, activate/close, lazy restore |
 | `src-tauri/src/session.rs` | the versioned `session.json`: open tab ids, active tab, sidebar visibility |
 | `src-tauri/src/auth.rs` | dsh launch-token parsing, the token URL, and the authority-hashed cookie name |
@@ -132,6 +135,25 @@ the tab exists, and the shell renders the dashboard in the stage instead. A tab 
 the title ellipsizes, so the instance suffix stays visible and two instances
 with the same page title remain distinguishable. Hovering a tab shows the full,
 untruncated page title, the instance name, and the URL.
+
+## Keyboard input
+
+Each embedded page decides what Enter does, and the usual guard is
+`event.key === "Enter" && !event.isComposing`. WebKit dispatches `compositionend`
+*before* the keydown of the Enter that confirms an IME composition, so that keydown
+reaches the page with `isComposing === false` and the page submits on the keystroke
+that was meant to commit pinyin — measured in the opencode session view, where the
+prompt was sent carrying the raw `wenti`.
+
+Every webview therefore runs `src-tauri/src/webview-ime.js` before the page's own
+scripts (ADR 0011). It reports `isComposing` as Chromium does: the engine's own answer,
+or `keyCode === 229` (a key the input method swallowed), or a keydown within 10 ms of
+`compositionend`. It only ever adds `true`, so a page that already checks `keyCode 229`
+keeps working. Arguments: the correction is in `src-tauri/src/ime.rs`, and
+`desktop/scripts/ime-shim.test.mjs` pins all three signals.
+
+What it does not change: sub-frames, and anything the host does not render. A page
+opened in Safari keeps Safari's behaviour.
 
 ## Shortcuts
 
