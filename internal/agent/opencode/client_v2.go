@@ -52,17 +52,6 @@ func (c *Client) healthV2(ctx context.Context) (Health, error) {
 	return Health{Healthy: true, Version: info.Version}, nil
 }
 
-// locationQuery is the deepObject spelling every configuration-resolving v2
-// endpoint takes. /api/session's own list endpoint is the exception and still
-// takes a flat ?directory=.
-func locationQuery(directory string) url.Values {
-	query := url.Values{}
-	if strings.TrimSpace(directory) != "" {
-		query.Set("location[directory]", directory)
-	}
-	return query
-}
-
 func (c *Client) agentsV2(ctx context.Context) ([]AgentInfo, error) {
 	var payload struct {
 		Data []struct {
