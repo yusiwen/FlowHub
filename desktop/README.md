@@ -236,6 +236,14 @@ cookie in the webview. It holds all three roles; `kind` decides the view —
 downstream — and the registry version stays 1 because the role is derived rather
 than stored.
 
+Those strings are the wire form for both the file and the IPC commands, and they are
+the shell's vocabulary: `desktop/src/types.ts` declares them, this table and
+`InstanceKind`'s serde names must match it, and a brand name keeps its spelling
+(`flowhub`, not `flow-hub`). A test reads the union out of `types.ts` and round-trips
+every member through `InstanceKind`, because two hand-written lists of literals
+drift — that is how the Hub view's Add button came to fail with `unknown variant
+'flowhub'` (issue #87).
+
 While the app was called "Agent Hub" it used the `dev.flowhub.agenthub`
 directory. On the first start after the rename, `instances.json` and
 `session.json` are copied from there when the new directory has none; the legacy
