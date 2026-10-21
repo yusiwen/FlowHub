@@ -178,6 +178,7 @@ desktop-app:
 
 desktop-check:
 	cd desktop && pnpm exec tsc --noEmit
+	cd desktop && pnpm test
 	cd desktop/src-tauri && cargo fmt --check
 	cd desktop/src-tauri && cargo clippy --all-targets -- -D warnings
 	cd desktop/src-tauri && cargo test

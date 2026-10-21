@@ -524,7 +524,10 @@ hubLogSave.addEventListener("click", () => {
 });
 
 hubLogInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
+  // An Enter that confirms an IME candidate belongs to the input method, not to
+  // this field. The webview script makes isComposing truthful under WebKit
+  // (ADR 0011), so the check holds in the app as well as in a browser.
+  if (event.key === "Enter" && !event.isComposing) {
     event.preventDefault();
     hubLogSave.click();
   }

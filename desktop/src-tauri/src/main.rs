@@ -5,6 +5,7 @@ mod auth;
 mod commands;
 mod health;
 mod hub;
+mod ime;
 mod menu;
 mod model;
 mod prefs;
@@ -44,8 +45,9 @@ fn main() {
                 .min_inner_size(900.0, 600.0)
                 .build()?;
 
-            let shell =
-                WebviewBuilder::new("shell", WebviewUrl::App("index.html".into())).auto_resize();
+            let shell = WebviewBuilder::new("shell", WebviewUrl::App("index.html".into()))
+                .initialization_script(ime::SCRIPT)
+                .auto_resize();
 
             window.add_child(shell, LogicalPosition::new(0.0, 0.0), window.inner_size()?)?;
             menu::install(app)?;
