@@ -90,8 +90,11 @@ not part of the Go module or its build: no cgo, no FFI edge. Use
 `make desktop-install`, `make desktop-dev`, `make desktop-app` and
 `make desktop-check`; the design is
 recorded in `docs/adr/0008-desktop-agent-hub.md`,
-`docs/adr/0009-desktop-three-views.md`, `docs/adr/0010-role-colour.md` and
-`desktop/README.md`.
+`docs/adr/0009-desktop-three-views.md`, `docs/adr/0010-role-colour.md`,
+`docs/adr/0011-webview-ime-composition.md` and `desktop/README.md`. Every webview is
+created with `ime::SCRIPT` as a document-start script; a builder that skips it
+reintroduces the IME bug where Enter that confirms a Chinese candidate also submits
+the page's form.
 
 ## Project Structure
 
