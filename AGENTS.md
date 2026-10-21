@@ -109,7 +109,7 @@ internal/source/youtrack/ the YouTrack adapter: payload model, schema report, ne
 internal/webhook/   The delivery pipeline: entry locks, body limits, source decode, replay window, idempotency, audit, redaction
 internal/projectmap/ the configuration file (v1/v2, sources, runtimes, (source, project) index, provenance) (~/.config/flowhub/config.json)
 internal/agent/       the runtime seam: Runtime, Turn/Result, Phase, Downloads, model references
-internal/agent/opencode/  the opencode implementation: client, arbiter, session ruleset, one-turn runner
+internal/agent/opencode/  the opencode implementation: one protocol-detecting client with a v1 and a v2 transport, arbiter, session rulesets, one-turn runner
 internal/workspace/   the workspace seam: Workspace, Handle, Base, Validator
 internal/workspace/localworktree/  one git worktree per task, baseline pinned through the origin
 internal/rules/     trigger policy over the neutral event (ignore/analyze/plan/execute) and the reply basis
@@ -236,8 +236,14 @@ documents. The rules below are load-bearing; do not relax them casually.
    Never reply `always` by default, never widen the allowlist to "make the agent
    work", and remember that allowed build and test commands are arbitrary code
    execution — the per-task worktree is the real containment. Completion detection
-   needs all three signals (new completed assistant message, status not busy, no
-   pending permission): status lags, and a pending permission keeps a session busy.
+   belongs to the server's API generation: on opencode 1.x it needs all three
+   signals (new completed assistant message, status not busy, no pending
+   permission), because status lags and a pending permission keeps a session busy;
+   on 2.x the server writes an `idle` message whose `outcome` is the end of the
+   turn, and a pending permission still holds that back. **Which generation a
+   server speaks is detected once by the client** — `/api/info` first, then
+   `/global/health` (ADR 0012) — so do not hard-code either surface in a caller,
+   and build the ruleset in the vocabulary the server actually evaluates.
    A turn that produces no assistant message at all while the session is idle is
    failed at `FLOWHUB_FIRST_RESPONSE` rather than held until the deadline — that is
    the signature of a prompt the agent server rejected, and a busy session with no

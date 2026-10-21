@@ -77,15 +77,25 @@ func TestLiveTask(t *testing.T) {
 	runner := NewRunner(client, DefaultArbiter(), logger)
 	runner.Poll = 2 * time.Second
 
-	result, err := runner.Run(ctx, Task{
+	task := Task{
 		Directory: directory,
 		Prompt:    prompt,
 		Agent:     os.Getenv("OPENCODE_AGENT"),
-		Title:     "flowhub live check",
-		Ruleset:   ruleset,
-		Metadata:  map[string]any{"task_key": "live-check", "source": "flowhub test-live"},
-		Deadline:  2 * time.Minute,
-	})
+		// v2 resolves a session's model from the session, not from the agent
+		// profile, so pin one explicitly or the server's global default is used.
+		Model:    os.Getenv("OPENCODE_MODEL"),
+		Title:    "flowhub live check",
+		Metadata: map[string]any{"task_key": "live-check", "source": "flowhub test-live"},
+		Deadline: 2 * time.Minute,
+	}
+	// The ruleset is expressed in the server's vocabulary, exactly as Runtime does.
+	if proto, err := client.Protocol(ctx); err == nil && proto == protocolV2 {
+		task.RulesetV2 = sessionRulesetV2(nil)
+	} else {
+		task.Ruleset = ruleset
+	}
+
+	result, err := runner.Run(ctx, task)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}

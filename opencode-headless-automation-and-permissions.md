@@ -9,6 +9,7 @@
 > 当前实现、配置项与实测结论以 [`README.md`](./README.md) 与 [`CODEBASE.md`](./CODEBASE.md) 为准。
 > 文中出现的接收端地址 `192.168.8.135:8080` 已失效（DHCP 变更），现固定为 `192.168.8.20`，
 > 或改用 `0.0.0.0:8080` + `FLOWHUB_ALLOW_WILDCARD_LISTEN=1`。
+> **opencode 2 更新（2026-10-21）**：opencode 2.0 移除了本文描述的整个 v1 HTTP API（`/global/health`、`/session`、`/permission`、`/provider` 等）；`/global/health` 在 2.x 上返回 web UI 的 HTML。本文的接口细节仅适用于 1.x 主机，v1→v2 的端点、请求体与完成/权限语义对照见 [`docs/adr/0012-opencode-v2-http-api.md`](./docs/adr/0012-opencode-v2-http-api.md)。
 
 ---
 

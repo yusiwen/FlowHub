@@ -10,6 +10,7 @@
 > 文中出现的接收端地址 `192.168.8.135:8080` 已失效（DHCP 变更），现固定为 `192.168.8.20`，
 > 或改用 `0.0.0.0:8080` + `FLOWHUB_ALLOW_WILDCARD_LISTEN=1`。
 > §8 提出的 `task_session(...)` 建表方案已由 append-only 的 `registry.jsonl` 落地，字段与状态机见 `CODEBASE.md`。
+> **opencode 2 更新（2026-10-21）**：opencode 2.0 移除了本文引用的 v1 HTTP API；第 3、5 节的端点与"v2 需要 UI runner"的结论都只适用于当时版本（2.0.32 的 `prompt` 会自行调度 agent loop）。FlowHub 现在同时支持两代 API，对照见 [`docs/adr/0012-opencode-v2-http-api.md`](./docs/adr/0012-opencode-v2-http-api.md)。
 
 ## 1. 背景与目标
 

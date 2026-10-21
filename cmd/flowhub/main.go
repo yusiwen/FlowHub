@@ -650,12 +650,16 @@ func declaredRuntimes(cfg config.Config, projects *projectmap.Map) []dispatch.De
 
 // opencodeProber decides whether a host that just claimed a name is usable.
 //
-// Answering /global/health is not enough. opencode accepts a session for an agent
+// Answering the health probe is not enough. opencode accepts a session for an agent
 // it does not have and falls back to its own default — a looser agent with a
 // different step budget and permission block — so activation also requires the
 // profile the host claimed to exist on *that* server, and the model the host
 // reported to be one the server offers. Those are the checks `init --check` runs
 // locally, repeated from the side that will actually send the turns.
+//
+// The probe is protocol-neutral: the client detects opencode 1.x (/global/health)
+// or 2.x (/api/info) on its first call and reads the same three facts from
+// whichever surface the host speaks (ADR 0012).
 //
 // It speaks opencode's own API rather than the agent seam, deliberately: the agent
 // registry and the model catalogue are what *this product* exposes, and a capability

@@ -17,6 +17,7 @@
 > 当前实现、配置项与实测结论以 [`README.md`](./README.md) 与 [`CODEBASE.md`](./CODEBASE.md) 为准。
 > 文中出现的接收端地址 `192.168.8.135:8080` 已失效（DHCP 变更），现固定为 `192.168.8.20`，
 > 或改用 `0.0.0.0:8080` + `FLOWHUB_ALLOW_WILDCARD_LISTEN=1`。
+> **opencode 2 更新（2026-10-21）**：§9.4、§11 里的 opencode 端点（`/agent`、`/global/health`）属于 v1 API，opencode 2.0 已移除；FlowHub 同时支持两代 API，对照见 [`docs/adr/0012-opencode-v2-http-api.md`](./docs/adr/0012-opencode-v2-http-api.md)。
 
 ---
 
