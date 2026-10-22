@@ -238,9 +238,9 @@ func (l *Log) loop() {
 // It is the delivery path: the webhook answers 202 only after this returns nil. It
 // does not fsync; the explicit durability contract is "the write reached the OS",
 // which is enough to survive a process crash and is the append-before-202 rule.
-func (l *Log) Append(event Event) error {
+func (l *Log) Append(event Event) (Event, error) {
 	if l == nil {
-		return fmt.Errorf("upstream: no event log")
+		return Event{}, fmt.Errorf("upstream: no event log")
 	}
 	// Hold sendMu so Close cannot close the file under an append that is in
 	// progress, and so an append after Close is refused rather than written to a
@@ -248,16 +248,16 @@ func (l *Log) Append(event Event) error {
 	l.sendMu.Lock()
 	defer l.sendMu.Unlock()
 	if l.closed {
-		return fmt.Errorf("upstream: event log is closed")
+		return Event{}, fmt.Errorf("upstream: event log is closed")
 	}
 	return l.persist(event)
 }
 
 func (l *Log) write(event Event) {
-	_ = l.persist(event)
+	_, _ = l.persist(event)
 }
 
-func (l *Log) persist(event Event) error {
+func (l *Log) persist(event Event) (Event, error) {
 	if event.ID == "" {
 		event.ID = NewID(l.opts.Now())
 	}
@@ -267,7 +267,7 @@ func (l *Log) persist(event Event) error {
 	if err := event.Validate(); err != nil {
 		l.invalid.Add(1)
 		l.setError(err.Error())
-		return err
+		return event, err
 	}
 	key := event.Upstream + "\x00" + event.DedupeKey
 
@@ -275,14 +275,14 @@ func (l *Log) persist(event Event) error {
 	defer l.writeMu.Unlock()
 	if l.dedupe.CheckAndAdd(key) {
 		l.duplicates.Add(1)
-		return nil
+		return event, nil
 	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		l.dedupe.Remove(key)
 		l.writeErrors.Add(1)
 		l.setError(fmt.Sprintf("marshal event: %v", err))
-		return fmt.Errorf("marshal event: %w", err)
+		return event, fmt.Errorf("marshal event: %w", err)
 	}
 
 	day := event.ReceivedAt.UTC().Format("2006-01-02")
@@ -300,7 +300,7 @@ func (l *Log) persist(event Event) error {
 			l.dedupe.Remove(key)
 			l.writeErrors.Add(1)
 			l.setError(fmt.Sprintf("open %s: %v", path, err))
-			return fmt.Errorf("open %s: %w", path, err)
+			return event, fmt.Errorf("open %s: %w", path, err)
 		}
 		l.file = file
 		l.fileDay = day
@@ -313,7 +313,7 @@ func (l *Log) persist(event Event) error {
 		l.dedupe.Remove(key)
 		l.writeErrors.Add(1)
 		l.setError(fmt.Sprintf("write %s: %v", name, err))
-		return fmt.Errorf("write %s: %w", name, err)
+		return event, fmt.Errorf("write %s: %w", name, err)
 	}
 	l.mu.Unlock()
 
@@ -321,7 +321,7 @@ func (l *Log) persist(event Event) error {
 	l.lastEvent.Store(event.ReceivedAt.UnixNano())
 	l.setError("")
 	l.notify(event)
-	return nil
+	return event, nil
 }
 
 func (l *Log) notify(event Event) {

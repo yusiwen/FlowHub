@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yusiwen/flowhub/internal/compare"
 	"github.com/yusiwen/flowhub/internal/event"
 	"github.com/yusiwen/flowhub/internal/flow"
 	"github.com/yusiwen/flowhub/internal/flow/mode"
@@ -65,6 +66,8 @@ type Options struct {
 	// shadow-only.
 	TaskService  tasksvc.Service
 	TaskSelector tasksvc.Selector
+	// Compare joins a shadow decision with dispatch's decision for the same event.
+	Compare *compare.Store
 }
 
 // Engine consumes events and writes shadow runs.
@@ -193,15 +196,18 @@ func (e *Engine) Snapshot() map[string]any {
 		return map[string]any{"enabled": false}
 	}
 	return map[string]any{
-		"enabled":      true,
-		"mode":         "shadow",
-		"flow":         e.opts.Flow.Definition.ID,
-		"submitted":    e.submitted.Load(),
-		"dropped":      e.dropped.Load(),
-		"runs":         e.runs.Load(),
-		"failed":       e.failed.Load(),
-		"on_available": e.CanExecuteOn(),
-		"dir":          e.store.Dir(),
+		"enabled":           true,
+		"mode":              "shadow",
+		"flow":              e.opts.Flow.Definition.ID,
+		"submitted":         e.submitted.Load(),
+		"dropped":           e.dropped.Load(),
+		"runs":              e.runs.Load(),
+		"failed":            e.failed.Load(),
+		"on_available":      e.CanExecuteOn(),
+		"pending":           e.pendingCompare(),
+		"shadow_compared":   e.compareCounts(),
+		"shadow_mismatches": e.compareMismatches(),
+		"dir":               e.store.Dir(),
 	}
 }
 
@@ -381,6 +387,7 @@ func (e *Engine) run(ctx context.Context, event upstream.Event, trigger *flow.Co
 			if err := e.store.Save(run); err != nil {
 				return run, err
 			}
+			e.observeRun(run, event)
 			return run, nil
 		}
 		if outcome.next == "" {
@@ -429,6 +436,20 @@ func (e *Engine) execute(ctx context.Context, node *flow.CompiledNode, event ups
 		return stepOutcome{state: StepSucceeded, output: output, next: next}, nil
 	case flow.NodeEvaluate:
 		config := node.Config.(*flow.EvaluateConfig)
+		view := views[config.Task]
+		if live != nil && live.task.Key != "" {
+			view = viewOf(live.task)
+		}
+		decision := e.opts.Policy.Decide(neutralEvent(event), view)
+		if decision.Action == rules.ActionIgnore {
+			// A policy ignore (our own comment, a pause phrase, the turn limit) is
+			// the same decision dispatch reaches before it checks routing. Report it
+			// as such, so an unmapped project does not turn one ignore into two
+			// different reasons during parity.
+			return stepOutcome{state: StepSucceeded, output: map[string]any{
+				"action": "ignore", "basis": string(decision.Trigger), "reason": decision.Reason,
+			}, next: next}, nil
+		}
 		if !routableFromSteps(context) {
 			return stepOutcome{state: StepSucceeded, output: map[string]any{
 				"action": "ignore",
@@ -436,11 +457,6 @@ func (e *Engine) execute(ctx context.Context, node *flow.CompiledNode, event ups
 				"reason": fmt.Sprintf("no routing entry for %s/%s", event.Upstream, event.Subject.Project),
 			}, next: next}, nil
 		}
-		view := views[config.Task]
-		if live != nil && live.task.Key != "" {
-			view = viewOf(live.task)
-		}
-		decision := e.opts.Policy.Decide(neutralEvent(event), view)
 		if live != nil {
 			live.basis = decision.Reason
 		}
@@ -505,6 +521,51 @@ func (e *Engine) authorAllowed(event upstream.Event) bool {
 		}
 	}
 	return false
+}
+
+func (e *Engine) observeRun(run *Run, event upstream.Event) {
+	if e.opts.Compare == nil || run == nil || run.Mode != mode.Shadow || event.ID == "" {
+		return
+	}
+	evaluate := run.Steps["evaluate"]
+	ensure := run.Steps["ensure"]
+	if evaluate == nil || evaluate.Output == nil {
+		return
+	}
+	action, _ := evaluate.Output["action"].(string)
+	reason, _ := evaluate.Output["reason"].(string)
+	routable := false
+	if ensure != nil && ensure.Output != nil {
+		routable, _ = ensure.Output["routable"].(bool)
+	}
+	e.opts.Compare.ObserveFlow(compare.Decision{
+		EventID: event.ID, Source: event.Upstream, IssueID: event.Subject.Key,
+		Project: event.Subject.Project, Action: action, Reason: reason,
+		Routable: routable, At: e.now().UTC(),
+	})
+}
+
+func (e *Engine) compareCounts() int64 {
+	if e == nil || e.opts.Compare == nil {
+		return 0
+	}
+	compared, _ := e.opts.Compare.Counts()
+	return compared
+}
+
+func (e *Engine) compareMismatches() int64 {
+	if e == nil || e.opts.Compare == nil {
+		return 0
+	}
+	_, mismatches := e.opts.Compare.Counts()
+	return mismatches
+}
+
+func (e *Engine) pendingCompare() int {
+	if e == nil || e.opts.Compare == nil {
+		return 0
+	}
+	return e.opts.Compare.Pending()
 }
 
 func (e *Engine) modeFor(event upstream.Event) string {

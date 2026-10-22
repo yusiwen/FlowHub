@@ -4,6 +4,7 @@ import type {
   FlowStep,
   HubFlowSummary,
   HubRunSummary,
+  FlowComparison,
 } from "./types";
 
 export interface LayoutNode {
@@ -257,6 +258,7 @@ export function renderInspector(
   definition: FlowDefinition | null,
   run: FlowRun | null,
   selectedId: string | null,
+  comparison: FlowComparison | null = null,
 ): void {
   container.replaceChildren();
   const heading = document.createElement("h3");
@@ -275,6 +277,11 @@ export function renderInspector(
     row(container, "upstream", flow.upstream);
     row(container, "nodes", definition ? String(definition.nodes.length) : "—");
     row(container, "edges", definition ? String(definition.edges.length) : "—");
+    if (comparison) {
+      row(container, "dispatch", `${comparison.dispatch.action} · ${comparison.dispatch.reason || "—"}`);
+      row(container, "flow", `${comparison.flow.action} · ${comparison.flow.reason || "—"}`);
+      row(container, "comparison", comparison.match ? "match" : `diff: ${comparison.differences?.join(", ") || "unknown"}`);
+    }
     const triggers = document.createElement("div");
     triggers.className = "flow-inspector-row";
     const triggerKey = document.createElement("span");
@@ -358,6 +365,13 @@ export function renderRunList(
     const action = document.createElement("span");
     action.className = "flow-run-action";
     action.textContent = run.action || "—";
+    if (run.compared) {
+      const compare = document.createElement("span");
+      compare.className = run.match ? "flow-compare match" : "flow-compare diff";
+      compare.textContent = run.match ? "match" : "diff";
+      compare.title = run.match ? "Dispatch reached the same decision" : `Differences: ${run.differences?.join(", ") || "unknown"}`;
+      action.append(" ", compare);
+    }
     const task = document.createElement("span");
     task.className = "flow-run-task mono";
     task.textContent = run.task || "—";

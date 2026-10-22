@@ -16,7 +16,10 @@ into a neutral event and appended to `events/YYYY-MM-DD.jsonl` for the flow engi
 (`internal/upstream`, ADR 0013); the dispatcher remains the live consumer until the
 staged cutover. The builtin flow also runs in **shadow**: it evaluates every
 accepted event, writes a run under `runs/<run-id>/`, and marks every workspace/
-session/runtime node skipped. `/hub/v1` exposes the definition and runs to the
+session/runtime node skipped. Dispatch publishes its decision for the event id;
+the shadow run joins it, and equal/different decisions are counted in
+`/healthz.flows` (`shadow_compared`/`shadow_mismatches`) and shown as a diff in
+the desktop. `/hub/v1` exposes the definition and runs to the
 desktop under `FLOWHUB_HUB_TOKEN`, and `flowhub flow list|show|mode` is the local
 operator switch (`off`/`shadow`/`on`; `on` needs `FLOWHUB_DISPATCH=1` so the
 shared task service can execute turns).
@@ -122,6 +125,7 @@ internal/flow/      The flow model and compiler: strict definition, typed nodes,
 internal/flow/builtin/ the embedded read-only default-youtrack flow
 internal/flow/engine/ the flow runner: trigger matching, task projection, profile evaluation, shadow or on execution, run meta/journal
 internal/tasks/    the execution seam: ensure/turn/grant/revoke, implemented by dispatch and consumed by the flow engine
+internal/compare/  joins dispatch and shadow decisions by event id; flow-compare.jsonl, match/mismatch counters
 internal/flow/mode/ the deployment state: off/shadow/on in `<DataDir>/flows/state.json`, live-reloaded
 internal/flow/api/ the read-only `/hub/v1` surface (flows, runs, journal), bearer token in front
 internal/projectmap/ the configuration file (v1/v2, sources, runtimes, (source, project) index, provenance) (~/.config/flowhub/config.json)

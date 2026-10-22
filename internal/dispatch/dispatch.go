@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/yusiwen/flowhub/internal/agent"
+	"github.com/yusiwen/flowhub/internal/compare"
 	"github.com/yusiwen/flowhub/internal/event"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
@@ -92,6 +93,9 @@ type Options struct {
 	// before the queue: a project moved to an `on` flow must not also be dispatched.
 	// The reason is logged; a skipped delivery is never handled or audited as work.
 	Skip func(*store.Record) (bool, string)
+	// Decision, when set, receives dispatch's decision for an event. The flow engine
+	// joins it with its shadow decision by the event id.
+	Decision func(compare.Decision)
 }
 
 // DeclaredRuntime is a runtime the configuration file declares: where it is, and the
@@ -369,6 +373,17 @@ func (d *Dispatcher) runtimeSnapshot() map[string]map[string]any {
 // enterTurn records that a turn is running on a runtime and returns the function
 // that clears it. The spread policy ranks by these counters, so with one worker
 // per runtime (ADR 0001 step 5) they say which host is busy right now.
+func (d *Dispatcher) observeDecision(rec *store.Record, decision rules.Decision, routable bool) {
+	if d.opts.Decision == nil || rec == nil || rec.EventID == "" {
+		return
+	}
+	d.opts.Decision(compare.Decision{
+		EventID: rec.EventID, Source: d.opts.Source.Name(), IssueID: rec.IssueID,
+		Project: rec.ProjectKey, Action: string(decision.Action), Reason: decision.Reason,
+		Routable: routable, At: time.Now().UTC(),
+	})
+}
+
 func (d *Dispatcher) taskLock(rec *store.Record) *sync.Mutex {
 	key := d.opts.Source.Name() + "\x00" + rec.IssueID
 	d.taskMu.Lock()
@@ -631,6 +646,13 @@ func (d *Dispatcher) clearRuntimeError(name string) {
 // what previous turns recorded.
 func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 	rec, binding := item.record, item.binding
+	effective := rules.Decision{}
+	routable := true
+	defer func() {
+		if effective.Action != "" {
+			d.observeDecision(rec, effective, routable)
+		}
+	}()
 	if d.opts.Skip != nil {
 		if skip, reason := d.opts.Skip(rec); skip {
 			d.ignored.Add(1)
@@ -641,6 +663,8 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 	}
 	if d.Paused() {
 		d.ignored.Add(1)
+		effective = rules.Decision{Action: rules.ActionIgnore, Reason: "dispatch is paused"}
+		routable = false
 		d.log.Warn("dispatch is paused; delivery ignored",
 			"pause_file", d.opts.PauseFile, "issue", rec.IssueID, "event", rec.Event)
 		return
@@ -676,12 +700,14 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 
 	decision := d.policy.Decide(delivery, taskView)
 	if decision.Action == rules.ActionIgnore {
+		effective = decision
 		d.ignored.Add(1)
 		d.log.Info("delivery not dispatched",
 			"issue", rec.IssueID, "event", rec.Event, "reason", decision.Reason)
 		return
 	}
 	if d.opts.MaxCostPerTask > 0 && known && task.Cost >= d.opts.MaxCostPerTask {
+		effective = rules.Decision{Action: rules.ActionIgnore, Reason: "the task exceeded its cost budget"}
 		d.ignored.Add(1)
 		d.log.Warn("task exceeded its cost budget; a human must take over",
 			"issue", rec.IssueID, "cost", task.Cost, "budget", d.opts.MaxCostPerTask)
@@ -692,6 +718,8 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 	if !ok {
 		// Fail closed. Guessing a repository is the one mistake this design
 		// refuses to make.
+		effective = rules.Decision{Action: rules.ActionIgnore, Reason: "no repository is mapped for this project"}
+		routable = false
 		d.ignored.Add(1)
 		d.log.Warn("no repository is mapped for this project in this source; delivery ignored",
 			"issue", rec.IssueID, "source", d.opts.Source.Name(), "project", rec.ProjectKey)
@@ -701,6 +729,7 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		// A per-project allowlist is a restriction, so an actor it does not name
 		// gets no work — including the no-actor events (issueDeleted carries no
 		// actor), which can therefore never pass this gate.
+		effective = rules.Decision{Action: rules.ActionIgnore, Reason: "the actor is not on the project's author allowlist"}
 		d.ignored.Add(1)
 		d.log.Warn("actor is not on the project's author allowlist; delivery ignored",
 			"issue", rec.IssueID, "project", rec.ProjectKey, "actor", rec.PrimaryActor,
@@ -713,6 +742,7 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		// spending a turn to say so would be noise. It is answered here — after the
 		// actor check, before anything is prepared — so revoking cannot be blocked by
 		// the worktree or the binding.
+		effective = decision
 		d.revokeGrant(rec, task)
 		return
 	}
@@ -721,6 +751,7 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 	// from the same record, but a task may never move between runtimes, so it is
 	// checked here too rather than trusted.
 	if name := strings.TrimSpace(task.Runtime); name != "" && name != binding.Name {
+		effective = rules.Decision{Action: rules.ActionIgnore, Reason: "the task is bound to another runtime"}
 		d.ignored.Add(1)
 		d.log.Error("refusing to move a bound task to another runtime",
 			"issue", rec.IssueID, "bound", name, "chosen", binding.Name)
@@ -730,6 +761,7 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 	agentName := runtimeAgent(match.Entry, binding, d.opts.Agent)
 	task, err = d.ensureTask(ctx, rec, match.Entry, task, known, binding, agentName)
 	if err != nil {
+		effective = rules.Decision{Action: rules.ActionIgnore, Reason: "the task could not be prepared"}
 		d.failPreparation(rec, binding, err)
 		return
 	}
@@ -738,12 +770,15 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		// The authorisation is recorded first, and then the *same delivery* becomes the
 		// turn that carries on: the human's comment is what unblocks the task, so it
 		// must not need a second trigger.
+		effective = decision
 		decision, task = d.grantPermit(rec, task, decision)
 		if decision.Action == rules.ActionIgnore {
+			effective = decision
 			return
 		}
+	} else {
+		effective = decision
 	}
-
 	d.runTurn(ctx, rec, delivery, task, match, decision, binding)
 }
 

@@ -1340,3 +1340,24 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+.flow-compare {
+  display: inline-block;
+  margin-left: 2px;
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.flow-compare.match {
+  background: var(--hub-badge);
+  color: var(--hub);
+}
+
+.flow-compare.diff {
+  background: rgba(215, 0, 21, 0.12);
+  color: var(--danger);
+}

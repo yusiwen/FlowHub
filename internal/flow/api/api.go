@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/yusiwen/flowhub/internal/compare"
 	"github.com/yusiwen/flowhub/internal/flow"
 	"github.com/yusiwen/flowhub/internal/flow/engine"
 	"github.com/yusiwen/flowhub/internal/flow/mode"
@@ -33,7 +34,9 @@ type Options struct {
 	// OnAvailable reports whether this process has the task service wired. `on`
 	// is refused without it: skipping dispatch but not running turns would lose work.
 	OnAvailable bool
-	Logger      *slog.Logger
+	// Compare joins a shadow run with dispatch's decision for the same event.
+	Compare *compare.Store
+	Logger  *slog.Logger
 }
 
 // Handler is the /hub/v1 mux with the bearer check in front.
@@ -251,7 +254,7 @@ func (h *Handler) runs(w http.ResponseWriter, r *http.Request) {
 	}
 	summaries := make([]any, 0, len(filtered))
 	for _, run := range filtered {
-		summaries = append(summaries, runSummary(run))
+		summaries = append(summaries, h.summarize(run))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runs": summaries, "next_cursor": next})
 }
@@ -270,7 +273,13 @@ func (h *Handler) run(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"run": run})
+	response := map[string]any{"run": run}
+	if h.opts.Compare != nil {
+		if comparison, ok := h.opts.Compare.Get(run.Event.ID); ok {
+			response["comparison"] = comparison
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
@@ -322,7 +331,7 @@ func (h *Handler) flowSummary(last *engine.Run) map[string]any {
 		"last_run":     nil,
 	}
 	if last != nil {
-		summary["last_run"] = runSummary(last)
+		summary["last_run"] = h.summarize(last)
 	}
 	return summary
 }
@@ -352,6 +361,18 @@ func (h *Handler) entry() mode.Entry {
 func (h *Handler) revision() string {
 	sum := sha256.Sum256(h.opts.Definition)
 	return fmt.Sprintf("%x", sum[:])
+}
+
+func (h *Handler) summarize(run *engine.Run) map[string]any {
+	summary := runSummary(run)
+	if h.opts.Compare != nil {
+		if comparison, ok := h.opts.Compare.Get(run.Event.ID); ok {
+			summary["compared"] = true
+			summary["match"] = comparison.Match
+			summary["differences"] = comparison.Differences
+		}
+	}
+	return summary
 }
 
 func runSummary(run *engine.Run) map[string]any {
