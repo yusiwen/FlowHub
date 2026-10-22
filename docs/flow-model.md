@@ -717,8 +717,10 @@ Hub tab
 - Polling: overview every 5 s while the sub-page is visible; selected run every 2 s
   while non-terminal; stop on hide or terminal.
 
-The full UI plan (wireframe, states, module split) is the M1-6 slice; this section is
-the contract it is built against.
+The M1-6 slice implements this page against the contract above: `desktop/src/flows.ts`
+owns the read-only layout/renderer, `desktop/src-tauri/src/hub_api.rs` the API
+client, and `token_store.rs` the Keychain token. Custom-flow editing still belongs
+to M4.
 
 ## 13. Migration
 

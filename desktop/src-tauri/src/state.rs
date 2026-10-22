@@ -18,6 +18,10 @@ pub struct AppState {
     pub session: Mutex<SessionStore>,
     pub prefs: Mutex<PrefsStore>,
     pub health: Mutex<HashMap<Uuid, HealthReport>>,
+    /// Hub API tokens already read from the Keychain this run. Caching them keeps
+    /// a 2s run poll from spawning `security` on every request; the Keychain is
+    /// still the source of truth at startup.
+    pub hub_tokens: Mutex<HashMap<Uuid, String>>,
     pub probing: AtomicBool,
 }
 
@@ -56,6 +60,7 @@ impl AppState {
             session: Mutex::new(session),
             prefs: Mutex::new(prefs),
             health: Mutex::new(HashMap::new()),
+            hub_tokens: Mutex::new(HashMap::new()),
             probing: AtomicBool::new(false),
         })
     }

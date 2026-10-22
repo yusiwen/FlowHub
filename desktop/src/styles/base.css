@@ -928,3 +928,415 @@ body {
 .hub-log-form .ghost-button {
   flex: none;
 }
+
+/* Hub sub-navigation and the read-only Flows page (ADR 0013 §12). */
+.hub-subnav {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.hub-subnav button {
+  appearance: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+
+.hub-subnav button.active {
+  border-bottom-color: var(--hub);
+  color: var(--text);
+  font-weight: 600;
+}
+
+#hub-dashboard[hidden],
+#hub-flows[hidden],
+.flow-token[hidden],
+#flows-error[hidden],
+#flow-token-error[hidden] {
+  display: none;
+}
+
+.flow-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 4px 0 10px;
+}
+
+.flow-head h3 {
+  margin: 0 0 3px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.flow-sub {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.flow-badges {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.flow-badge {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--hub-pill);
+  color: var(--hub);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.flow-badge.mode-off {
+  background: var(--badge);
+  color: var(--muted);
+}
+
+.flow-badge.mode-shadow {
+  background: var(--hub-badge);
+  color: var(--hub);
+}
+
+.flow-badge.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 400;
+}
+
+.flow-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 12px;
+  align-items: start;
+}
+
+.flow-graph-wrap {
+  min-height: 180px;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.flow-graph {
+  display: block;
+  width: 100%;
+  min-height: 180px;
+  height: auto;
+}
+
+.flow-edge {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 1.5;
+}
+
+.flow-edge.taken {
+  stroke: var(--hub);
+  stroke-width: 2;
+}
+
+.flow-edge.dim {
+  opacity: 0.35;
+}
+
+.flow-arrow {
+  fill: var(--border);
+}
+
+.flow-node rect {
+  fill: var(--panel);
+  stroke: var(--border);
+  stroke-width: 1.2;
+  cursor: pointer;
+}
+
+.flow-node:hover rect,
+.flow-node:focus-visible rect {
+  stroke: var(--hub);
+  outline: none;
+}
+
+.flow-node.selected rect {
+  stroke: var(--hub);
+  stroke-width: 2.5;
+}
+
+.flow-node.step-succeeded rect {
+  fill: var(--hub-pill);
+  stroke: var(--hub);
+}
+
+.flow-node.step-skipped rect {
+  fill: var(--badge);
+  stroke: var(--border);
+  stroke-dasharray: 4 3;
+}
+
+.flow-node.step-failed rect {
+  fill: rgba(215, 0, 21, 0.1);
+  stroke: var(--danger);
+}
+
+.flow-node.step-running rect {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.flow-node.unvisited {
+  opacity: 0.55;
+}
+
+.flow-node-label {
+  fill: var(--text);
+  font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  pointer-events: none;
+}
+
+.flow-node-type {
+  fill: var(--muted);
+  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  pointer-events: none;
+}
+
+.flow-inspector {
+  min-height: 180px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.flow-inspector h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.flow-inspector-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.flow-inspector-row:last-child {
+  border-bottom: 0;
+}
+
+.flow-inspector-key {
+  flex: none;
+  color: var(--muted);
+}
+
+.flow-inspector-value {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.flow-inspector-value.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+}
+
+.flow-inspector-config {
+  max-height: 220px;
+  margin: 8px 0 0;
+  padding: 8px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--bg);
+  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.flow-runs-section {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.flow-runs-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.flow-runs-head h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.flow-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.flow-run {
+  display: grid;
+  grid-template-columns: 70px 60px minmax(0, 1fr) 70px 80px 60px;
+  gap: 8px;
+  align-items: center;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.flow-run:hover {
+  background: var(--bg);
+}
+
+.flow-run.selected {
+  background: var(--hub-pill);
+}
+
+.flow-state {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.state-succeeded {
+  color: var(--hub);
+}
+
+.state-failed {
+  color: var(--danger);
+}
+
+.state-running,
+.state-queued,
+.state-waiting {
+  color: var(--accent);
+}
+
+.state-skipped {
+  color: var(--muted);
+}
+
+.flow-run-time,
+.flow-run-kind,
+.flow-run-duration {
+  color: var(--muted);
+}
+
+.flow-run-task {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.flow-step {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.flow-step.selected {
+  border-color: var(--hub);
+  background: var(--hub-pill);
+}
+
+.flow-step-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.flow-step-type,
+.flow-step-duration {
+  color: var(--muted);
+}
+
+.flow-token {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.flow-token h3 {
+  margin: 0 0 4px;
+  font-size: 13px;
+}
+
+.flow-token form {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.flow-token input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+
+.flow-muted {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.flow-error {
+  color: var(--danger);
+  font-size: 11px;
+}
+
+@media (max-width: 900px) {
+  .flow-layout {
+    grid-template-columns: 1fr;
+  }
+}

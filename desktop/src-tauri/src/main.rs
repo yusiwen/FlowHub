@@ -5,6 +5,7 @@ mod auth;
 mod commands;
 mod health;
 mod hub;
+mod hub_api;
 mod ime;
 mod menu;
 mod model;
@@ -13,6 +14,7 @@ mod session;
 mod state;
 mod store;
 mod tabs;
+mod token_store;
 
 use tauri::webview::WebviewBuilder;
 use tauri::window::WindowBuilder;
@@ -71,6 +73,11 @@ fn main() {
             commands::list_health,
             commands::probe_all,
             commands::hub_snapshot,
+            commands::hub_flows,
+            commands::hub_flow,
+            commands::hub_runs,
+            commands::hub_run,
+            commands::set_hub_token,
             commands::hub_logs,
             commands::set_hub_log_path,
             commands::load_session,

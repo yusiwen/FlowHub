@@ -269,6 +269,7 @@ func runSummary(run *engine.Run) map[string]any {
 		"state":       run.State,
 		"mode":        run.Mode,
 		"trigger":     run.Trigger,
+		"event_kind":  run.Event.Kind,
 		"action":      action,
 		"task":        run.Event.Subject.Key,
 		"started_at":  run.StartedAt,

@@ -123,6 +123,22 @@ export interface HubSnapshot {
   dispatch: HubDispatch | null;
   runtimes: HubRuntimes | null;
   counters: HubCounters | null;
+  flows: HubFlowsHealth | null;
+}
+
+export interface HubFlowsHealth {
+  enabled?: boolean;
+  mode?: string;
+  definitions?: number;
+  runs?: number;
+  waiting?: number;
+  needs_attention?: number;
+  submitted?: number;
+  dropped?: number;
+  failed?: number;
+  flow?: string;
+  dir?: string;
+  state_error?: string;
 }
 
 export interface HubProjects {
@@ -193,4 +209,120 @@ export interface SessionView {
   sidebar_visible: boolean;
   active: string | null;
   tabs: string[];
+}
+
+/// A trigger from the flow definition, as the API summarises it.
+export interface HubFlowTrigger {
+  id: string;
+  event: string;
+  exclusive: boolean;
+  priority: number;
+}
+
+/// A run summary from `/hub/v1/runs` and the flow's `last_run`.
+export interface HubRunSummary {
+  id: string;
+  flow: string;
+  state: string;
+  mode: string;
+  trigger: string;
+  event_kind?: string;
+  action: string;
+  task: string;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number;
+  error: string;
+}
+
+export interface HubFlowSummary {
+  id: string;
+  name: string;
+  builtin: boolean;
+  upstream: string;
+  revision: string;
+  mode: string;
+  triggers: HubFlowTrigger[];
+  last_run: HubRunSummary | null;
+}
+
+export interface HubFlowsResponse {
+  flows: HubFlowSummary[];
+}
+
+export interface FlowNodeDefinition {
+  id: string;
+  type: string;
+  name?: string;
+  config?: Record<string, unknown>;
+  next?: Array<{ to: string; when?: string }>;
+}
+
+export interface FlowEdgeDefinition {
+  from: string;
+  to: string;
+  when?: string;
+}
+
+export interface FlowDefinition {
+  version: number;
+  id: string;
+  name: string;
+  upstream: string;
+  description?: string;
+  start: string;
+  tasks: Record<string, unknown>;
+  triggers: HubFlowTrigger[];
+  nodes: FlowNodeDefinition[];
+  edges: FlowEdgeDefinition[];
+}
+
+export interface HubFlowDefinitionResponse {
+  id: string;
+  name: string;
+  builtin: boolean;
+  upstream: string;
+  revision: string;
+  mode: string;
+  definition: FlowDefinition;
+}
+
+export interface HubRunsResponse {
+  runs: HubRunSummary[];
+  next_cursor: string;
+}
+
+export interface FlowStep {
+  id: string;
+  type: string;
+  state: string;
+  attempt: number;
+  started_at: string;
+  finished_at: string | null;
+  output?: Record<string, unknown> | null;
+  error?: string;
+}
+
+export interface FlowRun {
+  id: string;
+  flow: string;
+  revision: string;
+  mode: string;
+  state: string;
+  trigger: string;
+  event: {
+    id: string;
+    upstream: string;
+    kind: string;
+    subject: { project: string; key: string; title: string; url: string };
+    actor: { login: string; display?: string };
+  };
+  started_at: string;
+  finished_at: string | null;
+  steps: Record<string, FlowStep>;
+  error?: string;
+}
+
+export interface HubRunResponse {
+  run: FlowRun;
 }

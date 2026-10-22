@@ -10,7 +10,11 @@ import type {
   AuthOkEvent,
   AuthFailedEvent,
   HealthReport,
+  HubFlowDefinitionResponse,
+  HubFlowsResponse,
   HubLogs,
+  HubRunResponse,
+  HubRunsResponse,
   HubSnapshot,
   Role,
   SessionView,
@@ -123,6 +127,47 @@ export const probeAll = (): Promise<HealthReport[]> =>
 
 export const hubSnapshot = (id: string): Promise<HubSnapshot> =>
   invoke<HubSnapshot>("hub_snapshot", { id });
+
+export const hubFlows = (
+  id: string,
+  token: string | null,
+  dataDir: string | null,
+): Promise<HubFlowsResponse> =>
+  invoke<HubFlowsResponse>("hub_flows", { id, token, dataDir });
+
+export const hubFlow = (
+  id: string,
+  flowId: string,
+  token: string | null,
+  dataDir: string | null,
+): Promise<HubFlowDefinitionResponse> =>
+  invoke<HubFlowDefinitionResponse>("hub_flow", { id, flowId, token, dataDir });
+
+export const hubRuns = (
+  id: string,
+  token: string | null,
+  dataDir: string | null,
+  stateFilter: string | null,
+  limit: number | null,
+): Promise<HubRunsResponse> =>
+  invoke<HubRunsResponse>("hub_runs", {
+    id,
+    token,
+    dataDir,
+    stateFilter,
+    limit,
+  });
+
+export const hubRun = (
+  id: string,
+  runId: string,
+  token: string | null,
+  dataDir: string | null,
+): Promise<HubRunResponse> =>
+  invoke<HubRunResponse>("hub_run", { id, runId, token, dataDir });
+
+export const setHubToken = (id: string, token: string): Promise<void> =>
+  invoke<void>("set_hub_token", { id, token });
 
 export const hubLogs = (id: string): Promise<HubLogs> =>
   invoke<HubLogs>("hub_logs", { id });

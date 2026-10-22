@@ -108,7 +108,7 @@ the page's form.
 ## Project Structure
 
 ```
-desktop/            macOS Tauri app (FlowHub): upstream/agent/hub views over one registry, native WebView or dashboard per tab; separate Rust/Node toolchain
+desktop/            macOS Tauri app (FlowHub): upstream/agent/hub views over one registry, native WebView or dashboard per tab, read-only Hub Flows page; separate Rust/Node toolchain
 cmd/flowhub/        CLI entry: wiring, flags, HTTP server, /healthz, shutdown, activation prober
 internal/config/    Environment parsing, validation, masked reporting
 internal/logging/   Application logger: stderr tee + size-rotated log file
