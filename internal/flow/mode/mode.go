@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,7 +28,11 @@ const (
 
 // Entry is one flow's deployment.
 type Entry struct {
-	Mode      string    `json:"mode"`
+	Mode string `json:"mode"`
+	// Projects scopes an `on` deployment: empty means every routed project.
+	// `shadow` and `off` ignore it, but it is kept so a later `on` keeps its
+	// selected projects.
+	Projects  []string  `json:"projects,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 	UpdatedBy string    `json:"updated_by,omitempty"`
 }
@@ -91,6 +96,22 @@ func (s *Store) Mode(id string) string {
 	}
 }
 
+// Entry reports one flow's deployment and whether it has a state row.
+func (s *Store) Entry(id string) (Entry, bool) {
+	if s == nil {
+		return Entry{Mode: Off}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reloadLocked()
+	entry, ok := s.state.Flows[id]
+	if !ok {
+		return Entry{Mode: Off}, false
+	}
+	entry.Projects = append([]string(nil), entry.Projects...)
+	return entry, true
+}
+
 // Entries copies the current state.
 func (s *Store) Entries() map[string]Entry {
 	if s == nil {
@@ -101,13 +122,16 @@ func (s *Store) Entries() map[string]Entry {
 	s.reloadLocked()
 	out := make(map[string]Entry, len(s.state.Flows))
 	for id, entry := range s.state.Flows {
+		entry.Projects = append([]string(nil), entry.Projects...)
 		out[id] = entry
 	}
 	return out
 }
 
-// Set writes one flow's mode atomically.
-func (s *Store) Set(id, mode, by string) error {
+// Set writes one flow's mode and project scope atomically. The mode package
+// accepts `on` so a future executable build can read a file written by a newer
+// one; the CLI and the API refuse it until the task service exists.
+func (s *Store) Set(id, mode string, projects []string, by string) error {
 	if s == nil {
 		return fmt.Errorf("mode: no store")
 	}
@@ -125,8 +149,18 @@ func (s *Store) Set(id, mode, by string) error {
 	if s.state.Flows == nil {
 		s.state.Flows = map[string]Entry{}
 	}
+	cleaned := make([]string, 0, len(projects))
+	seen := map[string]bool{}
+	for _, project := range projects {
+		project = strings.TrimSpace(project)
+		if project == "" || seen[project] {
+			continue
+		}
+		seen[project] = true
+		cleaned = append(cleaned, project)
+	}
 	s.state.Version = Version
-	s.state.Flows[id] = Entry{Mode: mode, UpdatedAt: time.Now().UTC(), UpdatedBy: by}
+	s.state.Flows[id] = Entry{Mode: mode, Projects: cleaned, UpdatedAt: time.Now().UTC(), UpdatedBy: by}
 	return s.writeLocked()
 }
 

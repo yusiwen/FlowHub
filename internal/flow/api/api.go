@@ -55,6 +55,7 @@ func New(opts Options) (*Handler, error) {
 	handler.mux.HandleFunc("GET /hub/v1/ping", handler.ping)
 	handler.mux.HandleFunc("GET /hub/v1/flows", handler.flows)
 	handler.mux.HandleFunc("GET /hub/v1/flows/{id}", handler.flow)
+	handler.mux.HandleFunc("POST /hub/v1/flows/{id}/deployment", handler.deploy)
 	handler.mux.HandleFunc("GET /hub/v1/runs", handler.runs)
 	handler.mux.HandleFunc("GET /hub/v1/runs/{id}", handler.run)
 	handler.mux.HandleFunc("GET /hub/v1/runs/{id}/events", handler.events)
@@ -103,15 +104,101 @@ func (h *Handler) flow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown flow")
 		return
 	}
+	entry := h.entry()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":         h.opts.Flow.Definition.ID,
 		"name":       h.opts.Flow.Definition.Name,
 		"builtin":    h.opts.Flow.Definition.Builtin,
 		"upstream":   h.opts.Flow.Definition.Upstream,
 		"revision":   h.revision(),
-		"mode":       h.mode(),
+		"mode":       entry.Mode,
+		"projects":   entry.Projects,
+		"updated_at": entry.UpdatedAt,
+		"updated_by": entry.UpdatedBy,
 		"definition": json.RawMessage(h.opts.Definition),
 	})
+}
+
+type deploymentRequest struct {
+	Mode     string   `json:"mode"`
+	Projects []string `json:"projects"`
+}
+
+// deploy writes the deployment state. `on` is intentionally refused until the
+// task service can execute task.turn: accepting it now would make dispatch skip a
+// project the flow cannot run.
+func (h *Handler) deploy(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("id") != h.opts.Flow.Definition.ID {
+		writeError(w, http.StatusNotFound, "unknown flow")
+		return
+	}
+	if h.opts.Modes == nil {
+		writeError(w, http.StatusServiceUnavailable, "flow deployment state is unavailable")
+		return
+	}
+	var request deploymentRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid deployment body: "+err.Error())
+		return
+	}
+	request.Mode = strings.TrimSpace(request.Mode)
+	switch request.Mode {
+	case mode.Off, mode.Shadow:
+	case mode.On:
+		writeError(w, http.StatusConflict, "on needs the task service (M3-1); use off or shadow")
+		return
+	default:
+		writeError(w, http.StatusBadRequest, "mode must be off or shadow")
+		return
+	}
+	projects, err := cleanProjects(request.Projects)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actor := strings.TrimSpace(os.Getenv("FLOWHUB_OPERATOR"))
+	if actor == "" {
+		actor = strings.TrimSpace(os.Getenv("USER"))
+	}
+	if actor == "" {
+		actor = "operator"
+	}
+	if err := h.opts.Modes.Set(h.opts.Flow.Definition.ID, request.Mode, projects, actor); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	entry := h.entry()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": h.opts.Flow.Definition.ID, "mode": entry.Mode,
+		"projects": entry.Projects, "updated_at": entry.UpdatedAt, "updated_by": entry.UpdatedBy,
+	})
+}
+
+func cleanProjects(values []string) ([]string, error) {
+	cleaned := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, fmt.Errorf("project keys must not be empty")
+		}
+		if len(value) > 64 {
+			return nil, fmt.Errorf("project key %q is longer than 64 characters", value)
+		}
+		for _, r := range value {
+			if !(r == '-' || r == '_' || r == '.' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+				return nil, fmt.Errorf("project key %q contains an unsupported character", value)
+			}
+		}
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		cleaned = append(cleaned, value)
+	}
+	return cleaned, nil
 }
 
 func (h *Handler) runs(w http.ResponseWriter, r *http.Request) {
@@ -213,15 +300,19 @@ func (h *Handler) flowSummary(last *engine.Run) map[string]any {
 			"exclusive": trigger.Trigger.Exclusive, "priority": trigger.Trigger.Priority,
 		})
 	}
+	entry := h.entry()
 	summary := map[string]any{
-		"id":       h.opts.Flow.Definition.ID,
-		"name":     h.opts.Flow.Definition.Name,
-		"builtin":  h.opts.Flow.Definition.Builtin,
-		"upstream": h.opts.Flow.Definition.Upstream,
-		"revision": h.revision(),
-		"mode":     h.mode(),
-		"triggers": triggers,
-		"last_run": nil,
+		"id":         h.opts.Flow.Definition.ID,
+		"name":       h.opts.Flow.Definition.Name,
+		"builtin":    h.opts.Flow.Definition.Builtin,
+		"upstream":   h.opts.Flow.Definition.Upstream,
+		"revision":   h.revision(),
+		"mode":       entry.Mode,
+		"projects":   entry.Projects,
+		"updated_at": entry.UpdatedAt,
+		"updated_by": entry.UpdatedBy,
+		"triggers":   triggers,
+		"last_run":   nil,
 	}
 	if last != nil {
 		summary["last_run"] = runSummary(last)
@@ -240,11 +331,15 @@ func (h *Handler) lastRun() *engine.Run {
 	return list[0]
 }
 
-func (h *Handler) mode() string {
+func (h *Handler) entry() mode.Entry {
+	entry := mode.Entry{Mode: mode.Off}
 	if h.opts.Modes == nil {
-		return mode.Off
+		return entry
 	}
-	return h.opts.Modes.Mode(h.opts.Flow.Definition.ID)
+	if current, ok := h.opts.Modes.Entry(h.opts.Flow.Definition.ID); ok {
+		return current
+	}
+	return entry
 }
 
 func (h *Handler) revision() string {

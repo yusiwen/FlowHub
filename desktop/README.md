@@ -111,7 +111,7 @@ never proxies, so a remote hub must expose that listener (or go through a tunnel
 ### Flows
 
 The Hub tab has a `Dashboard | Flows` sub-navigation. Flows is read-only and
-fetched through Rust from `/hub/v1`: the flow header (mode, revision, trigger), an
+fetched through Rust from `/hub/v1`: the flow header (mode, project scope, revision, trigger), an
 SVG DAG laid out in columns, an inspector (flow overview by default; node config,
 status, timing and output on selection), and the run list with the selected run's
 step chain. A shadow run renders `task.turn` as skipped and dims the edges the

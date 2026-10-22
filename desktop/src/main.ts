@@ -973,6 +973,7 @@ function renderHub(): void {
     const card = hubCard("Flows");
     hubRow(card.body, "Enabled", flows.enabled === false ? "no" : "yes");
     hubRow(card.body, "Mode", flows.mode || "—");
+    hubRow(card.body, "Projects", flows.projects?.join(", ") || "all");
     hubRow(card.body, "Definitions", hubNumber(flows.definitions));
     hubRow(card.body, "Runs", hubNumber(flows.runs));
     hubRow(card.body, "Waiting", hubNumber(flows.waiting));

@@ -3,6 +3,7 @@ package mode_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/yusiwen/flowhub/internal/flow/mode"
@@ -24,7 +25,7 @@ func TestSetPersistsAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if err := store.Set("default-youtrack", mode.Shadow, "test"); err != nil {
+	if err := store.Set("default-youtrack", mode.Shadow, nil, "test"); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	if got := store.Mode("default-youtrack"); got != mode.Shadow {
@@ -64,11 +65,34 @@ func TestMutationIsVisibleToAnotherStore(t *testing.T) {
 	if got := second.Mode("default-youtrack"); got != mode.Off {
 		t.Fatalf("initial mode = %q", got)
 	}
-	if err := first.Set("default-youtrack", mode.Shadow, "first"); err != nil {
+	if err := first.Set("default-youtrack", mode.Shadow, nil, "first"); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	if got := second.Mode("default-youtrack"); got != mode.Shadow {
 		t.Fatalf("after set = %q", got)
+	}
+}
+
+func TestProjectsArePersistedAndCopied(t *testing.T) {
+	dir := t.TempDir()
+	store, err := mode.Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := store.Set("default-youtrack", mode.On, []string{" TEST ", "SP", "TEST", ""}, "test"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	entry, ok := store.Entry("default-youtrack")
+	if !ok || entry.Mode != mode.On {
+		t.Fatalf("entry = %+v, ok = %v", entry, ok)
+	}
+	if got := strings.Join(entry.Projects, ","); got != "TEST,SP" {
+		t.Fatalf("projects = %q, want TEST,SP", got)
+	}
+	entry.Projects[0] = "MUTATED"
+	again, _ := store.Entry("default-youtrack")
+	if again.Projects[0] != "TEST" {
+		t.Fatalf("projects were not copied: %+v", again.Projects)
 	}
 }
 
@@ -77,10 +101,10 @@ func TestInvalidModeIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if err := store.Set("default-youtrack", "bogus", "test"); err == nil {
+	if err := store.Set("default-youtrack", "bogus", nil, "test"); err == nil {
 		t.Fatal("expected an error")
 	}
-	if err := store.Set("", mode.Off, "test"); err == nil {
+	if err := store.Set("", mode.Off, nil, "test"); err == nil {
 		t.Fatal("expected an error for an empty flow id")
 	}
 }

@@ -137,6 +137,9 @@ export interface HubFlowsHealth {
   dropped?: number;
   failed?: number;
   flow?: string;
+  projects?: string[];
+  updated_at?: string;
+  updated_by?: string;
   dir?: string;
   state_error?: string;
 }
@@ -242,6 +245,9 @@ export interface HubFlowSummary {
   upstream: string;
   revision: string;
   mode: string;
+  projects?: string[];
+  updated_at?: string;
+  updated_by?: string;
   triggers: HubFlowTrigger[];
   last_run: HubRunSummary | null;
 }
@@ -284,6 +290,9 @@ export interface HubFlowDefinitionResponse {
   upstream: string;
   revision: string;
   mode: string;
+  projects?: string[];
+  updated_at?: string;
+  updated_by?: string;
   definition: FlowDefinition;
 }
 

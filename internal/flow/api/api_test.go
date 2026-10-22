@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,7 +124,7 @@ func TestTokenIsRequired(t *testing.T) {
 
 func TestFlowsAndDefinition(t *testing.T) {
 	f := newFixture(t, "sekret")
-	if err := f.modes.Set(f.flowID, mode.Shadow, "test"); err != nil {
+	if err := f.modes.Set(f.flowID, mode.Shadow, nil, "test"); err != nil {
 		t.Fatalf("mode: %v", err)
 	}
 	seedRun(t, f.runs, "run_1", string(engine.StateSucceeded))
@@ -194,5 +195,58 @@ func TestRunEventsAfterSequence(t *testing.T) {
 	}
 	if recorder := request(t, f.handler, "/hub/v1/runs/run_1/events?after=2", "sekret"); recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func postJSON(t *testing.T, handler http.Handler, path, token, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	return recorder
+}
+
+func TestDeploymentWritesProjectScope(t *testing.T) {
+	t.Setenv("FLOWHUB_OPERATOR", "operator-a")
+	f := newFixture(t, "sekret")
+	path := "/hub/v1/flows/" + f.flowID + "/deployment"
+
+	body := decode(t, postJSON(t, f.handler, path, "sekret", `{"mode":"shadow","projects":["TEST","SP","TEST"]}`))
+	if body["mode"] != mode.Shadow || body["updated_by"] != "operator-a" {
+		t.Fatalf("deployment = %+v", body)
+	}
+	projects := body["projects"].([]any)
+	if len(projects) != 2 || projects[0] != "TEST" || projects[1] != "SP" {
+		t.Fatalf("projects = %+v", projects)
+	}
+	entry, ok := f.modes.Entry(f.flowID)
+	if !ok || entry.Mode != mode.Shadow || len(entry.Projects) != 2 {
+		t.Fatalf("stored = %+v, ok = %v", entry, ok)
+	}
+
+	flows := decode(t, request(t, f.handler, "/hub/v1/flows", "sekret"))
+	summary := flows["flows"].([]any)[0].(map[string]any)
+	if summary["projects"] == nil || summary["updated_by"] != "operator-a" {
+		t.Fatalf("summary = %+v", summary)
+	}
+
+	if recorder := postJSON(t, f.handler, path, "sekret", `{"mode":"on"}`); recorder.Code != http.StatusConflict {
+		t.Fatalf("on status = %d, want 409", recorder.Code)
+	}
+	if recorder := postJSON(t, f.handler, path, "sekret", `{"mode":"bogus"}`); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("bogus status = %d, want 400", recorder.Code)
+	}
+	if recorder := postJSON(t, f.handler, path, "sekret", `{"mode":"shadow","projects":["bad key"]}`); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("project status = %d, want 400", recorder.Code)
+	}
+	if recorder := postJSON(t, f.handler, "/hub/v1/flows/unknown/deployment", "sekret", `{"mode":"shadow"}`); recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown flow status = %d, want 404", recorder.Code)
+	}
+	if recorder := postJSON(t, f.handler, path, "wrong", `{"mode":"shadow"}`); recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("auth status = %d, want 401", recorder.Code)
 	}
 }

@@ -1194,7 +1194,16 @@ func flowHealth(engine *flowengine.Engine, modes *flowmode.Store) map[string]any
 	}
 	snapshot := engine.Snapshot()
 	if flow, ok := snapshot["flow"].(string); ok && modes != nil {
-		snapshot["mode"] = modes.Mode(flow)
+		mode := modes.Mode(flow)
+		snapshot["mode"] = mode
+		if entry, ok := modes.Entry(flow); ok {
+			snapshot["projects"] = entry.Projects
+			snapshot["updated_by"] = entry.UpdatedBy
+			snapshot["updated_at"] = entry.UpdatedAt
+		}
+		if mode == flowmode.On {
+			snapshot["state_error"] = "on needs the task service (M3-1); the flow cannot execute task.turn yet"
+		}
 	}
 	snapshot["definitions"] = 1
 	if modes != nil {
