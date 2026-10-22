@@ -1,7 +1,7 @@
 # Real E2E harness
 
 `e2e/` is an opt-in end-to-end suite that drives a **real** FlowHub process against
-the self-hosted YouTrack `TEST` project and the local opencode server. It is not
+a configured YouTrack test project and the local opencode server. It is not
 part of `make test` or CI: it spends real turns, writes to YouTrack, and needs
 credentials.
 
@@ -22,8 +22,8 @@ credentials.
 
 The suite reads:
 
-- `YOUTRACK_URL`, `YOUTRACK_PROJECT`, `YOUTRACK_TOKEN` from a `0600` file such as
-  `/tmp/flowhub-e2e.env`;
+- `YOUTRACK_URL`, `YOUTRACK_PROJECT`, `YOUTRACK_TOKEN`, `E2E_REPO` and `E2E_ISSUE`
+  from a `0600` file such as `/tmp/flowhub-e2e.env`;
 - `FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN` and the opencode credentials from
   `~/.config/flowhub/.env`.
 
@@ -39,14 +39,14 @@ make build
 make e2e
 ```
 
-Live webhook (test FlowHub owns `192.168.8.20:8080`, the YouTrack app delivers):
+Live webhook (test FlowHub owns `E2E_ADDR`, the address the YouTrack app posts to):
 
 ```bash
 # stop the real receiver first; the test process must bind the app's URL
 make e2e-live
 ```
 
-Real dispatch turn (creates a new TEST issue and spends one opencode turn):
+Real dispatch turn (creates a new test-project issue and spends one opencode turn):
 
 ```bash
 make e2e-turn
@@ -79,13 +79,13 @@ state survive):
 make e2e-restart
 ```
 
-`E2E_ISSUE` defaults to `TEST-38` for the `issueUpdated` webhook test; the turn
-test creates a fresh issue itself.
+`E2E_ISSUE` is the existing issue used by the `issueUpdated` webhook test; the
+turn and comment tests create fresh issues in `YOUTRACK_PROJECT`.
 
 ## Isolation
 
 The harness creates a temporary `DataDir`, a temp config containing only the
-`TEST` project, and temp worktrees. It does not read or write `./data`, the
+the project named by `YOUTRACK_PROJECT`, and temp worktrees. It does not read or write `./data`, the
 production repository, or the production worktrees. A test run stops its FlowHub
 process on exit.
 
