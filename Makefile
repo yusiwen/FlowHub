@@ -26,7 +26,7 @@ PLATFORM_LIST = \
 	linux-arm64 \
 	darwin-arm64
 
-.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-live-flow e2e-live-journey e2e-all e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart e2e-permit e2e-crash lint staticcheck \
+.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-clean e2e-live e2e-live-flow e2e-live-journey e2e-live-permit e2e-all e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart e2e-permit e2e-crash lint staticcheck \
 	fmt fmt-check smoke clean all releases \
 	desktop-install desktop-dev desktop-app desktop-build desktop-check desktop-clean
 
@@ -88,6 +88,19 @@ e2e-live-journey: build
 		FLOWHUB_E2E=1 FLOWHUB_E2E_LIVE=1 E2E_LIVE_JOURNEY=1 \
 		E2E_ADDR=$${E2E_ADDR:?set E2E_ADDR to the webhook target} \
 		go test -tags=e2e ./e2e -count=1 -run TestLiveFullJourney -v
+
+# Delete issues created by this suite (summary prefixes) and its temp dirs; keeps
+# E2E_ISSUE. E2E_CLEANUP_DRY=1 lists only.
+e2e-clean:
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 E2E_CLEANUP=1 go test -tags=e2e ./e2e -count=1 -run TestCleanupTestResources -v
+
+# Live permit/revoke: real webhook comment, refusal, permit and revoke.
+e2e-live-permit: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 FLOWHUB_E2E_LIVE=1 E2E_PERMIT=1 \
+		E2E_ADDR=$${E2E_ADDR:?set E2E_ADDR to the webhook target} \
+		go test -tags=e2e ./e2e -count=1 -run TestPermitAndRevoke -v
 
 # Live webhook + shadow + on/rollback; requires E2E_ADDR and no real receiver.
 e2e-live-flow: build

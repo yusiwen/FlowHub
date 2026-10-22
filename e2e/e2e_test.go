@@ -128,6 +128,9 @@ func setup() *env {
 		fatalf("e2e: write config: %v", err)
 	}
 	e.configPath = configPath
+	if os.Getenv("E2E_CLEANUP") == "1" {
+		return e
+	}
 	e.binary = os.Getenv("E2E_BIN")
 	if e.binary == "" {
 		e.binary = filepath.Join(repoRoot(), "bin", "flowhub")
@@ -849,9 +852,6 @@ func TestPermitAndRevoke(t *testing.T) {
 	if os.Getenv("E2E_PERMIT") != "1" {
 		t.Skip("set E2E_PERMIT=1 to run the real permit/revoke path")
 	}
-	if suite.live {
-		t.Skip("permit/revoke currently runs in direct mode")
-	}
 	t.Cleanup(func() { _ = suite.setMode("off", nil) })
 	if err := suite.setMode("off", nil); err != nil {
 		t.Fatalf("set off: %v", err)
@@ -863,11 +863,13 @@ func TestPermitAndRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create issue: %v", err)
 	}
-	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, prompt, suite.ytProject)); status != http.StatusAccepted {
-		t.Fatalf("webhook status = %d", status)
+	if !suite.live {
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, prompt, suite.ytProject)); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+		suite.waitForEvent(t, key, "issue.created", 15*time.Second)
 	}
-	suite.waitForEvent(t, key, "issue.created", 15*time.Second)
-	suite.waitForDispatchHandled(t, 1, 20*time.Second)
+	suite.waitForDispatchHandled(t, 1, 6*time.Minute)
 	suite.waitForComment(t, key, "<!-- flowhub-auto -->", 6*time.Minute)
 	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
 		return len(row.Refusals) > 0
@@ -880,8 +882,10 @@ func TestPermitAndRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("permit comment: %v", err)
 	}
-	if status := suite.postWebhook(t, commentAddedPayload(key, permit, "/opencode permit", suite.ytProject)); status != http.StatusAccepted {
-		t.Fatalf("permit webhook status = %d", status)
+	if !suite.live {
+		if status := suite.postWebhook(t, commentAddedPayload(key, permit, "/opencode permit", suite.ytProject)); status != http.StatusAccepted {
+			t.Fatalf("permit webhook status = %d", status)
+		}
 	}
 	suite.waitForRegistry(t, key, func(row taskRow) bool {
 		if row.Grant == nil || len(row.Grant.Commands) == 0 || row.Turns <= turnsBefore {
@@ -900,8 +904,10 @@ func TestPermitAndRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("revoke comment: %v", err)
 	}
-	if status := suite.postWebhook(t, commentAddedPayload(key, revoke, "/opencode revoke", suite.ytProject)); status != http.StatusAccepted {
-		t.Fatalf("revoke webhook status = %d", status)
+	if !suite.live {
+		if status := suite.postWebhook(t, commentAddedPayload(key, revoke, "/opencode revoke", suite.ytProject)); status != http.StatusAccepted {
+			t.Fatalf("revoke webhook status = %d", status)
+		}
 	}
 	suite.waitForRegistry(t, key, func(row taskRow) bool {
 		return row.Grant == nil || len(row.Grant.Commands) == 0
