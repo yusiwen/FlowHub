@@ -138,8 +138,9 @@ to be narrower and for the UI. An unknown kind is accepted and reaches
 
 - `<DataDir>/events/YYYY-MM-DD.jsonl`, one object per line, mode `0600`, directory
   `0700`.
-- Retention is 30 days by default (`FLOWHUB_EVENT_RETENTION`), independent of the
-  run retention.
+- Retention is 30 days by default (`LogOptions.Retention` in the implementation;
+  the environment setting lands with the rest of the flow configuration),
+  independent of the run retention.
 - Every run stores an event snapshot in its `meta.json`, so pruning the log does not
   break run inspection.
 - The audit (`audit.jsonl`) stays as it is during migration; the event log is

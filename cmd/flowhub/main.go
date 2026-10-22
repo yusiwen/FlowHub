@@ -44,6 +44,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/source"
 	"github.com/yusiwen/flowhub/internal/source/youtrack"
 	"github.com/yusiwen/flowhub/internal/store"
+	"github.com/yusiwen/flowhub/internal/upstream"
 	"github.com/yusiwen/flowhub/internal/webhook"
 	"github.com/yusiwen/flowhub/internal/workspace"
 	"github.com/yusiwen/flowhub/internal/workspace/localworktree"
@@ -315,6 +316,19 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	sink := store.NewAsync(store.NewMulti(recorders...), cfg.QueueSize, logger, stats)
 	cache := dedupe.New(cfg.DedupeTTL)
 
+	// The flow event log is additive: the webhook still hands the same record to
+	// dispatch, and the log is what the flow engine will consume in shadow. It is
+	// created before the handler so a delivery is never accepted without a sink.
+	events, err := upstream.NewLog(upstream.LogOptions{
+		Dir:       cfg.DataDir,
+		QueueSize: cfg.QueueSize,
+		Logger:    logger,
+	})
+	if err != nil {
+		return fmt.Errorf("open event log: %w", err)
+	}
+	defer func() { _ = events.Close() }()
+
 	// The dispatcher is built before the handler so that a delivery can never be
 	// accepted before there is something to hand it to.
 	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger)
@@ -331,7 +345,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		return err
 	}
 
-	handler := webhook.New(webhookOptions(cfg, dispatcher, src), sink, cache, logger, stats)
+	handler := webhook.New(webhookOptions(cfg, dispatcher, src, events), sink, cache, logger, stats)
 
 	// The paths are registered without a method so that a wrong method is still
 	// audited (and answered with 405) instead of being swallowed by ServeMux.
@@ -339,7 +353,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	mux := http.NewServeMux()
 	mux.Handle(base, handler)
 	mux.Handle(base+"/{key}", handler)
-	mux.Handle("GET /healthz", healthHandler(cfg, projects, stats, sink, cache, audit, detail, dispatcher, inventory, started))
+	mux.Handle("GET /healthz", healthHandler(cfg, projects, stats, sink, cache, audit, detail, events, dispatcher, inventory, started))
 
 	server := &http.Server{
 		Handler:           mux,
@@ -395,6 +409,9 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	if err := sink.Close(shutdownCtx); err != nil {
 		return fmt.Errorf("draining audit queue: %w", err)
 	}
+	if err := events.Close(); err != nil {
+		return fmt.Errorf("closing event log: %w", err)
+	}
 
 	logger.Info("stopped",
 		"persisted", stats.Persisted.Load(),
@@ -412,7 +429,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 // Dispatch on a nil receiver. Measured: with FLOWHUB_DISPATCH off, every
 // delivery was answered with an empty reply because that panic happened after
 // the 202 was written.
-func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src source.Source) webhook.Options {
+func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src source.Source, events *upstream.Log) webhook.Options {
 	opts := webhook.Options{
 		Source:         src,
 		HookPath:       cfg.HookPath,
@@ -426,6 +443,9 @@ func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src sour
 	}
 	if dispatcher != nil {
 		opts.Dispatcher = dispatcher
+	}
+	if events != nil {
+		opts.Events = events
 	}
 	return opts
 }
@@ -1039,7 +1059,7 @@ func startSweeper(ctx context.Context, cache *dedupe.Cache, ttl time.Duration, l
 
 // healthHandler serves GET /healthz for local operations. nginx never proxies
 // this path, so it is not part of the public attack surface.
-func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.Counters, sink *store.Async, cache *dedupe.Cache, audit *store.JSONL, detail *store.Detail, dispatcher *dispatch.Dispatcher, inventory *runtimes.Inventory, started time.Time) http.HandlerFunc {
+func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.Counters, sink *store.Async, cache *dedupe.Cache, audit *store.JSONL, detail *store.Detail, events *upstream.Log, dispatcher *dispatch.Dispatcher, inventory *runtimes.Inventory, started time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Payload and audit paths are only known after the first record of the
 		// day, so they are read per request rather than captured at startup.
@@ -1075,6 +1095,7 @@ func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.C
 			"projects":                  map[string]any{"file": cfg.ConfigFile, "mappings": projects.Len(), "routable": projects.Routable(), "keys": projects.Keys()},
 			"dispatch":                  dispatchState,
 			"runtimes":                  runtimeHealth(inventory),
+			"upstreams":                 upstreamHealth(events),
 			"control_api":               controlAPIHealth(cfg),
 			"counters":                  stats.Snapshot(),
 		})
@@ -1101,6 +1122,14 @@ func runtimeHealth(inventory *runtimes.Inventory) map[string]any {
 		"runtimes": names,
 		"states":   states,
 	}
+}
+
+// upstreamHealth reports the flow event log without exposing a payload.
+func upstreamHealth(events *upstream.Log) map[string]any {
+	if events == nil {
+		return map[string]any{"enabled": false}
+	}
+	return events.Snapshot()
 }
 
 // controlAPIHealth describes the control API without leaking its token.

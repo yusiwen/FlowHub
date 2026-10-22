@@ -11,10 +11,13 @@ first implemented source is YouTrack; Gitea and Drone come later.
 **Current state: the YouTrack receiver and the opencode dispatcher are both
 implemented.** The receiver records and audits every delivery; the dispatcher is
 opt-in (`FLOWHUB_DISPATCH=1`) and turns an accepted delivery into one opencode
-turn inside a per-task git worktree.
+turn inside a per-task git worktree. Every accepted delivery is also normalised
+into a neutral event and appended to `events/YYYY-MM-DD.jsonl` for the flow engine
+(`internal/upstream`, ADR 0013); the dispatcher remains the live consumer until the
+staged cutover.
 
-The three documents in the repository root are the specification — read the
-relevant section before changing behaviour:
+The documents below are the specification — read the relevant section before
+changing behaviour:
 
 | Document | Covers |
 | --- | --- |
@@ -22,6 +25,7 @@ relevant section before changing behaviour:
 | `opencode-devops-orchestration-design.md` | Overall architecture, session ownership, event-driven model |
 | `opencode-headless-automation-and-permissions.md` | opencode HTTP API and the permission loop the dispatcher drives |
 | `docs/adr/` | Decisions taken after the design documents, with their context and consequences. Read the relevant ADR before restructuring a seam it covers |
+| `docs/flow-model.md` | The flow model: Event, Upstream, Flow, Task and Run, the run journal, the builtin flow and the dispatch parity table (ADR 0013, epic #92) |
 
 `CODEBASE.md` is the file-level map; keep it in step with structural changes.
 
@@ -107,6 +111,7 @@ internal/event/     the neutral event IR (Kind, Subject, Attachment, Event) ever
 internal/source/    the source seam: Request, Decoded, Source, ToolPolicy (data only)
 internal/source/youtrack/ the YouTrack adapter: payload model, schema report, neutral-event decoding, tools, prompt
 internal/webhook/   The delivery pipeline: entry locks, body limits, source decode, replay window, idempotency, audit, redaction
+internal/upstream/  The flow event seam: Event envelope, Normalizer, append-only per-day event log with dedupe and /healthz counters
 internal/projectmap/ the configuration file (v1/v2, sources, runtimes, (source, project) index, provenance) (~/.config/flowhub/config.json)
 internal/agent/       the runtime seam: Runtime, Turn/Result, Phase, Downloads, model references
 internal/agent/opencode/  the opencode implementation: one protocol-detecting client with a v1 and a v2 transport, arbiter, session rulesets, one-turn runner
