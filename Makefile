@@ -26,7 +26,7 @@ PLATFORM_LIST = \
 	linux-arm64 \
 	darwin-arm64
 
-.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-live-flow e2e-all e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart e2e-permit e2e-crash lint staticcheck \
+.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-live-flow e2e-live-journey e2e-all e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart e2e-permit e2e-crash lint staticcheck \
 	fmt fmt-check smoke clean all releases \
 	desktop-install desktop-dev desktop-app desktop-build desktop-check desktop-clean
 
@@ -79,6 +79,15 @@ e2e-all: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 E2E_TURN=1 E2E_FLOW=1 E2E_COMMENT=1 E2E_RESTART=1 E2E_CRASH=1 \
 		E2E_SOAK=$${E2E_SOAK:-100} go test -tags=e2e ./e2e -count=1 -v
+
+# The full live operator journey: analyze, first start -> plan, second start ->
+# execute, then check worktree/comment/registry. Requires E2E_ADDR and no real
+# receiver on that port.
+e2e-live-journey: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 FLOWHUB_E2E_LIVE=1 E2E_LIVE_JOURNEY=1 \
+		E2E_ADDR=$${E2E_ADDR:?set E2E_ADDR to the webhook target} \
+		go test -tags=e2e ./e2e -count=1 -run TestLiveFullJourney -v
 
 # Live webhook + shadow + on/rollback; requires E2E_ADDR and no real receiver.
 e2e-live-flow: build

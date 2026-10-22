@@ -1139,8 +1139,10 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		state = registry.StateDone
 	}
 	plan := task.Plan
-	if replied && (decision.Action == rules.ActionAnalyze || decision.Action == rules.ActionPlan) {
-		// The turn produced analysis or a plan; a human decides what happens next.
+	if replied && decision.Action == rules.ActionPlan {
+		// Only a planning turn creates a plan. An analysis turn must leave the plan
+		// empty: marking it draft made the next `/opencode start` jump straight to
+		// edit rights without a plan (found by the live journey E2E).
 		plan = registry.PlanDraft
 	}
 

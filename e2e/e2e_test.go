@@ -909,12 +909,15 @@ func TestPermitAndRevoke(t *testing.T) {
 }
 
 type taskRow struct {
-	TaskKey   string `json:"task_key"`
-	State     string `json:"state"`
-	Worktree  string `json:"worktree"`
-	LastError string `json:"last_error"`
-	Turns     int    `json:"turns"`
-	Refusals  []struct {
+	TaskKey    string `json:"task_key"`
+	State      string `json:"state"`
+	Worktree   string `json:"worktree"`
+	Session    string `json:"session_id"`
+	Plan       string `json:"plan_state"`
+	LastAction string `json:"last_action"`
+	LastError  string `json:"last_error"`
+	Turns      int    `json:"turns"`
+	Refusals   []struct {
 		Command string `json:"command"`
 	} `json:"refusals"`
 	Grant *struct {
@@ -1009,6 +1012,109 @@ func (e *env) waitForSession(t *testing.T, key string, timeout time.Duration) ta
 	}
 	t.Fatalf("task %s never got an opencode session (last %+v)", key, last)
 	return last
+}
+
+func TestLiveFullJourney(t *testing.T) {
+	if os.Getenv("E2E_LIVE_JOURNEY") != "1" {
+		t.Skip("set E2E_LIVE_JOURNEY=1 to run the full live journey")
+	}
+	if !suite.live {
+		t.Skip("the full journey requires live webhook delivery")
+	}
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+	marker := "E2E-JOURNEY-" + time.Now().UTC().Format("20060102T150405")
+	summary := "FlowHub live journey " + marker
+	description := fmt.Sprintf("Add one line to README.md containing exactly `%s`. Do not change any other file. Commit the change in the task worktree.", marker)
+	key, _, err := suite.createIssue(summary, description)
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	// 1. The issueCreated webhook starts the analysis turn.
+	suite.waitForComment(t, key, "<!-- flowhub-auto -->", 6*time.Minute)
+	_, state := suite.waitForTurnState(t, key, 2*time.Minute)
+	analyzed := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Session != "" && row.Plan == "none" && row.Turns == 1
+	}, 20*time.Second)
+	if state == "failed" {
+		t.Fatalf("analysis ended failed")
+	}
+	session := analyzed.Session
+
+	// 2. The first /opencode start must plan, not execute.
+	beforeComments := suite.commentCount(t, key)
+	planComment, err := suite.addComment(key, "/opencode start")
+	if err != nil {
+		t.Fatalf("plan comment: %v", err)
+	}
+	_ = planComment
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Plan == "draft" && row.Turns == 2 && row.Session == session
+	}, 6*time.Minute)
+	suite.waitForCommentCount(t, key, beforeComments+1, 6*time.Minute)
+	planned := suite.lastTaskRowOrFail(t, key)
+
+	// 3. The second /opencode start executes the plan in the same session.
+	beforeComments = suite.commentCount(t, key)
+	if _, err := suite.addComment(key, "/opencode start"); err != nil {
+		t.Fatalf("execute comment: %v", err)
+	}
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "done" && row.Turns == 3 && row.Session == session
+	}, 6*time.Minute)
+	suite.waitForCommentCount(t, key, beforeComments+1, 6*time.Minute)
+	executed := suite.lastTaskRowOrFail(t, key)
+	if executed.LastAction != "execute" {
+		t.Fatalf("last_action = %q, want execute", executed.LastAction)
+	}
+	if executed.Worktree == "" || planned.Worktree != executed.Worktree {
+		t.Fatalf("worktree changed: planned=%q executed=%q", planned.Worktree, executed.Worktree)
+	}
+	suite.waitForFileContains(t, filepath.Join(executed.Worktree, "README.md"), marker, 2*time.Minute)
+}
+
+func (e *env) lastTaskRowOrFail(t *testing.T, key string) taskRow {
+	t.Helper()
+	row, ok := e.lastTaskRow(key)
+	if !ok {
+		t.Fatalf("no registry row for %s", key)
+	}
+	return row
+}
+
+func (e *env) commentCount(t *testing.T, key string) int {
+	t.Helper()
+	var comments []any
+	if err := e.ytRequest(http.MethodGet, "/api/issues/"+key+"/comments?fields=id", nil, &comments); err != nil {
+		t.Fatalf("comments: %v", err)
+	}
+	return len(comments)
+}
+
+func (e *env) waitForCommentCount(t *testing.T, key string, minimum int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if e.commentCount(t, key) >= minimum {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatalf("comments on %s did not reach %d within %s", key, minimum, timeout)
+}
+
+func (e *env) waitForFileContains(t *testing.T, path, needle string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil && strings.Contains(string(data), needle) {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("%s does not contain %q within %s", path, needle, timeout)
 }
 
 func (e *env) updateIssue(issue, description string) error {
