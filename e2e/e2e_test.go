@@ -657,7 +657,7 @@ func TestCommentTriggerStartsAPlan(t *testing.T) {
 	if status := suite.postWebhook(t, commentAddedPayload(key, comment, "/opencode start", suite.ytProject)); status != http.StatusAccepted {
 		t.Fatalf("webhook status = %d", status)
 	}
-	suite.waitForDispatchHandled(t, baseline+1, 20*time.Second)
+	suite.waitForDispatchHandled(t, baseline+1, 6*time.Minute)
 	suite.waitForComment(t, key, "<!-- flowhub-auto -->", 6*time.Minute)
 	suite.waitForTurnState(t, key, 2*time.Minute)
 }

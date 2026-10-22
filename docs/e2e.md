@@ -107,22 +107,27 @@ Do not point the production YouTrack webhook app at a test instance.
 
 ## Current coverage
 
-- live and direct webhook delivery of an issue update;
-- one real dispatch analysis turn, one worktree/session, one YouTrack comment,
-  terminal `awaiting_input` state;
-- a shadow comparison on a real issue update (`shadow_compared` grows,
-  `shadow_mismatches` stays zero);
-- an `on` turn through the flow task service, then rollback to `off` and a
-  dispatch-handled delivery again;
-- a `/opencode start` comment plan turn;
-- duplicate webhook suppression, pause, and a direct shadow soak (queue drops and
-  mismatches asserted);
-- restart: the shadow mode and compare counters survive a process restart, and a
-  new update still compares;
-- permit/revoke: the agent is refused for an exact command, `/opencode permit`
-  grants it and runs the continuation, then `/opencode revoke` clears the grant;
-- crash recovery: SIGKILL during a real turn, restart, and the registry row is
-  marked failed with the interruption reason, same worktree and at most one
-  session.
+Every checked-in scenario is a Go test in [e2e/e2e_test.go](../e2e/e2e_test.go);
+the Make targets are only wrappers around the suite.
 
-The next scenarios (a larger/longer soak and cleanup) are tracked in #119.
+| Scenario | Test | Target |
+| --- | --- | --- |
+| live/direct issue update webhook | `TestWebhookDeliversAnIssueUpdate` | `make e2e`, `make e2e-live` |
+| real dispatch analysis turn + session + comment | `TestIssueCreatedRunsOneDispatchTurn` | `make e2e-turn` |
+| shadow comparison | `TestShadowComparisonOnIssueUpdate` | `make e2e-flow`, `make e2e-live-flow` |
+| `on` execution + rollback | `TestOnExecutesAndRollsBack` | `make e2e-flow`, `make e2e-live-flow` |
+| `/opencode start` plan | `TestCommentTriggerStartsAPlan` | `make e2e-comments` |
+| duplicate webhook | `TestDuplicateWebhookIsIdempotent` | `make e2e` |
+| pause | `TestPauseDoesNotDispatch` | `make e2e` |
+| shadow soak / queue drops | `TestShadowSoak` | `make e2e-soak` (`E2E_SOAK=100`) |
+| restart mode + compare state | `TestRestartKeepsComparisonState` | `make e2e-restart` |
+| permit/revoke | `TestPermitAndRevoke` | `make e2e-permit` |
+| SIGKILL + restart recovery | `TestCrashRecovery` | `make e2e-crash` |
+
+`make e2e-all` runs every non-permit opt-in scenario in direct mode in one process.
+`make e2e-permit` is separate because it installs a project prompt file before
+the process starts, which would affect the other turns.
+
+Not automated in the harness: YouTrack webhook app configuration, the test
+project/repo/runtime setup, and the real 1-week pilot. The next product scenarios
+(plan -> execute, live permit, cleanup and a larger soak) are still open in #119.
