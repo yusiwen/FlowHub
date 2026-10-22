@@ -406,10 +406,10 @@ documents. The rules below are load-bearing; do not relax them casually.
 16. **A comment is the deliverable, and a silent turn is a failure.** The agent's only
     way to reach a human is the one comment the source's reply tool posts, so `replied`
     is load-bearing: a finished turn that called none of those tools is recorded
-    `failed`, never `awaiting_input` with a plan draft — that row means "the analysis is
-    posted" and "a plan exists", and the next delivery read it as approval to start an
-    execution turn with edit rights (issue #27, measured 2026-10-09: three bash refusals,
-    no assistant text, an issue with no comment, and a registry row claiming a plan).
+    `failed`, never `awaiting_input` — that row means "the analysis is posted", and
+    the next delivery may read a plan draft as approval to start an execution turn
+    with edit rights (issue #27, measured 2026-10-09: three bash refusals, no
+    assistant text, an issue with no comment, and a registry row claiming a plan).
     The dispatcher asks once more, on the *same* session, with a prompt whose only job is
     the comment — the text is the source's (`rules.PromptContext.Nudge`, so it is phrased
     in terms of that tracker's reply tool), the bound is the dispatcher's. A second silent
@@ -418,6 +418,9 @@ documents. The rules below are load-bearing; do not relax them casually.
     Do not turn the follow-up into a retry loop, and do not let a silent turn update
     `LastReply`: that text is what recognises our own comment coming back when the marker
     is lost.
+    An **analysis** turn leaves `plan_state` at `none`; only a **plan** turn records a
+    draft. Marking analysis as a plan made the next `/opencode start` jump straight to
+    edit rights without a plan (found by the live journey E2E).
 17. **A human's authorisation moves the allowlist and nothing else.** `/opencode permit`
     is answered by `internal/rules` and acted on by the dispatcher: the authorised set is
     the literal commands the task's **most recent** turn was refused for — recorded from

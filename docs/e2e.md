@@ -46,6 +46,13 @@ Live webhook (test FlowHub owns `E2E_ADDR`, the address the YouTrack app posts t
 make e2e-live
 ```
 
+Full live operator journey (analyze, first start -> plan, second start -> execute,
+then worktree/comment/registry):
+
+```bash
+make e2e-live-journey
+```
+
 Real dispatch turn (creates a new test-project issue and spends one opencode turn):
 
 ```bash
@@ -116,6 +123,7 @@ the Make targets are only wrappers around the suite.
 | real dispatch analysis turn + session + comment | `TestIssueCreatedRunsOneDispatchTurn` | `make e2e-turn` |
 | shadow comparison | `TestShadowComparisonOnIssueUpdate` | `make e2e-flow`, `make e2e-live-flow` |
 | `on` execution + rollback | `TestOnExecutesAndRollsBack` | `make e2e-flow`, `make e2e-live-flow` |
+| full live analyze -> plan -> execute | `TestLiveFullJourney` | `make e2e-live-journey` |
 | `/opencode start` plan | `TestCommentTriggerStartsAPlan` | `make e2e-comments` |
 | duplicate webhook | `TestDuplicateWebhookIsIdempotent` | `make e2e` |
 | pause | `TestPauseDoesNotDispatch` | `make e2e` |
@@ -125,6 +133,7 @@ the Make targets are only wrappers around the suite.
 | SIGKILL + restart recovery | `TestCrashRecovery` | `make e2e-crash` |
 
 `make e2e-all` runs every non-permit opt-in scenario in direct mode in one process.
+`make e2e-live-journey` runs only the full live operator journey.
 `make e2e-permit` is separate because it installs a project prompt file before
 the process starts, which would affect the other turns.
 

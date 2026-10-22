@@ -390,8 +390,8 @@ func TestIssueCreatedRunsAReadOnlyAnalysisTurn(t *testing.T) {
 	if task.State != registry.StateAwaitingInput {
 		t.Fatalf("state = %s, want awaiting_input after an analysis turn", task.State)
 	}
-	if task.Plan != registry.PlanDraft {
-		t.Fatalf("plan = %s, want draft after analysis", task.Plan)
+	if task.Plan != registry.PlanNone {
+		t.Fatalf("plan = %s, want none after analysis (a plan is a separate turn)", task.Plan)
 	}
 	if task.Turns != 1 || task.Cost == 0 || task.LastReply == "" {
 		t.Fatalf("task counters were not updated: %+v", task)
@@ -413,29 +413,31 @@ func TestSecondEventContinuesTheSameSessionAndWorktree(t *testing.T) {
 	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
 
 	dispatcher.handle(context.Background(), delivery("TEST-41", "issueCreated", issueCreatedBody("TEST-41")))
-	dispatcher.handle(context.Background(), delivery("TEST-41", "commentAdded",
-		`{"event":"commentAdded","id":"TEST-41","summary":"准入首页","description":"d",`+
-			`"project":{"key":"TEST","name":"TEST","shortName":"TEST"},`+
-			`"comments":[{"text":"/opencode start","created":1,"author":{"login":"yusiwen"}}]}`))
+	for i := 0; i < 2; i++ {
+		dispatcher.handle(context.Background(), delivery("TEST-41", "commentAdded",
+			`{"event":"commentAdded","id":"TEST-41","summary":"准入首页","description":"d",`+
+				`"project":{"key":"TEST","name":"TEST","shortName":"TEST"},`+
+				`"comments":[{"text":"/opencode start","created":1,"author":{"login":"yusiwen"}}]}`))
+	}
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	if fake.sessions != 1 {
 		t.Fatalf("sessions = %d, want the session to be reused", fake.sessions)
 	}
-	if fake.continued != 1 {
-		t.Fatalf("the second turn did not continue the session (prompts=%d)", len(fake.prompts))
+	if fake.continued != 2 {
+		t.Fatalf("the plan/execute turns did not continue the session (prompts=%d)", len(fake.prompts))
 	}
-	if !strings.Contains(fake.prompts[1], "Implement the agreed plan") {
-		t.Fatalf("the second prompt is not an execution prompt:\n%s", fake.prompts[1])
+	if !strings.Contains(fake.prompts[2], "Implement the agreed plan") {
+		t.Fatalf("the third prompt is not an execution prompt:\n%s", fake.prompts[2])
 	}
 
 	task, ok := reg.Get(youtrack.SourceName, "TEST-41")
 	if !ok {
 		t.Fatal("task missing")
 	}
-	if task.Turns != 2 || task.State != registry.StateDone {
-		t.Fatalf("task = %+v, want two turns ending done", task)
+	if task.Turns != 3 || task.State != registry.StateDone {
+		t.Fatalf("task = %+v, want three turns ending done", task)
 	}
 }
 
@@ -639,8 +641,8 @@ func TestASilentTurnIsAskedOnceMoreAndThenAnswered(t *testing.T) {
 	if !ok {
 		t.Fatal("the task was not recorded")
 	}
-	if task.State != registry.StateAwaitingInput || task.Plan != registry.PlanDraft {
-		t.Fatalf("state/plan = %q/%q, want awaiting_input/draft once the comment was posted",
+	if task.State != registry.StateAwaitingInput || task.Plan != registry.PlanNone {
+		t.Fatalf("state/plan = %q/%q, want awaiting_input/none once the analysis comment was posted",
 			task.State, task.Plan)
 	}
 	// The follow-up's own usage is folded into the one delivery: its cost is real and
@@ -1457,9 +1459,10 @@ func TestAPermitContinuesInThePhaseTheRefusalsStopped(t *testing.T) {
 	defer server.Close()
 	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
 
-	// Analysis (which posts a plan), then the trigger, which now plans-or-executes with a
-	// plan on file — an execution turn, whose command is refused.
+	// Analysis, then plan, then execute: the execution turn is the one whose
+	// command is refused.
 	dispatcher.handle(context.Background(), delivery("TEST-64", "issueCreated", issueCreatedBody("TEST-64")))
+	dispatcher.handle(context.Background(), delivery("TEST-64", "commentAdded", commentBody("TEST-64", "/opencode start")))
 	dispatcher.handle(context.Background(), delivery("TEST-64", "commentAdded", commentBody("TEST-64", "/opencode start")))
 	if task, _ := reg.Get(youtrack.SourceName, "TEST-64"); task.LastAction != string(rules.ActionExecute) {
 		t.Fatalf("last_action = %q, want the refused turn to have been an execution", task.LastAction)
@@ -1469,17 +1472,17 @@ func TestAPermitContinuesInThePhaseTheRefusalsStopped(t *testing.T) {
 		commentBody("TEST-64", rules.PermitTrigger)))
 
 	prompts := fake.promptsSeen()
-	if len(prompts) != 3 {
-		t.Fatalf("prompts = %d, want three", len(prompts))
+	if len(prompts) != 4 {
+		t.Fatalf("prompts = %d, want four (analysis, plan, execute, continuation)", len(prompts))
 	}
-	if !strings.Contains(prompts[2], "Implement the plan in the working directory") {
-		t.Fatalf("the continuation is not an implementation turn:\n%s", prompts[2])
+	if !strings.Contains(prompts[3], "Implement the plan in the working directory") {
+		t.Fatalf("the continuation is not an implementation turn:\n%s", prompts[3])
 	}
-	if !strings.Contains(prompts[2], "## Authorised commands") {
+	if !strings.Contains(prompts[3], "## Authorised commands") {
 		t.Fatal("the continuation does not carry the authorisation")
 	}
 	// The executed arbiter had the command allowed, which is what makes the phase useful.
-	if got := fake.permissionReplyFor(3); got != "once" {
+	if got := fake.permissionReplyFor(4); got != "once" {
 		t.Fatalf("the continuation answered %q, want the authorised command allowed", got)
 	}
 }
