@@ -184,6 +184,15 @@ func (e *env) stop() {
 	e.cmd = nil
 }
 
+func (e *env) kill() {
+	if e == nil || e.cmd == nil || e.cmd.Process == nil {
+		return
+	}
+	_ = e.cmd.Process.Kill()
+	_, _ = e.cmd.Process.Wait()
+	e.cmd = nil
+}
+
 func (e *env) waitHealthy(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -900,10 +909,12 @@ func TestPermitAndRevoke(t *testing.T) {
 }
 
 type taskRow struct {
-	TaskKey  string `json:"task_key"`
-	State    string `json:"state"`
-	Turns    int    `json:"turns"`
-	Refusals []struct {
+	TaskKey   string `json:"task_key"`
+	State     string `json:"state"`
+	Worktree  string `json:"worktree"`
+	LastError string `json:"last_error"`
+	Turns     int    `json:"turns"`
+	Refusals  []struct {
 		Command string `json:"command"`
 	} `json:"refusals"`
 	Grant *struct {
@@ -941,6 +952,62 @@ func (e *env) waitForRegistry(t *testing.T, key string, ok func(taskRow) bool, t
 		time.Sleep(time.Second)
 	}
 	t.Fatalf("registry for %s did not reach the expected state (last %+v)", key, last)
+	return last
+}
+
+func TestCrashRecovery(t *testing.T) {
+	if os.Getenv("E2E_CRASH") != "1" {
+		t.Skip("set E2E_CRASH=1 to SIGKILL the test FlowHub during a turn")
+	}
+	if suite.live {
+		t.Skip("crash recovery is checked in direct mode")
+	}
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+	summary := "FlowHub E2E crash " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Crash recovery E2E.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Crash recovery E2E.", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("webhook status = %d", status)
+	}
+	before := suite.waitForSession(t, key, 20*time.Second)
+	if before.Worktree == "" {
+		t.Fatalf("task row has no worktree before the crash: %+v", before)
+	}
+	suite.kill()
+	time.Sleep(500 * time.Millisecond)
+	suite.start()
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "failed" && strings.Contains(row.LastError, "interrupted by a restart")
+	}, 20*time.Second)
+	if row.Worktree != before.Worktree {
+		t.Fatalf("worktree changed across restart: before=%s after=%s", before.Worktree, row.Worktree)
+	}
+	if row.Turns > 1 {
+		t.Fatalf("turns after restart = %d, want at most one", row.Turns)
+	}
+	if sessions := suite.openCodeSessionsIn(t, row.Worktree); sessions > 1 {
+		t.Fatalf("opencode sessions after restart = %d, want at most one", sessions)
+	}
+}
+
+func (e *env) waitForSession(t *testing.T, key string, timeout time.Duration) taskRow {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last taskRow
+	for time.Now().Before(deadline) {
+		if row, ok := e.lastTaskRow(key); ok {
+			last = row
+			if row.Worktree != "" && e.openCodeSessionsIn(t, row.Worktree) > 0 {
+				return row
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("task %s never got an opencode session (last %+v)", key, last)
 	return last
 }
 

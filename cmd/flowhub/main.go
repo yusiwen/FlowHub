@@ -354,6 +354,11 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	if err != nil {
 		return fmt.Errorf("open task registry: %w", err)
 	}
+	if recovered, err := tasks.RecoverInterrupted(); err != nil {
+		return fmt.Errorf("recover interrupted tasks: %w", err)
+	} else if recovered > 0 {
+		logger.Warn("tasks interrupted by a restart were marked failed", "tasks", recovered)
+	}
 
 	// The builtin flow is loaded and its deployment state read before dispatch is
 	// constructed: dispatch consults the state to skip a project the flow owns.

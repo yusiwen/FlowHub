@@ -289,3 +289,38 @@ func TestAPreSeamRowIsReadAsYouTrack(t *testing.T) {
 		t.Fatalf("the written row has source %q, want %q", task.Source, DefaultSource)
 	}
 }
+
+func TestRecoverInterruptedMarksOnlyRunningTasks(t *testing.T) {
+	dir := t.TempDir()
+	registry, err := Open(filepath.Join(dir, "registry.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, state := range map[string]State{
+		"TEST-80": StateAnalyzing,
+		"TEST-81": StatePlanning,
+		"TEST-82": StateExecuting,
+		"TEST-83": StateAwaitingInput,
+		"TEST-84": StateDone,
+	} {
+		if err := registry.Put(Task{Source: DefaultSource, Key: key, State: state}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recovered, err := registry.RecoverInterrupted()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 3 {
+		t.Fatalf("recovered = %d, want 3", recovered)
+	}
+	for _, key := range []string{"TEST-80", "TEST-81", "TEST-82"} {
+		task, ok := registry.Get(DefaultSource, key)
+		if !ok || task.State != StateFailed || !strings.Contains(task.LastError, "interrupted by a restart") {
+			t.Fatalf("%s = %+v, want failed with the interruption reason", key, task)
+		}
+	}
+	if task, _ := registry.Get(DefaultSource, "TEST-83"); task.State != StateAwaitingInput {
+		t.Fatalf("awaiting task changed: %+v", task)
+	}
+}

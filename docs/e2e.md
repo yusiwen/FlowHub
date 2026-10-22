@@ -85,6 +85,13 @@ Permit/revoke (real refusal, `/opencode permit`, continuation, `/opencode revoke
 make e2e-permit
 ```
 
+Crash recovery (SIGKILL a real turn, restart, assert the interrupted task is
+marked failed with the interruption reason):
+
+```bash
+make e2e-crash
+```
+
 `E2E_ISSUE` is the existing issue used by the `issueUpdated` webhook test; the
 turn and comment tests create fresh issues in `YOUTRACK_PROJECT`.
 
@@ -113,6 +120,9 @@ Do not point the production YouTrack webhook app at a test instance.
 - restart: the shadow mode and compare counters survive a process restart, and a
   new update still compares;
 - permit/revoke: the agent is refused for an exact command, `/opencode permit`
-  grants it and runs the continuation, then `/opencode revoke` clears the grant.
+  grants it and runs the continuation, then `/opencode revoke` clears the grant;
+- crash recovery: SIGKILL during a real turn, restart, and the registry row is
+  marked failed with the interruption reason, same worktree and at most one
+  session.
 
-The next scenarios (crash recovery and a larger/longer soak) are tracked in #119.
+The next scenarios (a larger/longer soak and cleanup) are tracked in #119.
