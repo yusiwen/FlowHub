@@ -43,8 +43,6 @@ type env struct {
 	binary      string
 	configPath  string
 	cmd         *exec.Cmd
-	logPath     string
-	logFile     *os.File
 	client      *http.Client
 }
 
@@ -76,7 +74,7 @@ func setup() *env {
 		ocBase:      strings.TrimRight(os.Getenv("OPENCODE_URL"), "/"),
 		ocPass:      firstNonEmpty(os.Getenv("FLOWHUB_OPENCODE_PASSWORD"), os.Getenv("HOMELAB_OPENCODE_PASSWORD")),
 		client:      &http.Client{Timeout: 30 * time.Second},
-		ytClient:    &http.Client{Timeout: 30 * time.Second},
+		ytClient:    &http.Client{Timeout: 60 * time.Second},
 	}
 	if e.ocBase == "" {
 		e.ocBase = "http://127.0.0.1:4096"
@@ -114,10 +112,19 @@ func setup() *env {
 	}
 	e.baseURL = "http://" + host + ":" + port(e.addr)
 	e.dataDir = filepath.Join(e.dir, "data")
-	e.logPath = filepath.Join(e.dir, "flowhub.log")
 
 	configPath := filepath.Join(e.dir, "config.json")
-	if err := writeTestConfig(configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject); err != nil {
+	promptFile := ""
+	if os.Getenv("E2E_PERMIT") == "1" {
+		// The permit test needs a permission refusal. Issue text is untrusted, so
+		// asking the model there is correctly ignored; a project-level prompt file
+		// is the operator's trusted instruction and can require the inspection.
+		promptFile = filepath.Join(e.dir, "permit-prompt.md")
+		if err := os.WriteFile(promptFile, []byte("Before answering, run this shell command with the shell tool and record its output: git worktree list\n"), 0o600); err != nil {
+			fatalf("e2e: permit prompt: %v", err)
+		}
+	}
+	if err := writeTestConfig(configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject, promptFile); err != nil {
 		fatalf("e2e: write config: %v", err)
 	}
 	e.configPath = configPath
@@ -152,19 +159,13 @@ func (e *env) start() {
 		"FLOWHUB_LOG_FILE=none",
 		"FLOWHUB_TASK_DEADLINE=5m",
 	)
-	logFile, err := os.OpenFile(e.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		fatalf("e2e: log: %v", err)
-	}
-	e.logFile = logFile
-	e.cmd.Stdout = logFile
-	e.cmd.Stderr = logFile
+	e.cmd.Stdout = os.Stdout
+	e.cmd.Stderr = os.Stderr
 	if err := e.cmd.Start(); err != nil {
 		fatalf("e2e: start: %v", err)
 	}
 	if err := e.waitHealthy(15 * time.Second); err != nil {
-		data, _ := os.ReadFile(e.logPath)
-		fatalf("e2e: FlowHub did not become healthy: %v\n%s", err, tail(string(data), 40))
+		fatalf("e2e: FlowHub did not become healthy: %v", err)
 	}
 }
 
@@ -179,10 +180,6 @@ func (e *env) stop() {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		_ = e.cmd.Process.Kill()
-	}
-	if e.logFile != nil {
-		_ = e.logFile.Close()
-		e.logFile = nil
 	}
 	e.cmd = nil
 }
@@ -244,7 +241,7 @@ func TestIssueCreatedRunsOneDispatchTurn(t *testing.T) {
 	}
 	t.Logf("created %s (%s)", key, id)
 	if !suite.live {
-		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, suite.ytProject)); status != http.StatusAccepted {
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Created by the FlowHub E2E turn test.", suite.ytProject)); status != http.StatusAccepted {
 			t.Fatalf("webhook status = %d, want 202", status)
 		}
 	}
@@ -430,14 +427,14 @@ func (e *env) openCodeSessionsIn(t *testing.T, directory string) int {
 	return len(body.Data)
 }
 
-func issueCreatedPayload(key, summary, project string) []byte {
+func issueCreatedPayload(key, summary, description, project string) []byte {
 	payload := map[string]any{
 		"event":       "issueCreated",
 		"timestamp":   time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 		"id":          key,
 		"summary":     summary,
 		"project":     map[string]any{"key": project, "name": project, "shortName": project},
-		"description": "Created by the FlowHub E2E turn test.",
+		"description": description,
 		"created":     time.Now().UnixMilli(),
 		"reporter":    map[string]any{"login": "yusiwen", "fullName": "Siwen Yu"},
 	}
@@ -501,7 +498,7 @@ func TestOnExecutesAndRollsBack(t *testing.T) {
 		t.Fatalf("create issue: %v", err)
 	}
 	if !suite.live {
-		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, suite.ytProject)); status != http.StatusAccepted {
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Created by the FlowHub E2E on test.", suite.ytProject)); status != http.StatusAccepted {
 			t.Fatalf("webhook status = %d", status)
 		}
 	}
@@ -648,7 +645,7 @@ func TestCommentTriggerStartsAPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add comment: %v", err)
 	}
-	if status := suite.postWebhook(t, commentAddedPayload(key, comment, suite.ytProject)); status != http.StatusAccepted {
+	if status := suite.postWebhook(t, commentAddedPayload(key, comment, "/opencode start", suite.ytProject)); status != http.StatusAccepted {
 		t.Fatalf("webhook status = %d", status)
 	}
 	suite.waitForDispatchHandled(t, baseline+1, 20*time.Second)
@@ -769,7 +766,7 @@ func (e *env) flowDropped(t *testing.T) float64 {
 	return body.Flows.Dropped
 }
 
-func commentAddedPayload(key, commentID, project string) []byte {
+func commentAddedPayload(key, commentID, text, project string) []byte {
 	payload := map[string]any{
 		"event":     "commentAdded",
 		"timestamp": time.Now().UTC().Format("2006-01-02T15:04:05Z"),
@@ -777,7 +774,7 @@ func commentAddedPayload(key, commentID, project string) []byte {
 		"summary":   "FlowHub E2E trigger",
 		"project":   map[string]any{"key": project, "name": project, "shortName": project},
 		"comments": []map[string]any{{
-			"id": commentID, "text": "/opencode start",
+			"id": commentID, "text": text,
 			"created": time.Now().UnixMilli(),
 			"author":  map[string]any{"login": "yusiwen", "fullName": "Siwen Yu"},
 		}},
@@ -837,6 +834,114 @@ func TestRestartKeepsComparisonState(t *testing.T) {
 		t.Fatalf("webhook after restart status = %d", status)
 	}
 	suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.ShadowCompared > afterRestart.ShadowCompared }, 20*time.Second)
+}
+
+func TestPermitAndRevoke(t *testing.T) {
+	if os.Getenv("E2E_PERMIT") != "1" {
+		t.Skip("set E2E_PERMIT=1 to run the real permit/revoke path")
+	}
+	if suite.live {
+		t.Skip("permit/revoke currently runs in direct mode")
+	}
+	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+	prompt := "Inspect the repository and report every git worktree attached to it. " +
+		"Follow the project instructions for the required inspection."
+	summary := "FlowHub E2E permit " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, prompt)
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, prompt, suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("webhook status = %d", status)
+	}
+	suite.waitForEvent(t, key, "issue.created", 15*time.Second)
+	suite.waitForDispatchHandled(t, 1, 20*time.Second)
+	suite.waitForComment(t, key, "<!-- flowhub-auto -->", 6*time.Minute)
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return len(row.Refusals) > 0
+	}, 6*time.Minute)
+	command := row.Refusals[0].Command
+	t.Logf("refused command: %s", command)
+
+	turnsBefore := row.Turns
+	permit, err := suite.addComment(key, "/opencode permit")
+	if err != nil {
+		t.Fatalf("permit comment: %v", err)
+	}
+	if status := suite.postWebhook(t, commentAddedPayload(key, permit, "/opencode permit", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("permit webhook status = %d", status)
+	}
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		if row.Grant == nil || len(row.Grant.Commands) == 0 || row.Turns <= turnsBefore {
+			return false
+		}
+		for _, granted := range row.Grant.Commands {
+			if granted == command {
+				return true
+			}
+		}
+		return false
+	}, 6*time.Minute)
+	suite.waitForComment(t, key, "<!-- flowhub-auto -->", 6*time.Minute)
+
+	revoke, err := suite.addComment(key, "/opencode revoke")
+	if err != nil {
+		t.Fatalf("revoke comment: %v", err)
+	}
+	if status := suite.postWebhook(t, commentAddedPayload(key, revoke, "/opencode revoke", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("revoke webhook status = %d", status)
+	}
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Grant == nil || len(row.Grant.Commands) == 0
+	}, 20*time.Second)
+}
+
+type taskRow struct {
+	TaskKey  string `json:"task_key"`
+	State    string `json:"state"`
+	Turns    int    `json:"turns"`
+	Refusals []struct {
+		Command string `json:"command"`
+	} `json:"refusals"`
+	Grant *struct {
+		Commands []string `json:"commands"`
+	} `json:"grant"`
+}
+
+func (e *env) lastTaskRow(key string) (taskRow, bool) {
+	data, err := os.ReadFile(filepath.Join(e.dataDir, "registry.jsonl"))
+	if err != nil {
+		return taskRow{}, false
+	}
+	var found taskRow
+	ok := false
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var row taskRow
+		if json.Unmarshal([]byte(line), &row) == nil && row.TaskKey == key {
+			found, ok = row, true
+		}
+	}
+	return found, ok
+}
+
+func (e *env) waitForRegistry(t *testing.T, key string, ok func(taskRow) bool, timeout time.Duration) taskRow {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last taskRow
+	for time.Now().Before(deadline) {
+		if row, found := e.lastTaskRow(key); found {
+			last = row
+			if ok(row) {
+				return row
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("registry for %s did not reach the expected state (last %+v)", key, last)
+	return last
 }
 
 func (e *env) updateIssue(issue, description string) error {
@@ -947,33 +1052,53 @@ func (e *env) getJSON(t *testing.T, path string, out any) error {
 }
 
 func (e *env) ytRequest(method, path string, body, out any) error {
-	var reader io.Reader
+	var data []byte
 	if body != nil {
-		data, err := json.Marshal(body)
+		encoded, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		reader = bytes.NewReader(data)
+		data = encoded
 	}
-	request, err := http.NewRequest(method, e.ytBase+path, reader)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		var reader io.Reader
+		if data != nil {
+			reader = bytes.NewReader(data)
+		}
+		request, err := http.NewRequest(method, e.ytBase+path, reader)
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Authorization", "Bearer "+e.ytToken)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := e.ytClient.Do(request)
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+			continue
+		}
+		if response.StatusCode >= 500 {
+			lastErr = fmt.Errorf("%s %s: %d", method, path, response.StatusCode)
+			payload, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+			_ = response.Body.Close()
+			if len(payload) > 0 {
+				lastErr = fmt.Errorf("%s %s: %d %s", method, path, response.StatusCode, strings.TrimSpace(string(payload)))
+			}
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+			continue
+		}
+		defer func() { _ = response.Body.Close() }()
+		if response.StatusCode < 200 || response.StatusCode > 299 {
+			payload, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+			return fmt.Errorf("%s %s: %d %s", method, path, response.StatusCode, strings.TrimSpace(string(payload)))
+		}
+		if out != nil {
+			return json.NewDecoder(response.Body).Decode(out)
+		}
+		return nil
 	}
-	request.Header.Set("Authorization", "Bearer "+e.ytToken)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := e.ytClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		data, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
-		return fmt.Errorf("%s %s: %d %s", method, path, response.StatusCode, strings.TrimSpace(string(data)))
-	}
-	if out != nil {
-		return json.NewDecoder(response.Body).Decode(out)
-	}
-	return nil
+	return lastErr
 }
 
 func issueUpdatedPayload(issue, description, timestamp, project string) []byte {
@@ -994,7 +1119,7 @@ func issueUpdatedPayload(issue, description, timestamp, project string) []byte {
 	return data
 }
 
-func writeTestConfig(path, repo, worktrees, project string) error {
+func writeTestConfig(path, repo, worktrees, project, promptFile string) error {
 	home, _ := os.UserHomeDir()
 	data, err := os.ReadFile(filepath.Join(home, ".config", "flowhub", "config.json"))
 	if err != nil {
@@ -1011,6 +1136,9 @@ func writeTestConfig(path, repo, worktrees, project string) error {
 		if ok && entry["project"] == project {
 			entry["repo"].(map[string]any)["path"] = repo
 			entry["worktrees"] = worktrees
+			if promptFile != "" {
+				entry["prompt_file"] = promptFile
+			}
 			kept = append(kept, entry)
 		}
 	}
@@ -1047,14 +1175,6 @@ func port(addr string) string {
 		return addr[i+1:]
 	}
 	return addr
-}
-
-func tail(text string, lines int) string {
-	all := strings.Split(strings.TrimSpace(text), "\n")
-	if len(all) > lines {
-		all = all[len(all)-lines:]
-	}
-	return strings.Join(all, "\n")
 }
 
 func fatalf(format string, args ...any) {

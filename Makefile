@@ -26,7 +26,7 @@ PLATFORM_LIST = \
 	linux-arm64 \
 	darwin-arm64
 
-.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart lint staticcheck \
+.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart e2e-permit lint staticcheck \
 	fmt fmt-check smoke clean all releases \
 	desktop-install desktop-dev desktop-app desktop-build desktop-check desktop-clean
 
@@ -99,6 +99,11 @@ e2e-soak: build
 e2e-restart: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 E2E_RESTART=1 go test -tags=e2e ./e2e -count=1 -v
+
+# Opt-in: a real permission refusal, /opencode permit and /opencode revoke.
+e2e-permit: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 E2E_PERMIT=1 go test -tags=e2e ./e2e -count=1 -v
 
 # Opt-in: spends one real opencode turn and creates one test-project issue.
 e2e-turn: build
