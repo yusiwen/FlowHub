@@ -244,11 +244,14 @@ func TestEngineSubmitProcessesAndCloses(t *testing.T) {
 		if err != nil {
 			t.Fatalf("list runs: %v", err)
 		}
-		if len(runs) == 1 {
-			if runs[0].State != StateSucceeded || runs[0].Mode != "shadow" {
+		if len(runs) == 1 && runs[0].State == StateSucceeded {
+			if runs[0].Mode != "shadow" {
 				t.Fatalf("run = %+v", runs[0])
 			}
 			break
+		}
+		if len(runs) == 1 && runs[0].State == StateFailed {
+			t.Fatalf("run failed: %+v", runs[0])
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("no run was written; snapshot = %+v", engine.Snapshot())
