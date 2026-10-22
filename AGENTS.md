@@ -16,7 +16,9 @@ into a neutral event and appended to `events/YYYY-MM-DD.jsonl` for the flow engi
 (`internal/upstream`, ADR 0013); the dispatcher remains the live consumer until the
 staged cutover. The builtin flow also runs in **shadow**: it evaluates every
 accepted event, writes a run under `runs/<run-id>/`, and marks every workspace/
-session/runtime node skipped.
+session/runtime node skipped. `/hub/v1` exposes the definition and runs to the
+desktop under `FLOWHUB_HUB_TOKEN`, and `flowhub flow list|show|mode` is the local
+operator switch (`off`/`shadow`; `on` waits for M2).
 
 The documents below are the specification — read the relevant section before
 changing behaviour:
@@ -48,6 +50,7 @@ Run the receiver locally:
 export FLOWHUB_HOOK_KEY=$(openssl rand -hex 32)
 export FLOWHUB_TOKEN=$(openssl rand -hex 32)
 export FLOWHUB_ALLOWED_SOURCES=127.0.0.1
+export FLOWHUB_HUB_TOKEN=$(openssl rand -hex 32)   # enables /hub/v1 and the desktop read view
 make run
 ```
 
@@ -117,6 +120,8 @@ internal/upstream/  The flow event seam: Event envelope, Normalizer, append-only
 internal/flow/      The flow model and compiler: strict definition, typed nodes, expression/template language, parity fixture
 internal/flow/builtin/ the embedded read-only default-youtrack flow
 internal/flow/engine/ the shadow runner: trigger matching, task projection, profile evaluation, run meta/journal
+internal/flow/mode/ the deployment state: off/shadow/on in `<DataDir>/flows/state.json`, live-reloaded
+internal/flow/api/ the read-only `/hub/v1` surface (flows, runs, journal), bearer token in front
 internal/projectmap/ the configuration file (v1/v2, sources, runtimes, (source, project) index, provenance) (~/.config/flowhub/config.json)
 internal/agent/       the runtime seam: Runtime, Turn/Result, Phase, Downloads, model references
 internal/agent/opencode/  the opencode implementation: one protocol-detecting client with a v1 and a v2 transport, arbiter, session rulesets, one-turn runner
@@ -330,8 +335,9 @@ documents. The rules below are load-bearing; do not relax them casually.
     plausible reason when asked to explain itself. The marker stays the last line,
     inside the blockquote.
 11. **A subcommand runs before the receiver configuration is loaded.**
-    `flowhub runtime init` executes on a machine that has none of the receiver's
-    environment variables, so `main` dispatches a subcommand before `config.Load`
+    `flowhub runtime init` and `flowhub flow …` execute on a machine that may have
+    none of the receiver's environment variables, so `main` dispatches a subcommand
+    before `config.Load`
     and does not print the receiver's banner or load the routing table. Its exit
     status is a gate: 0 ready, 2 not ready, 1 usage. A capability report never
     carries a secret value — only whether a variable is present — because it is a

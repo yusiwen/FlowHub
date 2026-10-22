@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -133,6 +134,38 @@ func (s *Store) List() ([]*Run, error) {
 		return runs[a].StartedAt.After(runs[b].StartedAt)
 	})
 	return runs, nil
+}
+
+// Events reads journal events with seq > after, up to limit. The journal is one
+// JSON object per line; an incomplete last line is ignored.
+func (s *Store) Events(runID string, after, limit int) ([]map[string]any, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	data, err := os.ReadFile(filepath.Join(s.dir, runID, "journal.jsonl"))
+	if err != nil {
+		return nil, fmt.Errorf("engine: read journal %s: %w", runID, err)
+	}
+	events := make([]map[string]any, 0, limit)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		seq, _ := event["seq"].(float64)
+		if int(seq) <= after {
+			continue
+		}
+		events = append(events, event)
+		if len(events) >= limit {
+			break
+		}
+	}
+	return events, nil
 }
 
 // Recover marks runs that were in flight when the process stopped. A shadow run

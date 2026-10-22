@@ -160,6 +160,9 @@ flowhub runtime init         # report, install the files FlowHub manages, enrol
 flowhub runtime doctor       # re-check this host; writes nothing
 flowhub runtime doctor --push# re-check and report to the control plane
 flowhub runtime uninstall    # remove exactly what the manifest records
+flowhub flow list            # builtin flow, deployment mode, revision, run count
+flowhub flow show default-youtrack   # print the flow definition JSON
+flowhub flow mode default-youtrack shadow   # off|shadow (on is M2)
 ```
 
 On the service host, the same binary manages the runtime inventory over the
@@ -338,6 +341,7 @@ and explains nothing, and the admin API returns real errors and refusals.
 | --- | --- | --- |
 | `FLOWHUB_ADMIN_ADDR` | *(unset)* | Control API listen address, e.g. `127.0.0.1:8081`. Unset turns the listener off. A wildcard bind is refused like the webhook's |
 | `FLOWHUB_ADMIN_TOKEN` | *(unset)* | **Required** when `FLOWHUB_ADMIN_ADDR` is set; the listener refuses to start without it |
+| `FLOWHUB_HUB_TOKEN` | *(unset)* | Bearer token for `/hub/v1` (flows, runs, journal). Unset disables the API with a 503; it is separate from the admin token, so the desktop can read without being able to mutate runtimes |
 | `FLOWHUB_RUNTIMES_FILE` | `<DataDir>/runtimes.json` | Runtime inventory. Written only by the service |
 
 The control API serves `/control/v1/runtimes` (`GET` inventory, `POST …/invite`,
@@ -345,6 +349,13 @@ The control API serves `/control/v1/runtimes` (`GET` inventory, `POST …/invite
 `DELETE …/{name}`) plus an open `/control/v1/health`. Everything but `register`,
 `heartbeat` and the health endpoint needs the admin token as
 `Authorization: Bearer …`.
+
+The flow API is read-only and lives on the same listener as the webhook:
+`GET /hub/v1/flows`, `/hub/v1/flows/{id}`, `/hub/v1/runs?flow=&state=&limit=&cursor=`,
+`/hub/v1/runs/{id}` and `/hub/v1/runs/{id}/events?after=`. Every request needs
+`Authorization: Bearer $FLOWHUB_HUB_TOKEN`; an unset token answers `503`. The
+builtin flow is **off** by default; `flowhub flow mode default-youtrack shadow`
+turns on the shadow evaluation (no agent turns yet).
 
 `FLOWHUB_DISPATCH=1` refuses to start when dispatching cannot work: no routing
 table, an entry with no `default_branch`, an entry with no `worktrees` directory

@@ -48,6 +48,9 @@ type Options struct {
 	QueueSize  int
 	Logger     *slog.Logger
 	Now        func() time.Time
+	// ModeEnabled gates shadow execution. Nil means enabled (tests and callers
+	// that do not have a deployment state yet).
+	ModeEnabled func(flowID string) bool
 }
 
 // Engine consumes events and writes shadow runs.
@@ -187,9 +190,20 @@ func (e *Engine) Snapshot() map[string]any {
 	}
 }
 
+// RunStore exposes the run store to the hub API.
+func (e *Engine) RunStore() *Store {
+	if e == nil {
+		return nil
+	}
+	return e.store
+}
+
 // RunEvent executes one event synchronously. It is exported for the parity
 // harness; the worker uses it too.
 func (e *Engine) RunEvent(event upstream.Event) (*Run, error) {
+	if e.opts.ModeEnabled != nil && !e.opts.ModeEnabled(e.opts.Flow.Definition.ID) {
+		return nil, nil
+	}
 	trigger := e.triggerFor(event)
 	if trigger == nil {
 		return nil, nil
