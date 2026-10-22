@@ -19,7 +19,9 @@ accepted event, writes a run under `runs/<run-id>/`, and marks every workspace/
 session/runtime node skipped. Dispatch publishes its decision for the event id;
 the shadow run joins it, and equal/different decisions are counted in
 `/healthz.flows` (`shadow_compared`/`shadow_mismatches`) and shown as a diff in
-the desktop. `/hub/v1` exposes the definition and runs to the
+the desktop. A real E2E harness under `e2e/` (build tag `e2e`, `make e2e`) drives
+the self-hosted YouTrack TEST project and local opencode; it is opt-in and never
+part of `make test`. `/hub/v1` exposes the definition and runs to the
 desktop under `FLOWHUB_HUB_TOKEN`, and `flowhub flow list|show|mode` is the local
 operator switch (`off`/`shadow`/`on`; `on` needs `FLOWHUB_DISPATCH=1` so the
 shared task service can execute turns).
@@ -265,7 +267,11 @@ documents. The rules below are load-bearing; do not relax them casually.
    signals (new completed assistant message, status not busy, no pending
    permission), because status lags and a pending permission keeps a session busy;
    on 2.x the server writes an `idle` message whose `outcome` is the end of the
-   turn, and a pending permission still holds that back. **Which generation a
+   turn, and a pending permission still holds that back. On 2.x an MCP call can be
+   nested inside the model's `execute` tool (`state.metadata.toolCalls`), and the
+   server spells it `youtrack.add_issue_comment`; the projection flattens those
+   calls and reply detection normalizes `.`/`-` to `_`, or a posted comment looks
+   like silence and the task is failed. **Which generation a
    server speaks is detected once by the client** — `/api/info` first, then
    `/global/health` (ADR 0012) — so do not hard-code either surface in a caller,
    and build the ruleset in the vocabulary the server actually evaluates.

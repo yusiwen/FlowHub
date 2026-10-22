@@ -26,7 +26,7 @@ PLATFORM_LIST = \
 	linux-arm64 \
 	darwin-arm64
 
-.PHONY: default build run secrets test test-race test-live test-repeat lint staticcheck \
+.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-turn lint staticcheck \
 	fmt fmt-check smoke clean all releases \
 	desktop-install desktop-dev desktop-app desktop-build desktop-check desktop-clean
 
@@ -65,6 +65,26 @@ test-race:
 # http://127.0.0.1:4096). Skipped by the normal suite because it spends tokens and
 # creates real sessions. Point it at a repository to verify the routing table:
 #   OPENCODE_LIVE_DIR=/path/to/repo make test-live
+# Real E2E: starts a disposable FlowHub process against the self-hosted YouTrack
+# TEST project and the local opencode server. The token comes from a 0600 file;
+# this target is never part of `make test` or CI.
+FLOWHUB_E2E_ENV ?= /tmp/flowhub-e2e.env
+e2e: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 go test -tags=e2e ./e2e -count=1 -v
+
+# Requires the test FlowHub to own the address the YouTrack app posts to
+# (default 192.168.8.20:8080) and no real receiver on that port.
+e2e-live: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 FLOWHUB_E2E_LIVE=1 E2E_ADDR=$${E2E_ADDR:-192.168.8.20:8080} \
+		go test -tags=e2e ./e2e -count=1 -v
+
+# Opt-in: spends one real opencode turn and creates one TEST issue.
+e2e-turn: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 E2E_TURN=1 go test -tags=e2e ./e2e -count=1 -v
+
 test-live:
 	OPENCODE_LIVE=1 go test -count=1 -timeout 5m -run TestLiveTask ./internal/opencode/
 
