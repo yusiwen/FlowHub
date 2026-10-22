@@ -59,6 +59,19 @@ instance `off`):
 make e2e-flow
 ```
 
+Comment trigger (a real `/opencode start` plan turn):
+
+```bash
+make e2e-comments
+```
+
+Direct soak (N issue updates through shadow; default 10):
+
+```bash
+make e2e-soak
+E2E_SOAK=100 make e2e-soak
+```
+
 `E2E_ISSUE` defaults to `TEST-38` for the `issueUpdated` webhook test; the turn
 test creates a fresh issue itself.
 
@@ -80,7 +93,9 @@ Do not point the production YouTrack webhook app at a test instance.
 - a shadow comparison on a real issue update (`shadow_compared` grows,
   `shadow_mismatches` stays zero);
 - an `on` turn through the flow task service, then rollback to `off` and a
-  dispatch-handled delivery again.
+  dispatch-handled delivery again;
+- a `/opencode start` comment plan turn;
+- duplicate webhook suppression, pause, and a direct shadow soak (queue drops and
+  mismatches asserted).
 
-The next scenarios (comment trigger, permit/revoke, duplicate, pause, restart and
-soak) are tracked in #119.
+The next scenarios (permit/revoke, restart and a larger soak) are tracked in #119.

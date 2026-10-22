@@ -26,7 +26,7 @@ PLATFORM_LIST = \
 	linux-arm64 \
 	darwin-arm64
 
-.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-turn e2e-flow lint staticcheck \
+.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-turn e2e-flow e2e-comments e2e-soak lint staticcheck \
 	fmt fmt-check smoke clean all releases \
 	desktop-install desktop-dev desktop-app desktop-build desktop-check desktop-clean
 
@@ -84,6 +84,16 @@ e2e-live: build
 e2e-flow: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 E2E_FLOW=1 go test -tags=e2e ./e2e -count=1 -v
+
+# Opt-in: a real /opencode start comment turn.
+e2e-comments: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 E2E_COMMENT=1 go test -tags=e2e ./e2e -count=1 -v
+
+# Opt-in: N direct issueUpdated deliveries through shadow (default 10).
+e2e-soak: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 E2E_SOAK=$${E2E_SOAK:-10} go test -tags=e2e ./e2e -count=1 -v
 
 # Opt-in: spends one real opencode turn and creates one TEST issue.
 e2e-turn: build
