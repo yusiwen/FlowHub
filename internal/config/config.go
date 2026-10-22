@@ -274,6 +274,10 @@ type Config struct {
 	// the same rule the entry locks follow.
 	AdminToken string
 
+	// HubToken authenticates /hub/v1. Empty disables the API with a 503; the
+	// dashboard and the webhook do not need it.
+	HubToken string
+
 	// RuntimesFile is the runtime inventory. Empty resolves to
 	// <DataDir>/runtimes.json.
 	RuntimesFile string
@@ -338,6 +342,7 @@ func Load() (Config, error) {
 
 	cfg.AdminAddr = env("FLOWHUB_ADMIN_ADDR", DefaultAdminAddr)
 	cfg.AdminToken = os.Getenv("FLOWHUB_ADMIN_TOKEN")
+	cfg.HubToken = os.Getenv("FLOWHUB_HUB_TOKEN")
 	cfg.RuntimesFile = env("FLOWHUB_RUNTIMES_FILE", "")
 	cfg.OpenCodeURL = env("FLOWHUB_OPENCODE_URL", DefaultOpenCodeURL)
 	cfg.OpenCodeUser = os.Getenv("FLOWHUB_OPENCODE_USER")
@@ -771,6 +776,7 @@ func (c Config) Report() string {
 	fmt.Fprintf(&b, "registry_file:      %s\n", c.ResolvedRegistryFile())
 	fmt.Fprintf(&b, "pause_file:         %s (touch it to pause dispatch)\n", c.ResolvedPauseFile())
 	fmt.Fprintf(&b, "control_api:        %s\n", controlAPIReport(c))
+	fmt.Fprintf(&b, "hub_api:            %s\n", hubAPIReport(c))
 	fmt.Fprintf(&b, "runtimes_file:      %s\n", c.ResolvedRuntimesFile())
 	worktreeBase := c.WorktreeBase
 	if worktreeBase == "" {
@@ -805,6 +811,13 @@ func controlAPIReport(c Config) string {
 
 // authReport says whether the agent servers are called with credentials, without
 // ever printing the password: the report is a document that gets pasted around.
+func hubAPIReport(c Config) string {
+	if c.HubToken == "" {
+		return "disabled (set FLOWHUB_HUB_TOKEN to enable /hub/v1)"
+	}
+	return "enabled at /hub/v1 (token masked)"
+}
+
 func authReport(c Config) string {
 	if c.OpenCodeUser == "" {
 		return "none (loopback only: set FLOWHUB_OPENCODE_USER and FLOWHUB_OPENCODE_PASSWORD to reach a remote runtime)"

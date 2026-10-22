@@ -1160,6 +1160,7 @@ picture.
 | `/var/lib/flowhub/webhook-YYYY-MM-DD.jsonl` | FlowHub | one JSON record per delivery, raw body included |
 | `/var/lib/flowhub/events/YYYY-MM-DD.jsonl` | FlowHub | neutral flow event envelope, `0600`, 30-day retention |
 | `/var/lib/flowhub/runs/<run-id>/` | FlowHub | one shadow run: `meta.json` + `journal.jsonl` (`0600`) |
+| `/var/lib/flowhub/flows/state.json` | FlowHub/CLI | deployment mode per flow (`off`/`shadow`/`on`), `0600` |
 | `/var/lib/flowhub/payload-YYYY-MM-DD.log` | FlowHub | human-readable per-delivery blocks |
 | `/var/lib/flowhub/flowhub.log` | FlowHub | application log, size-rotated |
 | `/var/lib/flowhub/registry.jsonl` | FlowHub | task registry (append-only) |
@@ -1187,6 +1188,7 @@ picture.
 | Header token (lock 2) | `FLOWHUB_YOUTRACK_TOKEN` | the app's `webhookToken` |
 | Source allowlist (lock 3) | `FLOWHUB_YOUTRACK_ALLOWED_SOURCES` | not a secret |
 | Control API | `FLOWHUB_ADMIN_TOKEN` | the CLI's `--token` |
+| Flow API | `FLOWHUB_HUB_TOKEN` | `Authorization: Bearer …` on `/hub/v1`; unset means 503 |
 | Runtime enrolment | one-time invite token | printed once by `runtime invite` |
 | Runtime secret | stored in `runtime.json` | the inventory keeps only its SHA-256 |
 | YouTrack token for the agent | `YOUTRACK_TOKEN` | the MCP snippet references `{env:YOUTRACK_TOKEN}` |

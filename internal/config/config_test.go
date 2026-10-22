@@ -292,3 +292,21 @@ func TestReportMasksSecrets(t *testing.T) {
 		t.Fatalf("report lacks the active locks:\n%s", report)
 	}
 }
+
+func TestHubTokenIsReportedWithoutItsValue(t *testing.T) {
+	t.Setenv("FLOWHUB_HUB_TOKEN", "hub-token-secret")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.HubToken != "hub-token-secret" {
+		t.Fatalf("hub token = %q", cfg.HubToken)
+	}
+	report := cfg.Report()
+	if !strings.Contains(report, "hub_api:            enabled at /hub/v1 (token masked)") {
+		t.Fatalf("report = %s", report)
+	}
+	if strings.Contains(report, "hub-token-secret") {
+		t.Fatal("the report leaked the hub token")
+	}
+}

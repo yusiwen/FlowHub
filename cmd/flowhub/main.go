@@ -34,8 +34,10 @@ import (
 	"github.com/yusiwen/flowhub/internal/config"
 	"github.com/yusiwen/flowhub/internal/dedupe"
 	"github.com/yusiwen/flowhub/internal/dispatch"
+	flowapi "github.com/yusiwen/flowhub/internal/flow/api"
 	flowbuiltin "github.com/yusiwen/flowhub/internal/flow/builtin"
 	flowengine "github.com/yusiwen/flowhub/internal/flow/engine"
+	flowmode "github.com/yusiwen/flowhub/internal/flow/mode"
 	"github.com/yusiwen/flowhub/internal/logging"
 	"github.com/yusiwen/flowhub/internal/metrics"
 	"github.com/yusiwen/flowhub/internal/projectmap"
@@ -90,6 +92,9 @@ func main() {
 		// The build identity travels into the manifest, so a host can tell which
 		// binary wrote the files it is running.
 		provision.Version = versionLine()
+		if os.Args[1] == "flow" {
+			os.Exit(runFlowCommand(os.Args[2:], os.Stdout, os.Stderr))
+		}
 		os.Exit(provision.Main(os.Args[1], os.Args[2:], os.Stdout, os.Stderr))
 	}
 	if err := run(envResult, envErr); err != nil {
@@ -352,6 +357,10 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	if err != nil {
 		return fmt.Errorf("load builtin flow: %w", err)
 	}
+	modes, err := flowmode.Open(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("open flow deployment state: %w", err)
+	}
 	flowEngine, err := flowengine.New(flowengine.Options{
 		Flow:       flowDefinition,
 		Definition: flowRaw,
@@ -361,6 +370,9 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		DataDir:    cfg.DataDir,
 		QueueSize:  cfg.DispatchQueueSize,
 		Logger:     logger,
+		ModeEnabled: func(id string) bool {
+			return modes.Mode(id) == flowmode.Shadow
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("start flow shadow: %w", err)
@@ -368,7 +380,16 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	events.Subscribe(flowEngine.Submit)
 	flowEngine.Start(ctx)
 	defer func() { _ = flowEngine.Close() }()
-	logger.Info("flow shadow started", "flow", flowDefinition.Definition.ID, "runs", flowEngine.Snapshot()["dir"])
+	logger.Info("flow engine started",
+		"flow", flowDefinition.Definition.ID, "mode", modes.Mode(flowDefinition.Definition.ID),
+		"runs", flowEngine.Snapshot()["dir"])
+	hubAPI, err := flowapi.New(flowapi.Options{
+		Token: cfg.HubToken, Flow: flowDefinition, Definition: flowRaw,
+		Modes: modes, Runs: flowEngine.RunStore(), Logger: logger,
+	})
+	if err != nil {
+		return fmt.Errorf("start hub API: %w", err)
+	}
 
 	// The dispatcher is built before the handler so that a delivery can never be
 	// accepted before there is something to hand it to.
@@ -394,7 +415,8 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	mux := http.NewServeMux()
 	mux.Handle(base, handler)
 	mux.Handle(base+"/{key}", handler)
-	mux.Handle("GET /healthz", healthHandler(cfg, projects, stats, sink, cache, audit, detail, events, dispatcher, inventory, started))
+	mux.Handle("/hub/v1/", hubAPI)
+	mux.Handle("GET /healthz", healthHandler(cfg, projects, stats, sink, cache, audit, detail, events, dispatcher, inventory, flowEngine, modes, started))
 
 	server := &http.Server{
 		Handler:           mux,
@@ -1099,7 +1121,7 @@ func startSweeper(ctx context.Context, cache *dedupe.Cache, ttl time.Duration, l
 
 // healthHandler serves GET /healthz for local operations. nginx never proxies
 // this path, so it is not part of the public attack surface.
-func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.Counters, sink *store.Async, cache *dedupe.Cache, audit *store.JSONL, detail *store.Detail, events *upstream.Log, dispatcher *dispatch.Dispatcher, inventory *runtimes.Inventory, started time.Time) http.HandlerFunc {
+func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.Counters, sink *store.Async, cache *dedupe.Cache, audit *store.JSONL, detail *store.Detail, events *upstream.Log, dispatcher *dispatch.Dispatcher, inventory *runtimes.Inventory, flowEngine *flowengine.Engine, modes *flowmode.Store, started time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Payload and audit paths are only known after the first record of the
 		// day, so they are read per request rather than captured at startup.
@@ -1136,6 +1158,7 @@ func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.C
 			"dispatch":                  dispatchState,
 			"runtimes":                  runtimeHealth(inventory),
 			"upstreams":                 upstreamHealth(events),
+			"flows":                     flowHealth(flowEngine, modes),
 			"control_api":               controlAPIHealth(cfg),
 			"counters":                  stats.Snapshot(),
 		})
@@ -1165,6 +1188,23 @@ func runtimeHealth(inventory *runtimes.Inventory) map[string]any {
 }
 
 // upstreamHealth reports the flow event log without exposing a payload.
+func flowHealth(engine *flowengine.Engine, modes *flowmode.Store) map[string]any {
+	if engine == nil {
+		return map[string]any{"enabled": false}
+	}
+	snapshot := engine.Snapshot()
+	if flow, ok := snapshot["flow"].(string); ok && modes != nil {
+		snapshot["mode"] = modes.Mode(flow)
+	}
+	snapshot["definitions"] = 1
+	if modes != nil {
+		if message := modes.Error(); message != "" {
+			snapshot["state_error"] = message
+		}
+	}
+	return snapshot
+}
+
 func upstreamHealth(events *upstream.Log) map[string]any {
 	if events == nil {
 		return map[string]any{"enabled": false}
