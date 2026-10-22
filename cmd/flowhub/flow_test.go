@@ -20,14 +20,14 @@ func TestFlowCommandLifecycle(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := runFlowCommand([]string{"mode", "default-youtrack", "shadow"}, &stdout, &stderr); code != 0 {
+	if code := runFlowCommand([]string{"mode", "default-youtrack", "shadow", "--project", "TEST", "--project", "SP"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("mode code = %d, stderr = %s", code, stderr.String())
 	}
 	stdout.Reset()
 	if code := runFlowCommand([]string{"list"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("list code = %d", code)
 	}
-	if !strings.Contains(stdout.String(), "shadow") {
+	if !strings.Contains(stdout.String(), "shadow") || !strings.Contains(stdout.String(), "TEST,SP") {
 		t.Fatalf("list output = %q", stdout.String())
 	}
 
@@ -39,8 +39,13 @@ func TestFlowCommandLifecycle(t *testing.T) {
 		t.Fatalf("show output = %q", stdout.String())
 	}
 
+	stdout.Reset()
+	stderr.Reset()
 	if code := runFlowCommand([]string{"mode", "default-youtrack", "on"}, &stdout, &stderr); code == 0 {
-		t.Fatal("on must be refused until M2")
+		t.Fatal("on must be refused until the task service exists")
+	}
+	if !strings.Contains(stderr.String(), "task service") {
+		t.Fatalf("on error = %q", stderr.String())
 	}
 	if code := runFlowCommand([]string{"show", "unknown"}, &stdout, &stderr); code == 0 {
 		t.Fatal("unknown flow must be refused")

@@ -18,7 +18,7 @@ staged cutover. The builtin flow also runs in **shadow**: it evaluates every
 accepted event, writes a run under `runs/<run-id>/`, and marks every workspace/
 session/runtime node skipped. `/hub/v1` exposes the definition and runs to the
 desktop under `FLOWHUB_HUB_TOKEN`, and `flowhub flow list|show|mode` is the local
-operator switch (`off`/`shadow`; `on` waits for M2).
+operator switch (`off`/`shadow`; `on` waits for the task service, M3-1).
 
 The documents below are the specification — read the relevant section before
 changing behaviour:

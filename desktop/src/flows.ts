@@ -266,6 +266,8 @@ export function renderInspector(
     row(container, "name", flow.name);
     row(container, "id", flow.id, true);
     row(container, "mode", flow.mode);
+    row(container, "projects", flow.projects?.join(", ") || "all");
+    row(container, "updated", flow.updated_by ? `${flow.updated_by} · ${relativeTime(flow.updated_at ?? null)}` : "—");
     row(container, "revision", flow.revision.slice(0, 12), true);
     row(container, "upstream", flow.upstream);
     row(container, "nodes", definition ? String(definition.nodes.length) : "—");

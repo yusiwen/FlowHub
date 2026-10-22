@@ -368,9 +368,11 @@ Deployment is state, not definition:
 - `projects`: for `on`, the project keys the flow owns; empty means all projects.
   `shadow` is always all projects; `off` is none.
 - A missing file means every flow is `off`. The builtin flow is never deleted.
-- M1 supports `off` and `shadow`; `on` and per-project ownership land in M2, before
-  the pilot. The CLI writes this file; the API exposes it read-only in M1 and
-  read-write in M2.
+- M1 supports `off` and `shadow`; M2-2 adds the project-scoped deployment schema
+  and a token-authenticated `POST /hub/v1/flows/{id}/deployment` (the CLI writes
+  the same file). `on` remains refused (`409`) until the task service can execute
+  `task.turn`: accepting it now would let dispatch skip a project the flow cannot
+  run. The pilot therefore waits for M3-1.
 
 ## 6. Node catalogue
 
@@ -622,8 +624,9 @@ All under `/hub/v1` on the main listener, all requiring
 | GET | `/hub/v1/runs/{id}` | run snapshot: steps, tasks, outputs, error |
 | GET | `/hub/v1/runs/{id}/events?after=<seq>` | journal events for polling |
 
-M2 adds `POST /hub/v1/flows/{id}/deployment` (`off|shadow|on`, project scope) and
-`POST /hub/v1/runs/{id}/cancel`. There is no `PUT`/`DELETE` for the builtin flow.
+M2 adds `POST /hub/v1/flows/{id}/deployment` (`off|shadow`, project scope stored
+for a future `on`) and `POST /hub/v1/runs/{id}/cancel`. `on` answers `409` until
+the task service exists. There is no `PUT`/`DELETE` for the builtin flow.
 
 - Errors are JSON: `{"error": "...", "details": [{"path": "...", "message": "..."}]}`
   with `400`/`401`/`404`/`409`/`503`. Unlike the webhook entry, the caller is a

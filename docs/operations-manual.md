@@ -1160,7 +1160,7 @@ picture.
 | `/var/lib/flowhub/webhook-YYYY-MM-DD.jsonl` | FlowHub | one JSON record per delivery, raw body included |
 | `/var/lib/flowhub/events/YYYY-MM-DD.jsonl` | FlowHub | neutral flow event envelope, `0600`, 30-day retention |
 | `/var/lib/flowhub/runs/<run-id>/` | FlowHub | one shadow run: `meta.json` + `journal.jsonl` (`0600`) |
-| `/var/lib/flowhub/flows/state.json` | FlowHub/CLI | deployment mode per flow (`off`/`shadow`/`on`), `0600` |
+| `/var/lib/flowhub/flows/state.json` | FlowHub/CLI/API | deployment mode per flow (`off`/`shadow`/`on`) and project scope, `0600` |
 | `/var/lib/flowhub/payload-YYYY-MM-DD.log` | FlowHub | human-readable per-delivery blocks |
 | `/var/lib/flowhub/flowhub.log` | FlowHub | application log, size-rotated |
 | `/var/lib/flowhub/registry.jsonl` | FlowHub | task registry (append-only) |
