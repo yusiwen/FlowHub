@@ -26,7 +26,7 @@ PLATFORM_LIST = \
 	linux-arm64 \
 	darwin-arm64
 
-.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-clean e2e-live e2e-live-flow e2e-live-journey e2e-live-permit e2e-all e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart e2e-permit e2e-crash lint staticcheck \
+.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-clean e2e-live e2e-live-flow e2e-live-journey e2e-live-on-journey e2e-live-permit e2e-all e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart e2e-permit e2e-crash lint staticcheck \
 	fmt fmt-check smoke clean all releases \
 	desktop-install desktop-dev desktop-app desktop-build desktop-check desktop-clean
 
@@ -101,6 +101,14 @@ e2e-live-permit: build
 		FLOWHUB_E2E=1 FLOWHUB_E2E_LIVE=1 E2E_PERMIT=1 \
 		E2E_ADDR=$${E2E_ADDR:?set E2E_ADDR to the webhook target} \
 		go test -tags=e2e ./e2e -count=1 -run TestPermitAndRevoke -v
+
+# The full live journey with the flow owning the project (`on`): analyze, plan,
+# execute, same session/worktree, no dispatch turn.
+e2e-live-on-journey: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 FLOWHUB_E2E_LIVE=1 E2E_ON_JOURNEY=1 \
+		E2E_ADDR=$${E2E_ADDR:?set E2E_ADDR to the webhook target} \
+		go test -tags=e2e ./e2e -count=1 -run TestOnLiveFullJourney -v
 
 # Live webhook + shadow + on/rollback; requires E2E_ADDR and no real receiver.
 e2e-live-flow: build
