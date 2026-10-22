@@ -30,7 +30,10 @@ type Options struct {
 	Definition []byte
 	Modes      *mode.Store
 	Runs       *engine.Store
-	Logger     *slog.Logger
+	// OnAvailable reports whether this process has the task service wired. `on`
+	// is refused without it: skipping dispatch but not running turns would lose work.
+	OnAvailable bool
+	Logger      *slog.Logger
 }
 
 // Handler is the /hub/v1 mux with the bearer check in front.
@@ -106,16 +109,17 @@ func (h *Handler) flow(w http.ResponseWriter, r *http.Request) {
 	}
 	entry := h.entry()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":         h.opts.Flow.Definition.ID,
-		"name":       h.opts.Flow.Definition.Name,
-		"builtin":    h.opts.Flow.Definition.Builtin,
-		"upstream":   h.opts.Flow.Definition.Upstream,
-		"revision":   h.revision(),
-		"mode":       entry.Mode,
-		"projects":   entry.Projects,
-		"updated_at": entry.UpdatedAt,
-		"updated_by": entry.UpdatedBy,
-		"definition": json.RawMessage(h.opts.Definition),
+		"id":           h.opts.Flow.Definition.ID,
+		"name":         h.opts.Flow.Definition.Name,
+		"builtin":      h.opts.Flow.Definition.Builtin,
+		"upstream":     h.opts.Flow.Definition.Upstream,
+		"revision":     h.revision(),
+		"mode":         entry.Mode,
+		"projects":     entry.Projects,
+		"updated_at":   entry.UpdatedAt,
+		"updated_by":   entry.UpdatedBy,
+		"on_available": h.opts.OnAvailable,
+		"definition":   json.RawMessage(h.opts.Definition),
 	})
 }
 
@@ -147,8 +151,10 @@ func (h *Handler) deploy(w http.ResponseWriter, r *http.Request) {
 	switch request.Mode {
 	case mode.Off, mode.Shadow:
 	case mode.On:
-		writeError(w, http.StatusConflict, "on needs the task service (M3-1); use off or shadow")
-		return
+		if !h.opts.OnAvailable {
+			writeError(w, http.StatusConflict, "on needs FLOWHUB_DISPATCH=1 and the task service; use off or shadow")
+			return
+		}
 	default:
 		writeError(w, http.StatusBadRequest, "mode must be off or shadow")
 		return
@@ -302,17 +308,18 @@ func (h *Handler) flowSummary(last *engine.Run) map[string]any {
 	}
 	entry := h.entry()
 	summary := map[string]any{
-		"id":         h.opts.Flow.Definition.ID,
-		"name":       h.opts.Flow.Definition.Name,
-		"builtin":    h.opts.Flow.Definition.Builtin,
-		"upstream":   h.opts.Flow.Definition.Upstream,
-		"revision":   h.revision(),
-		"mode":       entry.Mode,
-		"projects":   entry.Projects,
-		"updated_at": entry.UpdatedAt,
-		"updated_by": entry.UpdatedBy,
-		"triggers":   triggers,
-		"last_run":   nil,
+		"id":           h.opts.Flow.Definition.ID,
+		"name":         h.opts.Flow.Definition.Name,
+		"builtin":      h.opts.Flow.Definition.Builtin,
+		"upstream":     h.opts.Flow.Definition.Upstream,
+		"revision":     h.revision(),
+		"mode":         entry.Mode,
+		"projects":     entry.Projects,
+		"updated_at":   entry.UpdatedAt,
+		"updated_by":   entry.UpdatedBy,
+		"on_available": h.opts.OnAvailable,
+		"triggers":     triggers,
+		"last_run":     nil,
 	}
 	if last != nil {
 		summary["last_run"] = runSummary(last)

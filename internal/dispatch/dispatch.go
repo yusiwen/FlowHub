@@ -88,6 +88,10 @@ type Options struct {
 	// Capacity is the shared per-runtime turn gate. Nil means the dispatcher
 	// creates a private one; the flow engine passes the same instance.
 	Capacity *runner.Capacity
+	// Skip, when set, asks whether another orchestrator owns this delivery. It runs
+	// before the queue: a project moved to an `on` flow must not also be dispatched.
+	// The reason is logged; a skipped delivery is never handled or audited as work.
+	Skip func(*store.Record) (bool, string)
 }
 
 // DeclaredRuntime is a runtime the configuration file declares: where it is, and the
@@ -152,6 +156,14 @@ type Dispatcher struct {
 	// capacity counts and bounds turns per runtime; the selection policy and
 	// /healthz read the same counters, and the flow engine shares the gate.
 	capacity *runner.Capacity
+
+	// taskMu guards taskLocks, the per-task lease shared with the flow engine's
+	// task service. The scheduler already keeps one dispatch turn per task, but a
+	// deployment switch can put a flow turn and a dispatch turn for the same task
+	// in flight at once; the lease is what makes "one session, one turn" survive
+	// the switch.
+	taskMu    sync.Mutex
+	taskLocks map[string]*sync.Mutex
 }
 
 // New builds a dispatcher. It does not start working until Run is called.
@@ -204,6 +216,7 @@ func New(opts Options) (*Dispatcher, error) {
 		schedulers: map[string]*runtimeScheduler{},
 		routes:     map[taskID]runtimeBinding{},
 		lastError:  map[string]string{},
+		taskLocks:  map[string]*sync.Mutex{},
 	}, nil
 }
 
@@ -217,6 +230,14 @@ func New(opts Options) (*Dispatcher, error) {
 func (d *Dispatcher) Dispatch(rec *store.Record) {
 	if d == nil || rec == nil || !rec.Accepted {
 		return
+	}
+	if d.opts.Skip != nil {
+		if skip, reason := d.opts.Skip(rec); skip {
+			d.ignored.Add(1)
+			d.log.Info("dispatch skipped; a flow owns the project",
+				"issue", rec.IssueID, "project", rec.ProjectKey, "reason", reason)
+			return
+		}
 	}
 	select {
 	case d.queue <- rec:
@@ -348,6 +369,18 @@ func (d *Dispatcher) runtimeSnapshot() map[string]map[string]any {
 // enterTurn records that a turn is running on a runtime and returns the function
 // that clears it. The spread policy ranks by these counters, so with one worker
 // per runtime (ADR 0001 step 5) they say which host is busy right now.
+func (d *Dispatcher) taskLock(rec *store.Record) *sync.Mutex {
+	key := d.opts.Source.Name() + "\x00" + rec.IssueID
+	d.taskMu.Lock()
+	defer d.taskMu.Unlock()
+	if lock, ok := d.taskLocks[key]; ok {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	d.taskLocks[key] = lock
+	return lock
+}
+
 func (d *Dispatcher) enterTurn(ctx context.Context, runtime string) func() {
 	if runtime == "" {
 		return func() {}
@@ -598,6 +631,14 @@ func (d *Dispatcher) clearRuntimeError(name string) {
 // what previous turns recorded.
 func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 	rec, binding := item.record, item.binding
+	if d.opts.Skip != nil {
+		if skip, reason := d.opts.Skip(rec); skip {
+			d.ignored.Add(1)
+			d.log.Info("dispatch skipped before the turn; a flow owns the project",
+				"issue", rec.IssueID, "project", rec.ProjectKey, "reason", reason)
+			return
+		}
+	}
 	if d.Paused() {
 		d.ignored.Add(1)
 		d.log.Warn("dispatch is paused; delivery ignored",
@@ -686,7 +727,8 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		return
 	}
 
-	task, err = d.ensureTask(ctx, rec, match.Entry, task, known, binding)
+	agentName := runtimeAgent(match.Entry, binding, d.opts.Agent)
+	task, err = d.ensureTask(ctx, rec, match.Entry, task, known, binding, agentName)
 	if err != nil {
 		d.failPreparation(rec, binding, err)
 		return
@@ -707,7 +749,10 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 
 // ensureTask creates the registry row and the worktree if they do not exist yet,
 // and refuses to continue when the mapping changed under a running task.
-func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *projectmap.Entry, task registry.Task, known bool, binding runtimeBinding) (registry.Task, error) {
+func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *projectmap.Entry, task registry.Task, known bool, binding runtimeBinding, agentName string) (registry.Task, error) {
+	lease := d.taskLock(rec)
+	lease.Lock()
+	defer lease.Unlock()
 	if known && task.Repo != "" && task.Repo != entry.Repo.Path {
 		return registry.Task{}, fmt.Errorf("task %s is bound to %s but the mapping now points at %s; refusing to reuse the session",
 			rec.IssueID, task.Repo, entry.Repo.Path)
@@ -717,7 +762,7 @@ func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *p
 		created, _, err := d.opts.Registry.Ensure(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
 			t.Repo = entry.Repo.Path
 			t.Runtime = binding.Name
-			t.Agent = runtimeAgent(entry, binding, d.opts.Agent)
+			t.Agent = agentName
 			t.State = registry.StateAnalyzing
 			t.Plan = registry.PlanNone
 		})
@@ -857,8 +902,25 @@ func (d *Dispatcher) prepareLock(repo string) *sync.Mutex {
 	return d.workspaces.Lock(repo)
 }
 
+// turnOutcome is the part of a turn the flow engine needs to expose as a step
+// output. It is internal; the task service adapter maps it to tasks.TurnResult.
+type turnOutcome struct {
+	SessionID string
+	Text      string
+	Finished  bool
+	TimedOut  bool
+	Replied   bool
+	Cost      float64
+	Tokens    agent.Tokens
+	Refusals  []registry.Refusal
+	Action    rules.Action
+}
+
 // runTurn delivers one prompt and records what came back.
-func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery event.Event, task registry.Task, match projectmap.Match, decision rules.Decision, binding runtimeBinding) {
+func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery event.Event, task registry.Task, match projectmap.Match, decision rules.Decision, binding runtimeBinding) turnOutcome {
+	lease := d.taskLock(rec)
+	lease.Lock()
+	defer lease.Unlock()
 	phase := agent.PhaseAnalysis
 	if decision.Action == rules.ActionExecute {
 		phase = agent.PhaseExecution
@@ -894,7 +956,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	prompt := d.opts.Source.Prompt(decision.Action, &delivery, promptCtx)
 	if prompt == "" {
 		d.log.Error("no prompt was built for the action", "action", decision.Action, "issue", rec.IssueID)
-		return
+		return turnOutcome{Action: decision.Action}
 	}
 
 	// The routing entry owns the agent when it names one: which agent runs is a
@@ -1047,6 +1109,17 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		plan = registry.PlanDraft
 	}
 
+	outcome := turnOutcome{
+		SessionID: result.SessionID,
+		Text:      result.Text,
+		Finished:  result.Finished,
+		TimedOut:  result.TimedOut,
+		Replied:   replied,
+		Cost:      result.Cost,
+		Tokens:    result.Tokens,
+		Refusals:  refusedCommands(result.Permissions),
+		Action:    decision.Action,
+	}
 	if _, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
 		if result.SessionID != "" {
 			t.SessionID = result.SessionID
@@ -1086,6 +1159,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	}); err != nil {
 		d.log.Error("cannot record the turn in the registry", "issue", rec.IssueID, "error", err)
 	}
+	return outcome
 }
 
 // anyToolCompleted reports whether the turn called one of the source's reply

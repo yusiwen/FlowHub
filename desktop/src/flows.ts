@@ -268,6 +268,9 @@ export function renderInspector(
     row(container, "mode", flow.mode);
     row(container, "projects", flow.projects?.join(", ") || "all");
     row(container, "updated", flow.updated_by ? `${flow.updated_by} · ${relativeTime(flow.updated_at ?? null)}` : "—");
+    if (flow.mode === "on" && flow.on_available === false) {
+      row(container, "execution", "unavailable (no task service)");
+    }
     row(container, "revision", flow.revision.slice(0, 12), true);
     row(container, "upstream", flow.upstream);
     row(container, "nodes", definition ? String(definition.nodes.length) : "—");
