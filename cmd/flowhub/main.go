@@ -40,6 +40,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/provision"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
+	"github.com/yusiwen/flowhub/internal/runner"
 	"github.com/yusiwen/flowhub/internal/runtimes"
 	"github.com/yusiwen/flowhub/internal/source"
 	"github.com/yusiwen/flowhub/internal/source/youtrack"
@@ -329,9 +330,13 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	}
 	defer func() { _ = events.Close() }()
 
+	// One capacity gate is shared by dispatch and, when it lands, the flow engine:
+	// a runtime's breadth must bound both, not each in its own world.
+	capacity := runner.NewCapacity()
+
 	// The dispatcher is built before the handler so that a delivery can never be
 	// accepted before there is something to hand it to.
-	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger)
+	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger, capacity)
 	if err != nil {
 		return err
 	}
@@ -818,7 +823,7 @@ func startControlAPI(ctx context.Context, cfg config.Config, projects *projectma
 //
 // The returned channel closes when the worker has stopped, so shutdown can wait
 // for an in-flight turn instead of killing the process under it.
-func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger) (*dispatch.Dispatcher, <-chan struct{}, error) {
+func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger, capacity *runner.Capacity) (*dispatch.Dispatcher, <-chan struct{}, error) {
 	if !cfg.Dispatch {
 		return nil, nil, nil
 	}
@@ -888,6 +893,7 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 		FirstResponse:  cfg.FirstResponse,
 		QueueSize:      cfg.DispatchQueueSize,
 		PauseFile:      cfg.ResolvedPauseFile(),
+		Capacity:       capacity,
 		MaxCostPerTask: cfg.TaskMaxCost,
 	})
 	if err != nil {

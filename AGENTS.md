@@ -119,6 +119,7 @@ internal/workspace/   the workspace seam: Workspace, Handle, Base, Validator
 internal/workspace/localworktree/  one git worktree per task, baseline pinned through the origin
 internal/rules/     trigger policy over the neutral event (ignore/analyze/plan/execute) and the reply basis
 internal/dispatch/  the worker: intake loop, one task scheduler per runtime, routing, workspace hand-off, session, registry, audit
+internal/runner/    the shared turn core: Host/Turn, workspace-provider cache and per-repository locks, per-runtime capacity
 internal/provision/ data-plane host prep: `flowhub runtime init [--check]`, `doctor --push`, `uninstall` (capability report, embedded artifacts, manifest, runtime identity, heartbeat)
 internal/runtimes/  control plane: runtime inventory, states, invites, secrets (hashes only), `/control/v1` admin API and the `invite`/`list`/`show`/`remove`/`rotate` CLI
 internal/dedupe/    TTL idempotency cache
