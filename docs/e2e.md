@@ -137,7 +137,8 @@ the Make targets are only wrappers around the suite.
 | real dispatch analysis turn + session + comment | `TestIssueCreatedRunsOneDispatchTurn` | `make e2e-turn` |
 | shadow comparison | `TestShadowComparisonOnIssueUpdate` | `make e2e-flow`, `make e2e-live-flow` |
 | `on` execution + rollback | `TestOnExecutesAndRollsBack` | `make e2e-flow`, `make e2e-live-flow` |
-| full live analyze -> plan -> execute | `TestLiveFullJourney` | `make e2e-live-journey` |
+| full live analyze -> plan -> execute (dispatch) | `TestLiveFullJourney` | `make e2e-live-journey` |
+| full live analyze -> plan -> execute (`on`) | `TestOnLiveFullJourney` | `make e2e-live-on-journey` |
 | `/opencode start` plan | `TestCommentTriggerStartsAPlan` | `make e2e-comments` |
 | duplicate webhook | `TestDuplicateWebhookIsIdempotent` | `make e2e` |
 | pause | `TestPauseDoesNotDispatch` | `make e2e` |
@@ -149,7 +150,8 @@ the Make targets are only wrappers around the suite.
 | cleanup test issues/temp dirs | `TestCleanupTestResources` | `make e2e-clean` |
 
 `make e2e-all` runs every non-permit opt-in scenario in direct mode in one process.
-`make e2e-live-journey` runs only the full live operator journey.
+`make e2e-live-journey` runs the full live journey with dispatch;
+`make e2e-live-on-journey` runs the same journey with the flow in `on` mode.
 `make e2e-live-permit` runs the permit/revoke test against live webhooks.
 `make e2e-clean` deletes only issues with this suite's summary prefixes and removes
 its temp dirs; it never deletes `E2E_ISSUE`.

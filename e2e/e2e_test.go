@@ -1024,12 +1024,37 @@ func TestLiveFullJourney(t *testing.T) {
 	if os.Getenv("E2E_LIVE_JOURNEY") != "1" {
 		t.Skip("set E2E_LIVE_JOURNEY=1 to run the full live journey")
 	}
+	runJourney(t, false)
+}
+
+func TestOnLiveFullJourney(t *testing.T) {
+	if os.Getenv("E2E_ON_JOURNEY") != "1" {
+		t.Skip("set E2E_ON_JOURNEY=1 to run the on-mode live journey")
+	}
+	runJourney(t, true)
+}
+
+func runJourney(t *testing.T, on bool) {
+	t.Helper()
 	if !suite.live {
 		t.Skip("the full journey requires live webhook delivery")
 	}
-	if err := suite.setMode("off", nil); err != nil {
-		t.Fatalf("set off: %v", err)
+	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	modeName := "off"
+	if on {
+		modeName = "on"
 	}
+	if err := suite.setMode(modeName, func() []string {
+		if on {
+			return []string{suite.ytProject}
+		}
+		return nil
+	}()); err != nil {
+		t.Fatalf("set %s: %v", modeName, err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	beforeFlow := suite.flowHealth(t)
+	beforeDispatch := suite.dispatchHandled(t)
 	marker := "E2E-JOURNEY-" + time.Now().UTC().Format("20060102T150405")
 	summary := "FlowHub live journey " + marker
 	description := fmt.Sprintf("Add one line to README.md containing exactly `%s`. Do not change any other file. Commit the change in the task worktree.", marker)
@@ -1051,11 +1076,9 @@ func TestLiveFullJourney(t *testing.T) {
 
 	// 2. The first /opencode start must plan, not execute.
 	beforeComments := suite.commentCount(t, key)
-	planComment, err := suite.addComment(key, "/opencode start")
-	if err != nil {
+	if _, err := suite.addComment(key, "/opencode start"); err != nil {
 		t.Fatalf("plan comment: %v", err)
 	}
-	_ = planComment
 	suite.waitForRegistry(t, key, func(row taskRow) bool {
 		return row.Plan == "draft" && row.Turns == 2 && row.Session == session
 	}, 6*time.Minute)
@@ -1079,8 +1102,19 @@ func TestLiveFullJourney(t *testing.T) {
 		t.Fatalf("worktree changed: planned=%q executed=%q", planned.Worktree, executed.Worktree)
 	}
 	suite.waitForFileContains(t, filepath.Join(executed.Worktree, "README.md"), marker, 2*time.Minute)
-}
 
+	if on {
+		suite.waitForFlowHealth(t, func(f flowHealth) bool {
+			return f.Mode == "on" && f.Runs >= beforeFlow.Runs+3
+		}, 30*time.Second)
+		if !suite.hasRunMode(t, "on") {
+			t.Fatal("no on run appeared in /hub/v1/runs")
+		}
+		if after := suite.dispatchHandled(t); after != beforeDispatch {
+			t.Fatalf("dispatch handled a delivery while the flow owned the project: before=%v after=%v", beforeDispatch, after)
+		}
+	}
+}
 func (e *env) lastTaskRowOrFail(t *testing.T, key string) taskRow {
 	t.Helper()
 	row, ok := e.lastTaskRow(key)
