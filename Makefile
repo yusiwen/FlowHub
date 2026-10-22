@@ -26,7 +26,7 @@ PLATFORM_LIST = \
 	linux-arm64 \
 	darwin-arm64
 
-.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart e2e-permit e2e-crash lint staticcheck \
+.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-live e2e-live-flow e2e-all e2e-turn e2e-flow e2e-comments e2e-soak e2e-restart e2e-permit e2e-crash lint staticcheck \
 	fmt fmt-check smoke clean all releases \
 	desktop-install desktop-dev desktop-app desktop-build desktop-check desktop-clean
 
@@ -72,6 +72,20 @@ FLOWHUB_E2E_ENV ?= /tmp/flowhub-e2e.env
 e2e: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 go test -tags=e2e ./e2e -count=1 -v
+
+# Every non-permit opt-in scenario in one direct-mode run (100-event soak).
+# The permit test is separate because it installs a prompt file for its turn.
+e2e-all: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 E2E_TURN=1 E2E_FLOW=1 E2E_COMMENT=1 E2E_RESTART=1 E2E_CRASH=1 \
+		E2E_SOAK=$${E2E_SOAK:-100} go test -tags=e2e ./e2e -count=1 -v
+
+# Live webhook + shadow + on/rollback; requires E2E_ADDR and no real receiver.
+e2e-live-flow: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 FLOWHUB_E2E_LIVE=1 E2E_FLOW=1 \
+		E2E_ADDR=$${E2E_ADDR:?set E2E_ADDR to the webhook target} \
+		go test -tags=e2e ./e2e -count=1 -v
 
 # Requires the test FlowHub to own the address the YouTrack app posts to; set
 # E2E_ADDR to that address and stop any real receiver on that port first.
