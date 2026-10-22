@@ -79,6 +79,12 @@ state survive):
 make e2e-restart
 ```
 
+Permit/revoke (real refusal, `/opencode permit`, continuation, `/opencode revoke`):
+
+```bash
+make e2e-permit
+```
+
 `E2E_ISSUE` is the existing issue used by the `issueUpdated` webhook test; the
 turn and comment tests create fresh issues in `YOUTRACK_PROJECT`.
 
@@ -105,6 +111,8 @@ Do not point the production YouTrack webhook app at a test instance.
 - duplicate webhook suppression, pause, and a direct shadow soak (queue drops and
   mismatches asserted);
 - restart: the shadow mode and compare counters survive a process restart, and a
-  new update still compares.
+  new update still compares;
+- permit/revoke: the agent is refused for an exact command, `/opencode permit`
+  grants it and runs the continuation, then `/opencode revoke` clears the grant.
 
-The next scenarios (permit/revoke and a larger/longer soak) are tracked in #119.
+The next scenarios (crash recovery and a larger/longer soak) are tracked in #119.
