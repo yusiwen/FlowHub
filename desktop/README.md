@@ -46,6 +46,9 @@ it is not a required check for a Go-only pull request.
 | `src-tauri/src/auth.rs` | dsh launch-token parsing, the token URL, and the authority-hashed cookie name |
 | `src-tauri/src/health.rs` | reachability probes and the `ok` / `auth` / `http` / `unreachable` classes |
 | `src-tauri/src/hub.rs` | read-only `/healthz` client and the log tail behind the Hub dashboard |
+| `src-tauri/src/hub_api.rs` | read-only `/hub/v1` client: URL prefix, bearer token, resource-id validation |
+| `src-tauri/src/token_store.rs` | the Hub token in the macOS Keychain; never in `instances.json` |
+| `src/flows.ts` | the read-only flow graph layout/renderer, run list and step chain |
 | `src-tauri/src/prefs.rs` | local preferences: the confirmed log path per Hub |
 | `src-tauri/src/menu.rs` | macOS menu, accelerators, and the window-close lifecycle |
 | `src-tauri/capabilities/shell.json` | IPC grant for the `shell` webview only |
@@ -104,6 +107,23 @@ Switching back shows the page again without a reload.
 The dashboard is read-only and unauthenticated. It does not call the control API
 and stores no admin token. `/healthz` lives on the webhook listener, which nginx
 never proxies, so a remote hub must expose that listener (or go through a tunnel).
+
+### Flows
+
+The Hub tab has a `Dashboard | Flows` sub-navigation. Flows is read-only and
+fetched through Rust from `/hub/v1`: the flow header (mode, revision, trigger), an
+SVG DAG laid out in columns, an inspector (flow overview by default; node config,
+status, timing and output on selection), and the run list with the selected run's
+step chain. A shadow run renders `task.turn` as skipped and dims the edges the
+branch did not take. There are no buttons that change the deployment.
+
+The API needs `FLOWHUB_HUB_TOKEN`. A loopback Hub falls back to
+`~/.config/flowhub/.env` (or `<data_dir>/.env`); a token pasted in the page goes
+into the macOS Keychain under the instance id, never into `instances.json`,
+`session.json` or the logs. `401`/`403` reopens the token panel; `503` says the
+service has no API token. The overview polls every 5 s while the sub-page is
+visible, and a non-terminal selected run every 2 s. A failed read keeps the last
+snapshot and shows its age; the page never invents a connected state.
 
 The Logs card reads the service's `app_log`. A loopback Hub (`127.0.0.0/8`, `::1`,
 `localhost`) is trusted to name its own file because it runs on this machine as

@@ -5,7 +5,11 @@ import {
   activateTab,
   addInstance,
   closeTab,
+  hubFlow,
+  hubFlows,
   hubLogs,
+  hubRun,
+  hubRuns,
   hubSnapshot,
   listHealth,
   listInstances,
@@ -29,15 +33,29 @@ import {
   reorderInstances,
   setContentVisible,
   setHubLogPath,
+  setHubToken,
   setSidebarVisible,
   setStageBounds,
   submitToken,
   updateInstance,
 } from "./ipc";
+import {
+  layoutFlow,
+  relativeTime,
+  renderGraph,
+  renderInspector,
+  renderRunList,
+  renderStepChain,
+} from "./flows";
 import { roleOf } from "./types";
 import type {
+  FlowRun,
   HealthReport,
+  HubFlowDefinitionResponse,
+  HubFlowSummary,
   HubLogs,
+  HubRunSummary,
+  HubRunsResponse,
   HubSnapshot,
   Instance,
   Role,
@@ -72,10 +90,15 @@ app.innerHTML = `
               <button type="button" class="ghost-button" id="hub-refresh">Refresh</button>
             </div>
           </header>
+          <nav class="hub-subnav" id="hub-subnav">
+            <button type="button" data-page="dashboard" class="active">Dashboard</button>
+            <button type="button" data-page="flows">Flows</button>
+          </nav>
           <p class="hub-warning" id="hub-warning" hidden></p>
           <p class="hub-error" id="hub-error" role="alert" hidden></p>
-          <div class="hub-grid" id="hub-cards"></div>
-          <section class="hub-card hub-logs" id="hub-logs">
+          <div id="hub-dashboard">
+            <div class="hub-grid" id="hub-cards"></div>
+            <section class="hub-card hub-logs" id="hub-logs">
             <h3>Logs</h3>
             <p class="hub-log-path" id="hub-log-path"></p>
             <p class="hub-log-state" id="hub-log-state"></p>
@@ -86,6 +109,40 @@ app.innerHTML = `
               <button type="button" class="ghost-button" id="hub-log-use" hidden>Use service path</button>
               <button type="button" class="ghost-button" id="hub-log-refresh">Refresh</button>
             </div>
+            </section>
+          </div>
+          <section class="hub-flows" id="hub-flows" hidden>
+            <p class="hub-error" id="flows-error" role="alert" hidden></p>
+            <header class="flow-head">
+              <div class="flow-head-identity">
+                <h3 id="flow-name">No flow</h3>
+                <p id="flow-sub" class="flow-sub"></p>
+              </div>
+              <div class="flow-badges" id="flow-badges"></div>
+            </header>
+            <div class="flow-layout">
+              <div class="flow-graph-wrap">
+                <svg id="flow-graph" class="flow-graph" aria-label="Flow graph"></svg>
+              </div>
+              <aside class="flow-inspector" id="flow-inspector"></aside>
+            </div>
+            <section class="flow-runs-section">
+              <header class="flow-runs-head">
+                <h3>Runs</h3>
+                <span class="flow-muted" id="flow-runs-meta"></span>
+              </header>
+              <div class="flow-runs" id="flow-runs"></div>
+              <div class="flow-steps" id="flow-steps"></div>
+            </section>
+            <section class="flow-token" id="flow-token" hidden>
+              <h3>Hub API token</h3>
+              <p class="flow-muted">This remote Hub needs its <code>FLOWHUB_HUB_TOKEN</code>. The value is stored in the macOS Keychain, never in the instance registry.</p>
+              <form id="flow-token-form">
+                <input id="flow-token-input" type="password" autocomplete="off" spellcheck="false" placeholder="FLOWHUB_HUB_TOKEN" />
+                <button type="submit" class="ghost-button" id="flow-token-save">Connect</button>
+              </form>
+              <p class="flow-error" id="flow-token-error" hidden></p>
+            </section>
           </section>
         </section>
         <div class="auth-panel" id="auth-panel" hidden>
@@ -127,6 +184,22 @@ const hubStatus = document.querySelector<HTMLElement>("#hub-status")!;
 const hubWarning = document.querySelector<HTMLElement>("#hub-warning")!;
 const hubError = document.querySelector<HTMLElement>("#hub-error")!;
 const hubCards = document.querySelector<HTMLElement>("#hub-cards")!;
+const hubSubnav = document.querySelector<HTMLElement>("#hub-subnav")!;
+const hubDashboard = document.querySelector<HTMLElement>("#hub-dashboard")!;
+const hubFlowsEl = document.querySelector<HTMLElement>("#hub-flows")!;
+const flowName = document.querySelector<HTMLElement>("#flow-name")!;
+const flowSub = document.querySelector<HTMLElement>("#flow-sub")!;
+const flowBadges = document.querySelector<HTMLElement>("#flow-badges")!;
+const flowGraph = document.querySelector<SVGSVGElement>("#flow-graph")!;
+const flowInspector = document.querySelector<HTMLElement>("#flow-inspector")!;
+const flowRunsEl = document.querySelector<HTMLElement>("#flow-runs")!;
+const flowRunsMeta = document.querySelector<HTMLElement>("#flow-runs-meta")!;
+const flowSteps = document.querySelector<HTMLElement>("#flow-steps")!;
+const flowsError = document.querySelector<HTMLElement>("#flows-error")!;
+const flowTokenPanel = document.querySelector<HTMLElement>("#flow-token")!;
+const flowTokenForm = document.querySelector<HTMLFormElement>("#flow-token-form")!;
+const flowTokenInput = document.querySelector<HTMLInputElement>("#flow-token-input")!;
+const flowTokenError = document.querySelector<HTMLElement>("#flow-token-error")!;
 const hubRefresh = document.querySelector<HTMLButtonElement>("#hub-refresh")!;
 const hubLogPath = document.querySelector<HTMLElement>("#hub-log-path")!;
 const hubLogState = document.querySelector<HTMLElement>("#hub-log-state")!;
@@ -154,6 +227,22 @@ let hubTimer: number | null = null;
 let hubLogsValue: HubLogs | null = null;
 let hubLogsError: string | null = null;
 let hubLogsRequest = 0;
+
+type HubPage = "dashboard" | "flows";
+let hubPage: HubPage = "dashboard";
+let flowSummary: HubFlowSummary | null = null;
+let flowDefinition: HubFlowDefinitionResponse | null = null;
+let flowRunsValue: HubRunsResponse | null = null;
+let flowRunValue: FlowRun | null = null;
+let flowSelectedRun: string | null = null;
+let flowSelectedNode: string | null = null;
+let flowError: string | null = null;
+let flowUpdatedAt = 0;
+let flowLoading = false;
+let flowRequest = 0;
+let flowRunRequest = 0;
+let flowTimer: number | null = null;
+let flowRunTimer: number | null = null;
 
 function showError(error: unknown): void {
   errorBar.textContent = error instanceof Error ? error.message : String(error);
@@ -510,12 +599,65 @@ void onScopeSelect((next) => {
 });
 
 void onHubReload(() => {
-  void fetchHub();
+  if (hubPage === "flows") {
+    void refreshFlows();
+  } else {
+    void fetchHub();
+  }
 });
 
 hubRefresh.addEventListener("click", () => {
+  if (hubPage === "flows") {
+    flowTokenError.hidden = true;
+    void refreshFlows();
+    return;
+  }
   void fetchHub();
   void fetchHubLogs();
+});
+
+for (const button of hubSubnav.querySelectorAll<HTMLButtonElement>("button[data-page]")) {
+  button.addEventListener("click", () => {
+    const page = button.dataset.page;
+    if (page === "dashboard" || page === "flows") selectHubPage(page);
+  });
+}
+
+flowTokenForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const id = hubTabId;
+  const value = flowTokenInput.value.trim();
+  if (id === null) return;
+  if (value === "") {
+    flowTokenError.textContent = "Paste the FLOWHUB_HUB_TOKEN configured on the service.";
+    flowTokenError.hidden = false;
+    return;
+  }
+  void (async () => {
+    try {
+      await setHubToken(id, value);
+      flowTokenInput.value = "";
+      flowTokenError.hidden = true;
+      await refreshFlows();
+    } catch (error) {
+      flowTokenError.textContent =
+        error instanceof Error ? error.message : String(error);
+      flowTokenError.hidden = false;
+    }
+  })();
+});
+
+flowTokenInput.addEventListener("keydown", (event) => {
+  // Do not let the Enter that confirms an IME candidate submit the token form.
+  if (event.key === "Enter" && event.isComposing) {
+    event.preventDefault();
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && hubPage === "flows" && flowSelectedNode !== null) {
+    selectNode(null);
+  }
 });
 
 hubLogSave.addEventListener("click", () => {
@@ -826,11 +968,272 @@ function renderHub(): void {
     hubCards.append(card.card);
   }
 
+  const flows = snapshot.flows;
+  if (flows !== null && flows !== undefined) {
+    const card = hubCard("Flows");
+    hubRow(card.body, "Enabled", flows.enabled === false ? "no" : "yes");
+    hubRow(card.body, "Mode", flows.mode || "—");
+    hubRow(card.body, "Definitions", hubNumber(flows.definitions));
+    hubRow(card.body, "Runs", hubNumber(flows.runs));
+    hubRow(card.body, "Waiting", hubNumber(flows.waiting));
+    hubRow(card.body, "Needs attention", hubNumber(flows.needs_attention));
+    if (flows.state_error) hubRow(card.body, "State error", flows.state_error);
+    hubCards.append(card.card);
+  }
+
   const paths = hubCard("Paths");
   hubPathRow(paths.body, "Audit", snapshot.audit_file);
   hubPathRow(paths.body, "Payload log", snapshot.payload_log);
   hubPathRow(paths.body, "App log", snapshot.app_log);
   hubCards.append(paths.card);
+}
+
+
+function resetFlowState(): void {
+  flowRequest += 1;
+  flowRunRequest += 1;
+  flowSummary = null;
+  flowDefinition = null;
+  flowRunsValue = null;
+  flowRunValue = null;
+  flowSelectedRun = null;
+  flowSelectedNode = null;
+  flowError = null;
+  flowUpdatedAt = 0;
+  flowLoading = false;
+  flowTokenPanel.hidden = true;
+  flowTokenInput.value = "";
+  flowTokenError.hidden = true;
+  stopFlowTimer();
+  stopRunTimer();
+  renderFlows();
+}
+
+function selectHubPage(page: HubPage): void {
+  if (hubPage === page) {
+    if (page === "flows") void refreshFlows();
+    return;
+  }
+  hubPage = page;
+  for (const button of hubSubnav.querySelectorAll<HTMLButtonElement>("button[data-page]")) {
+    button.classList.toggle("active", button.dataset.page === page);
+  }
+  hubDashboard.hidden = page !== "dashboard";
+  hubFlowsEl.hidden = page !== "flows";
+  if (page === "flows") {
+    startFlowTimer();
+    void refreshFlows();
+  } else {
+    stopFlowTimer();
+    stopRunTimer();
+    void fetchHub();
+    void fetchHubLogs();
+  }
+}
+
+function startFlowTimer(): void {
+  if (flowTimer !== null) return;
+  flowTimer = window.setInterval(() => {
+    if (hubPage === "flows") void refreshFlows();
+  }, 5000);
+}
+
+function stopFlowTimer(): void {
+  if (flowTimer === null) return;
+  window.clearInterval(flowTimer);
+  flowTimer = null;
+}
+
+function startRunTimer(): void {
+  if (flowRunTimer !== null) return;
+  flowRunTimer = window.setInterval(() => {
+    void refreshSelectedRun();
+  }, 2000);
+}
+
+function stopRunTimer(): void {
+  if (flowRunTimer === null) return;
+  window.clearInterval(flowRunTimer);
+  flowRunTimer = null;
+}
+
+function needsToken(message: string): boolean {
+  return /token|401|403/i.test(message);
+}
+
+async function refreshFlows(): Promise<void> {
+  const id = hubTabId;
+  if (id === null) return;
+  const sequence = ++flowRequest;
+  flowLoading = true;
+  try {
+    const response = await hubFlows(
+      id,
+      null,
+      hubSnapshotValue?.data_dir ?? null,
+    );
+    if (sequence !== flowRequest || hubTabId !== id) return;
+    flowSummary = response.flows[0] ?? null;
+    flowError = null;
+    flowUpdatedAt = Date.now();
+    if (flowSummary !== null) {
+      const dataDir = hubSnapshotValue?.data_dir ?? null;
+      const [definition, runs] = await Promise.all([
+        hubFlow(id, flowSummary.id, null, dataDir),
+        hubRuns(id, null, dataDir, null, 50),
+      ]);
+      if (sequence !== flowRequest || hubTabId !== id) return;
+      flowDefinition = definition;
+      flowRunsValue = runs;
+      const known = runs.runs.some((run) => run.id === flowSelectedRun);
+      if (!known) {
+        flowSelectedRun =
+          flowSummary.last_run?.id ?? runs.runs[0]?.id ?? null;
+        flowSelectedNode = null;
+      }
+      if (flowSelectedRun !== null) {
+        await refreshSelectedRun();
+      }
+    }
+    renderFlows();
+  } catch (error) {
+    if (sequence !== flowRequest || hubTabId !== id) return;
+    const message = error instanceof Error ? error.message : String(error);
+    flowError = message;
+    flowTokenPanel.hidden = !needsToken(message);
+    flowTokenError.hidden = true;
+    if (flowSummary === null) {
+      flowName.textContent = "No flow";
+      flowSub.textContent = "";
+      flowBadges.replaceChildren();
+      flowGraph.replaceChildren();
+      flowInspector.replaceChildren();
+      flowRunsEl.replaceChildren();
+      flowSteps.replaceChildren();
+    }
+    renderFlows();
+  } finally {
+    if (sequence === flowRequest) flowLoading = false;
+  }
+}
+
+async function refreshSelectedRun(): Promise<void> {
+  const id = hubTabId;
+  const runId = flowSelectedRun;
+  if (id === null || runId === null) return;
+  const sequence = ++flowRunRequest;
+  try {
+    const response = await hubRun(
+      id,
+      runId,
+      null,
+      hubSnapshotValue?.data_dir ?? null,
+    );
+    if (sequence !== flowRunRequest || hubTabId !== id || flowSelectedRun !== runId) {
+      return;
+    }
+    flowRunValue = response.run;
+    if (
+      flowRunValue.state === "running" ||
+      flowRunValue.state === "queued" ||
+      flowRunValue.state === "waiting"
+    ) {
+      startRunTimer();
+    } else {
+      stopRunTimer();
+    }
+    renderFlows();
+  } catch (error) {
+    if (sequence !== flowRunRequest || hubTabId !== id || flowSelectedRun !== runId) {
+      return;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    flowError = message;
+    if (needsToken(message)) flowTokenPanel.hidden = false;
+    renderFlows();
+  }
+}
+
+function selectRun(id: string): void {
+  if (flowSelectedRun === id) return;
+  flowSelectedRun = id;
+  flowSelectedNode = null;
+  flowRunValue = null;
+  stopRunTimer();
+  void refreshSelectedRun();
+  renderFlows();
+}
+
+function selectNode(id: string | null): void {
+  flowSelectedNode = id;
+  renderFlows();
+}
+
+function renderFlows(): void {
+  if (hubPage !== "flows") return;
+  flowsError.hidden = flowError === null;
+  flowsError.textContent = flowError ?? "";
+  flowTokenPanel.hidden =
+    flowError === null || !needsToken(flowError);
+  flowBadges.replaceChildren();
+  if (flowSummary === null) {
+    flowName.textContent = "No flow";
+    flowSub.textContent = "";
+    flowGraph.replaceChildren();
+    flowInspector.replaceChildren();
+    flowRunsEl.replaceChildren();
+    flowSteps.replaceChildren();
+    flowRunsMeta.textContent = "";
+    return;
+  }
+  flowName.textContent = flowSummary.name;
+  const trigger = flowSummary.triggers
+    .map((item) => (item.event === "*" ? "all events" : item.event))
+    .join(", ");
+  flowSub.textContent = `${flowSummary.upstream} · ${trigger} · ${
+    flowSummary.mode === "shadow"
+      ? "shadow: decisions only, no agent turns"
+      : flowSummary.mode === "off"
+        ? "flow off"
+        : flowSummary.mode
+  }${flowUpdatedAt > 0 ? ` · updated ${relativeTime(new Date(flowUpdatedAt).toISOString())}` : ""}`;
+  const builtin = document.createElement("span");
+  builtin.className = "flow-badge";
+  builtin.textContent = flowSummary.builtin ? "builtin" : "custom";
+  const mode = document.createElement("span");
+  mode.className = `flow-badge mode-${flowSummary.mode}`;
+  mode.textContent = flowSummary.mode;
+  const revision = document.createElement("span");
+  revision.className = "flow-badge mono";
+  revision.textContent = `rev ${flowSummary.revision.slice(0, 12)}`;
+  flowBadges.append(builtin, mode, revision);
+
+  if (flowDefinition !== null) {
+    const layout = layoutFlow(flowDefinition.definition);
+    renderGraph(flowGraph, layout, flowRunValue, flowSelectedNode, {
+      onSelect: selectNode,
+    });
+  } else {
+    flowGraph.replaceChildren();
+  }
+  renderInspector(
+    flowInspector,
+    flowSummary,
+    flowDefinition?.definition ?? null,
+    flowRunValue,
+    flowSelectedNode,
+  );
+  flowRunsMeta.textContent =
+    flowSummary.mode === "off"
+      ? "flow off: no new runs"
+      : `${flowRunsValue?.runs.length ?? 0} runs`;
+  renderRunList(
+    flowRunsEl,
+    flowRunsValue?.runs ?? [],
+    flowSelectedRun,
+    selectRun,
+  );
+  renderStepChain(flowSteps, flowRunValue, flowSelectedNode, selectNode);
 }
 
 async function fetchHubLogs(): Promise<void> {
@@ -957,8 +1360,14 @@ function showHub(tab: TabInfo): void {
   hubUrlEl.textContent = url;
   hubPanel.hidden = false;
   startHubTimer();
-  if (!changed) return;
+  hubDashboard.hidden = hubPage !== "dashboard";
+  hubFlowsEl.hidden = hubPage !== "flows";
+  if (!changed) {
+    if (hubPage === "flows") startFlowTimer();
+    return;
+  }
 
+  resetFlowState();
   hubSnapshotValue = null;
   hubUpdatedAt = 0;
   hubFailed = false;
@@ -974,12 +1383,21 @@ function showHub(tab: TabInfo): void {
   hubLogsRequest += 1;
   renderHubLogs();
   void fetchHub();
-  void fetchHubLogs();
+  if (hubPage === "flows") {
+    startFlowTimer();
+    void refreshFlows();
+  } else {
+    void fetchHubLogs();
+  }
 }
 
 function hideHub(): void {
   hubPanel.hidden = true;
   stopHubTimer();
+  stopFlowTimer();
+  stopRunTimer();
+  flowRequest += 1;
+  flowRunRequest += 1;
   hubTabId = null;
   hubUrl = "";
   hubSnapshotValue = null;

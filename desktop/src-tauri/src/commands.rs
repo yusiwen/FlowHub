@@ -1,12 +1,15 @@
 use crate::auth;
 use crate::health::{self, HealthReport};
 use crate::hub::{self, HubLogs, HubSnapshot};
+use crate::hub_api;
 use crate::model::{AuthMode, Instance, InstanceInput};
 use crate::session::SessionView;
 use crate::state::{lock_prefs, lock_session, lock_tabs, AppState};
 use crate::store::lock;
 use crate::tabs::{viewport_top_inset, StageBounds, TabInfo};
+use crate::token_store;
 use serde::Serialize;
+use serde_json::Value;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
@@ -164,6 +167,10 @@ pub fn remove_instance(id: Uuid, state: State<'_, AppState>, app: AppHandle) -> 
     if let Ok(mut prefs) = lock_prefs(&state) {
         let _ = prefs.remove(id);
     }
+    token_store::remove(id);
+    if let Ok(mut tokens) = state.hub_tokens.lock() {
+        tokens.remove(&id);
+    }
     if let Ok(mut health) = state.health.lock() {
         health.remove(&id);
     }
@@ -204,6 +211,135 @@ pub async fn hub_snapshot(id: Uuid, state: State<'_, AppState>) -> Result<HubSna
         return Err("instance is not a FlowHub service".to_string());
     }
     hub::fetch(&instance.url).await
+}
+
+fn dashboard_instance(state: &AppState, id: Uuid) -> Result<Instance, String> {
+    let guard = lock(&state.store)?;
+    let instance = guard
+        .instances()
+        .iter()
+        .find(|instance| instance.id == id)
+        .cloned()
+        .ok_or_else(|| format!("no such instance: {id}"))?;
+    if !instance.is_dashboard() {
+        return Err("instance is not a FlowHub service".to_string());
+    }
+    Ok(instance)
+}
+
+fn hub_token(
+    state: &AppState,
+    id: Uuid,
+    instance: &Instance,
+    token: Option<&str>,
+    data_dir: Option<&str>,
+) -> Result<String, String> {
+    if let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) {
+        return Ok(token.to_string());
+    }
+    if let Ok(tokens) = state.hub_tokens.lock() {
+        if let Some(token) = tokens.get(&id) {
+            return Ok(token.clone());
+        }
+    }
+    if let Some(token) = token_store::load(id) {
+        if let Ok(mut tokens) = state.hub_tokens.lock() {
+            tokens.insert(id, token.clone());
+        }
+        return Ok(token);
+    }
+    hub_api::resolve_token(&instance.url, None, data_dir)
+}
+
+/// The flow overview: mode, revision, triggers and the latest run.
+#[tauri::command]
+pub async fn hub_flows(
+    id: Uuid,
+    token: Option<String>,
+    data_dir: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let instance = dashboard_instance(&state, id)?;
+    let token = hub_token(&state, id, &instance, token.as_deref(), data_dir.as_deref())?;
+    hub_api::get(&instance.url, "flows", &token).await
+}
+
+/// One flow definition, used by the graph renderer.
+#[tauri::command]
+pub async fn hub_flow(
+    id: Uuid,
+    flow_id: String,
+    token: Option<String>,
+    data_dir: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let instance = dashboard_instance(&state, id)?;
+    let flow_id = hub_api::segment(&flow_id)?;
+    let token = hub_token(&state, id, &instance, token.as_deref(), data_dir.as_deref())?;
+    hub_api::get(&instance.url, &format!("flows/{flow_id}"), &token).await
+}
+
+/// Run summaries, optionally filtered by state.
+#[tauri::command]
+pub async fn hub_runs(
+    id: Uuid,
+    token: Option<String>,
+    data_dir: Option<String>,
+    state_filter: Option<String>,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let instance = dashboard_instance(&state, id)?;
+    let token = hub_token(&state, id, &instance, token.as_deref(), data_dir.as_deref())?;
+    let mut pairs = Vec::new();
+    if let Some(value) = state_filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let encoded: String = url::form_urlencoded::byte_serialize(value.as_bytes()).collect();
+        pairs.push(format!("state={encoded}"));
+    }
+    if let Some(limit) = limit {
+        pairs.push(format!("limit={}", limit.min(200)));
+    }
+    let path = if pairs.is_empty() {
+        "runs".to_string()
+    } else {
+        format!("runs?{}", pairs.join("&"))
+    };
+    hub_api::get(&instance.url, &path, &token).await
+}
+
+/// One run with its steps, for the graph overlay and the inspector.
+#[tauri::command]
+pub async fn hub_run(
+    id: Uuid,
+    run_id: String,
+    token: Option<String>,
+    data_dir: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let instance = dashboard_instance(&state, id)?;
+    let run_id = hub_api::segment(&run_id)?;
+    let token = hub_token(&state, id, &instance, token.as_deref(), data_dir.as_deref())?;
+    hub_api::get(&instance.url, &format!("runs/{run_id}"), &token).await
+}
+
+/// Store a pasted token in the login keychain. The value never enters the
+/// registry, the shell's localStorage or the logs.
+#[tauri::command]
+pub fn set_hub_token(id: Uuid, token: String, state: State<'_, AppState>) -> Result<(), String> {
+    dashboard_instance(&state, id)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("the hub token is empty".to_string());
+    }
+    token_store::save(id, token)?;
+    if let Ok(mut tokens) = state.hub_tokens.lock() {
+        tokens.insert(id, token.to_string());
+    }
+    Ok(())
 }
 
 /// The Hub's log tail. The path decision lives here, not in the shell: a

@@ -50,6 +50,8 @@ pub struct HubSnapshot {
     pub runtimes: Value,
     #[serde(default)]
     pub counters: Value,
+    #[serde(default)]
+    pub flows: Value,
 }
 
 /// A wrong address must not make the app allocate an arbitrary page.
