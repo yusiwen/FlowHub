@@ -19,7 +19,10 @@ API), and a task is bound to the runtime that prepared its worktree for life.
 YouTrack is no longer hard-wired into the core: the receiver and the dispatcher
 both consume `internal/event` and `internal/source`, and `internal/source/youtrack`
 is the only package that knows what a YouTrack payload looks like or which tools
-the agent may call (ADR 0001 step 1).
+the agent may call (ADR 0001 step 1). Since ADR 0013 every accepted delivery is
+also normalised into `internal/upstream.Event` and appended to the event log; the
+log is additive, and the dispatcher still consumes the original record until the
+staged flow cutover.
 
 ## Where things live
 
@@ -33,7 +36,8 @@ the agent may call (ADR 0001 step 1).
 | `internal/event/` | The neutral event IR (`event.go`): `Kind`, `Subject`, `Attachment`, `Event`, `Validate`. Data only — no I/O, no vendor names — so routing, the trigger policy, the audit decision and the reply check never learn which tracker a delivery came from (ADR 0001 step 1) |
 | `internal/source/` | The event-source seam (`source.go`): `Request` (one delivery as the receiver saw it), `Decoded` (the event plus the source's own audit facts), `Source` (name, parse, policy, tools, prompt), and the data-only `ToolPolicy`/`DownloadPolicy`. A source cannot reach around the receiver's entry locks or the dispatcher's shell policy. `registry.go` holds the compile-time list of buildable adapters: `Factory(policy, instructions)` receives the trigger policy **and** the source's own `prompt_file` content, because reading and validating that file belongs to the configuration loader — a source that read it itself would find the mistake after the start |
 | `internal/source/youtrack/` | The YouTrack adapter: `payload.go` (lenient payload model, timestamp and issue-id parsing), `schema.go` (`Schema()`: flat sorted `path: type` report), `source.go` (payload → `event.Event`, including the workflow-state normalisation, the `Source` methods, and the source-level `prompt_file` text), `tools.go` (allowed MCP tools, reply tools, download host and prefix), `prompt.go` (ground rules, phase instructions, the operator-instruction sections for the source's and the project's `prompt_file`, the reply sign-off contract) |
-| `internal/webhook/handler.go` | The delivery pipeline: three locks, body limits, source decode, replay window, idempotency, audit, 202. It owns the transport and the redaction, not the payload |
+| `internal/webhook/handler.go` | The delivery pipeline: three locks, body limits, source decode, replay window, idempotency, audit, 202. It owns the transport and the redaction, not the payload; when `Options.Events` is set it also hands the accepted delivery to the flow normalizer |
+| `internal/upstream/` | The flow event seam (ADR 0013): the neutral `Event` envelope, the `Normalizer` a source adapter implements, and `Log` — an append-only per-day JSONL store (`events/YYYY-MM-DD.jsonl`, `0600`, 30-day retention, dedupe, non-blocking queue, `/healthz` counters). `internal/source/youtrack/upstream.go` is the YouTrack normalizer |
 | `internal/dedupe/dedupe.go` | TTL idempotency cache (`FLOWHUB_DEDUPE_TTL`) |
 | `internal/store/store.go` | `Record` (the audit schema) and the `Recorder` interface |
 | `internal/store/async.go` | Non-blocking audit queue; drops and counts instead of slowing the response |

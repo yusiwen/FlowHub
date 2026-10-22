@@ -27,6 +27,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/metrics"
 	"github.com/yusiwen/flowhub/internal/source"
 	"github.com/yusiwen/flowhub/internal/store"
+	"github.com/yusiwen/flowhub/internal/upstream"
 )
 
 // Rejection reasons. They are stable identifiers: they end up in the audit log
@@ -102,6 +103,10 @@ type Options struct {
 	// receiver owns the transport locks, and the adapter owns what a delivery from
 	// *its* tracker means. Required.
 	Source source.Source
+	// Events, when set, receives the neutral envelope of every accepted delivery.
+	// The source must also implement upstream.Normalizer; an adapter that does not
+	// keeps working without an event log.
+	Events upstream.Sink
 }
 
 // Dispatcher receives accepted deliveries for asynchronous work.
@@ -236,11 +241,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decoded, err := h.opts.Source.Parse(&source.Request{
+	request := &source.Request{
 		Method: rec.Method, Path: rec.Path, Query: rec.Query,
 		Headers: r.Header, RemoteIP: rec.RemoteIP, UserAgent: rec.UserAgent,
 		Body: body,
-	})
+	}
+	decoded, err := h.opts.Source.Parse(request)
 	if err != nil {
 		h.respond(w, rec, ReasonInvalidJSON, http.StatusAccepted)
 		return
@@ -279,6 +285,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.respond(w, rec, "", http.StatusAccepted)
+	h.recordEvent(decoded, request, start)
+}
+
+// recordEvent appends the neutral envelope of an accepted delivery.
+//
+// It runs after the response is written and only when an event log is configured.
+// The source is type-asserted instead of widening source.Source, so an adapter
+// that has not been taught the flow envelope still serves the webhook.
+func (h *Handler) recordEvent(decoded source.Decoded, request *source.Request, received time.Time) {
+	if h.opts.Events == nil || h.opts.Source == nil {
+		return
+	}
+	normalizer, ok := h.opts.Source.(upstream.Normalizer)
+	if !ok {
+		h.log.Error("source cannot normalize an event for the flow log", "source", h.opts.Source.Name())
+		return
+	}
+	envelope, err := normalizer.Normalize(decoded, request, received)
+	if err != nil {
+		h.log.Error("normalize event for the flow log", "source", h.opts.Source.Name(), "error", err)
+		return
+	}
+	h.opts.Events.Record(envelope)
 }
 
 // describe fills the record from what the source decoded.

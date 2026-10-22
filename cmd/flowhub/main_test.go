@@ -89,7 +89,7 @@ func TestWebhookOptionsNeverHoldATypedNilDispatcher(t *testing.T) {
 	if absent != nil {
 		t.Fatal("precondition: a nil pointer must compare equal to nil")
 	}
-	if opts := webhookOptions(config.Config{}, absent, youtrack.New(rules.Policy{}, "")); opts.Dispatcher != nil {
+	if opts := webhookOptions(config.Config{}, absent, youtrack.New(rules.Policy{}, ""), nil); opts.Dispatcher != nil {
 		t.Fatal("webhookOptions put a nil dispatcher behind the interface")
 	}
 }
@@ -103,7 +103,7 @@ func TestWebhookOptionsCarryTheReceiverLocks(t *testing.T) {
 		ReplayWindow: time.Minute,
 		LogHeaders:   true,
 	}
-	opts := webhookOptions(cfg, &dispatch.Dispatcher{}, youtrack.New(rules.Policy{}, ""))
+	opts := webhookOptions(cfg, &dispatch.Dispatcher{}, youtrack.New(rules.Policy{}, ""), nil)
 	if opts.HookKey != "k" || opts.Token != "t" || opts.Dispatcher == nil {
 		t.Fatalf("options = %+v", opts)
 	}

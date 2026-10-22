@@ -22,6 +22,7 @@ The three documents in the repository root are the specification:
 | `youtrack-webhook-and-flowhub-security.md` | YouTrack side, payload facts, layered security design (§8, §9, §12) |
 | `opencode-devops-orchestration-design.md` | Overall FlowHub architecture, session ownership, event-driven model |
 | `opencode-headless-automation-and-permissions.md` | opencode HTTP API and the permission loop the dispatcher drives |
+| `docs/flow-model.md` | The flow model: event envelope, task service, run journal, builtin flow, parity table, and the shadow → dual-run → cutover migration (ADR 0013) |
 
 ## Why the receiver looks like this
 
