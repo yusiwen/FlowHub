@@ -29,6 +29,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
+	"github.com/yusiwen/flowhub/internal/runner"
 	"github.com/yusiwen/flowhub/internal/runtimes"
 	"github.com/yusiwen/flowhub/internal/source"
 	"github.com/yusiwen/flowhub/internal/store"
@@ -84,6 +85,9 @@ type Options struct {
 	// MaxCostPerTask stops a task whose accumulated cost passes this value.
 	// Zero disables the check.
 	MaxCostPerTask float64
+	// Capacity is the shared per-runtime turn gate. Nil means the dispatcher
+	// creates a private one; the flow engine passes the same instance.
+	Capacity *runner.Capacity
 }
 
 // DeclaredRuntime is a runtime the configuration file declares: where it is, and the
@@ -114,20 +118,14 @@ type Dispatcher struct {
 	// delivery and every prompt is judged by the same rules.
 	policy rules.Policy
 
-	// spaces caches one workspace provider per checkout base directory, and runtimes
-	// one runtime adapter per host name — rebuilt when that host's address changes,
-	// because an operator may re-enrol it while this process runs. One worker per
-	// runtime touches them, so they are guarded rather than worker-local.
+	// workspaces caches one provider per checkout base directory and serializes
+	// preparation per repository; the flow engine shares this instance. runtimes
+	// caches one adapter per host name and is rebuilt when that host's address
+	// changes, because an operator may re-enrol it while this process runs.
+	workspaces *runner.Workspaces
+	// cacheMu guards runtimes, which is rebuilt when a host's address changes.
 	cacheMu  sync.Mutex
-	spaces   map[string]workspace.Workspace
 	runtimes map[string]cachedRuntime
-
-	// prepMu guards prepLocks, which serializes workspace preparation per repository:
-	// `git worktree add` is not safe to run twice at once in one clone, and two
-	// runtimes may well share one (a second name for the same host, or a
-	// misconfiguration that must not corrupt the clone).
-	prepMu    sync.Mutex
-	prepLocks map[string]*sync.Mutex
 
 	queue   chan *store.Record
 	queued  atomic.Int64
@@ -151,10 +149,9 @@ type Dispatcher struct {
 	routes    map[taskID]runtimeBinding
 	lastError map[string]string
 
-	// loadMu guards inFlight, which the selection policy reads from the worker
-	// goroutine and /healthz reads from an HTTP handler.
-	loadMu   sync.Mutex
-	inFlight map[string]int
+	// capacity counts and bounds turns per runtime; the selection policy and
+	// /healthz read the same counters, and the flow engine shares the gate.
+	capacity *runner.Capacity
 }
 
 // New builds a dispatcher. It does not start working until Run is called.
@@ -184,6 +181,10 @@ func New(opts Options) (*Dispatcher, error) {
 	if opts.Deadline <= 0 {
 		opts.Deadline = 10 * time.Minute
 	}
+	capacity := opts.Capacity
+	if capacity == nil {
+		capacity = runner.NewCapacity()
+	}
 	ruleset := opts.Source.Policy().Defaults()
 	if strings.TrimSpace(ruleset.Trigger) == "" {
 		// A dispatcher whose policy has no trigger is a silent no-op that looks
@@ -196,10 +197,9 @@ func New(opts Options) (*Dispatcher, error) {
 		opts:       opts,
 		policy:     ruleset,
 		log:        opts.Log,
-		prepLocks:  map[string]*sync.Mutex{},
-		spaces:     map[string]workspace.Workspace{},
+		workspaces: runner.NewWorkspaces(opts.NewWorkspace),
 		runtimes:   map[string]cachedRuntime{},
-		inFlight:   map[string]int{},
+		capacity:   capacity,
 		queue:      make(chan *store.Record, opts.QueueSize),
 		schedulers: map[string]*runtimeScheduler{},
 		routes:     map[taskID]runtimeBinding{},
@@ -348,39 +348,25 @@ func (d *Dispatcher) runtimeSnapshot() map[string]map[string]any {
 // enterTurn records that a turn is running on a runtime and returns the function
 // that clears it. The spread policy ranks by these counters, so with one worker
 // per runtime (ADR 0001 step 5) they say which host is busy right now.
-func (d *Dispatcher) enterTurn(runtime string) func() {
+func (d *Dispatcher) enterTurn(ctx context.Context, runtime string) func() {
 	if runtime == "" {
 		return func() {}
 	}
-	d.loadMu.Lock()
-	d.inFlight[runtime]++
-	d.loadMu.Unlock()
-	return func() {
-		d.loadMu.Lock()
-		d.inFlight[runtime]--
-		if d.inFlight[runtime] <= 0 {
-			delete(d.inFlight, runtime)
-		}
-		d.loadMu.Unlock()
+	release, err := d.capacity.Acquire(ctx, runtime)
+	if err != nil {
+		return func() {}
 	}
+	return release
 }
 
 // inFlightFor reports how many turns are running on a runtime right now.
 func (d *Dispatcher) inFlightFor(runtime string) int {
-	d.loadMu.Lock()
-	defer d.loadMu.Unlock()
-	return d.inFlight[runtime]
+	return d.capacity.InFlight(runtime)
 }
 
 // inFlightSnapshot copies the counters for /healthz.
 func (d *Dispatcher) inFlightSnapshot() map[string]int {
-	d.loadMu.Lock()
-	defer d.loadMu.Unlock()
-	out := make(map[string]int, len(d.inFlight))
-	for name, count := range d.inFlight {
-		out[name] = count
-	}
-	return out
+	return d.capacity.Snapshot()
 }
 
 // routeOne decides which runtime takes a delivery, and refuses it when none can.
@@ -488,6 +474,7 @@ func (d *Dispatcher) schedulerFor(name string, breadth int) (*runtimeScheduler, 
 	}
 	scheduler := newRuntimeScheduler(name, breadth, d.opts.QueueSize)
 	d.schedulers[name] = scheduler
+	d.capacity.SetLimit(name, breadth)
 	return scheduler, true
 }
 
@@ -859,17 +846,7 @@ func authorAllowed(allowed []string, actor string) bool {
 // creating it on first use. The base comes from the routing entry, because it has to
 // sit outside the repository that entry points at.
 func (d *Dispatcher) workspaceFor(base string) (workspace.Workspace, error) {
-	d.cacheMu.Lock()
-	defer d.cacheMu.Unlock()
-	if provider, ok := d.spaces[base]; ok {
-		return provider, nil
-	}
-	provider, err := d.opts.NewWorkspace(base)
-	if err != nil {
-		return nil, err
-	}
-	d.spaces[base] = provider
-	return provider, nil
+	return d.workspaces.For(base)
 }
 
 // prepareLock returns the mutex that serializes workspace preparation for one
@@ -877,14 +854,7 @@ func (d *Dispatcher) workspaceFor(base string) (workspace.Workspace, error) {
 // clone's own git bookkeeping — so it is the one step that cannot run twice at once
 // in the same repository, whatever the runtime. The turns themselves stay parallel.
 func (d *Dispatcher) prepareLock(repo string) *sync.Mutex {
-	d.prepMu.Lock()
-	defer d.prepMu.Unlock()
-	if lock, ok := d.prepLocks[repo]; ok {
-		return lock
-	}
-	lock := &sync.Mutex{}
-	d.prepLocks[repo] = lock
-	return lock
+	return d.workspaces.Lock(repo)
 }
 
 // runTurn delivers one prompt and records what came back.
@@ -949,7 +919,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		model = binding.declaredModel()
 	}
 
-	defer d.enterTurn(binding.Name)()
+	defer d.enterTurn(ctx, binding.Name)()
 
 	// Announce the turn before it starts. Overlap is a property of the log rather than
 	// something to infer from two completion lines, and it is the line that shows a
@@ -960,11 +930,17 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		"session", task.SessionID, "max_concurrent", d.breadthFor(binding))
 
 	deadline := binding.deadline(d.opts.Deadline)
-	turn := agent.Turn{
+	host := runner.Host{
+		Name:          binding.Name,
+		Runtime:       binding.Runtime,
+		Agent:         agentName,
+		Model:         model,
+		Deadline:      deadline,
+		MaxConcurrent: d.breadthFor(binding),
+	}
+	turn := runner.Turn{
 		Directory:    task.Worktree,
 		Prompt:       prompt,
-		Agent:        agentName,
-		Model:        model,
 		Title:        rec.IssueID,
 		SessionID:    task.SessionID,
 		Phase:        phase,
@@ -981,7 +957,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 		Deadline: deadline,
 	}
 
-	result, err := binding.Runtime.Run(ctx, turn)
+	result, err := host.Run(ctx, turn)
 
 	// The contract is one comment per turn, and a turn that posts none has told the
 	// maintainer nothing at all. Left alone that is invisible from the outside: the
@@ -1004,7 +980,7 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 			// The follow-up may only post a comment, and one delivery must not be able
 			// to hold a worker for two full turn budgets.
 			nudge.Deadline = nudgeDeadline(deadline)
-			nudged, nudgeErr := binding.Runtime.Run(ctx, nudge)
+			nudged, nudgeErr := host.Run(ctx, nudge)
 			d.log.Info("follow-up turn finished",
 				"issue", rec.IssueID, "session", nudged.SessionID,
 				"finished", nudged.Finished, "timed_out", nudged.TimedOut,
