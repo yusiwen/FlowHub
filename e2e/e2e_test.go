@@ -40,8 +40,11 @@ type env struct {
 	ocBase      string
 	ocPass      string
 	ytClient    *http.Client
+	binary      string
+	configPath  string
 	cmd         *exec.Cmd
 	logPath     string
+	logFile     *os.File
 	client      *http.Client
 }
 
@@ -128,20 +131,29 @@ func setup() *env {
 	if err := writeTestConfig(configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject); err != nil {
 		fatalf("e2e: write config: %v", err)
 	}
-	binary := os.Getenv("E2E_BIN")
-	if binary == "" {
-		binary = filepath.Join(repoRoot(), "bin", "flowhub")
+	e.configPath = configPath
+	e.binary = os.Getenv("E2E_BIN")
+	if e.binary == "" {
+		e.binary = filepath.Join(repoRoot(), "bin", "flowhub")
 	}
-	if _, err := os.Stat(binary); err != nil {
-		fatalf("e2e: binary %s: %v (run make build)", binary, err)
+	if _, err := os.Stat(e.binary); err != nil {
+		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	e.cmd = exec.Command(binary)
+	e.start()
+	return e
+}
+
+func (e *env) start() {
+	if e.cmd != nil && e.cmd.Process != nil {
+		e.stop()
+	}
+	e.cmd = exec.Command(e.binary)
 	e.cmd.Dir = repoRoot()
 	e.cmd.Env = append(os.Environ(),
 		"FLOWHUB_ENV_FILE=-",
 		"FLOWHUB_ADDR="+e.addr,
 		"FLOWHUB_DATA_DIR="+filepath.Join(e.dir, "data"),
-		"FLOWHUB_CONFIG_FILE="+configPath,
+		"FLOWHUB_CONFIG_FILE="+e.configPath,
 		"FLOWHUB_HOOK_KEY="+e.hookKey,
 		"FLOWHUB_TOKEN="+e.hookToken,
 		"FLOWHUB_HUB_TOKEN="+e.hubToken,
@@ -151,10 +163,11 @@ func setup() *env {
 		"FLOWHUB_LOG_FILE=none",
 		"FLOWHUB_TASK_DEADLINE=5m",
 	)
-	logFile, err := os.Create(e.logPath)
+	logFile, err := os.OpenFile(e.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		fatalf("e2e: log: %v", err)
 	}
+	e.logFile = logFile
 	e.cmd.Stdout = logFile
 	e.cmd.Stderr = logFile
 	if err := e.cmd.Start(); err != nil {
@@ -164,7 +177,6 @@ func setup() *env {
 		data, _ := os.ReadFile(e.logPath)
 		fatalf("e2e: FlowHub did not become healthy: %v\n%s", err, tail(string(data), 40))
 	}
-	return e
 }
 
 func (e *env) stop() {
@@ -179,6 +191,11 @@ func (e *env) stop() {
 	case <-time.After(10 * time.Second):
 		_ = e.cmd.Process.Kill()
 	}
+	if e.logFile != nil {
+		_ = e.logFile.Close()
+		e.logFile = nil
+	}
+	e.cmd = nil
 }
 
 func (e *env) waitHealthy(timeout time.Duration) error {
@@ -507,6 +524,7 @@ func TestOnExecutesAndRollsBack(t *testing.T) {
 }
 
 type flowHealth struct {
+	Mode             string
 	Runs             float64
 	Submitted        float64
 	ShadowCompared   float64
@@ -517,6 +535,7 @@ func (e *env) flowHealth(t *testing.T) flowHealth {
 	t.Helper()
 	var body struct {
 		Flows struct {
+			Mode             string  `json:"mode"`
 			Runs             float64 `json:"runs"`
 			Submitted        float64 `json:"submitted"`
 			ShadowCompared   float64 `json:"shadow_compared"`
@@ -526,7 +545,7 @@ func (e *env) flowHealth(t *testing.T) flowHealth {
 	if err := e.getJSON(t, "/healthz", &body); err != nil {
 		t.Fatalf("health: %v", err)
 	}
-	return flowHealth{Runs: body.Flows.Runs, Submitted: body.Flows.Submitted,
+	return flowHealth{Mode: body.Flows.Mode, Runs: body.Flows.Runs, Submitted: body.Flows.Submitted,
 		ShadowCompared: body.Flows.ShadowCompared, ShadowMismatches: body.Flows.ShadowMismatches}
 }
 
@@ -764,6 +783,49 @@ func eventLineCount(t *testing.T, dataDir string) int {
 		return 0
 	}
 	return len(strings.Split(strings.TrimSpace(string(data)), "\n"))
+}
+
+func TestRestartKeepsComparisonState(t *testing.T) {
+	if os.Getenv("E2E_RESTART") != "1" {
+		t.Skip("set E2E_RESTART=1 to stop and restart the test FlowHub")
+	}
+	if suite.live {
+		t.Skip("restart is checked in direct mode")
+	}
+	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	if err := suite.setMode("shadow", nil); err != nil {
+		t.Fatalf("set shadow: %v", err)
+	}
+	before := suite.flowHealth(t)
+	description := "FlowHub restart before " + time.Now().UTC().Format(time.RFC3339Nano)
+	if err := suite.updateIssue(suite.ytIssue, description); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if status := suite.postWebhook(t, issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"))); status != http.StatusAccepted {
+		t.Fatalf("webhook status = %d", status)
+	}
+	suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.ShadowCompared > before.ShadowCompared }, 20*time.Second)
+	beforeRestart := suite.flowHealth(t)
+
+	suite.stop()
+	suite.start()
+	time.Sleep(300 * time.Millisecond)
+
+	afterRestart := suite.flowHealth(t)
+	if afterRestart.Mode != "shadow" {
+		t.Fatalf("mode after restart = %q, want shadow", afterRestart.Mode)
+	}
+	if afterRestart.ShadowCompared < beforeRestart.ShadowCompared {
+		t.Fatalf("compare count regressed: before=%v after=%v", beforeRestart.ShadowCompared, afterRestart.ShadowCompared)
+	}
+	description = "FlowHub restart after " + time.Now().UTC().Format(time.RFC3339Nano)
+	if err := suite.updateIssue(suite.ytIssue, description); err != nil {
+		t.Fatalf("update after restart: %v", err)
+	}
+	if status := suite.postWebhook(t, issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"))); status != http.StatusAccepted {
+		t.Fatalf("webhook after restart status = %d", status)
+	}
+	suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.ShadowCompared > afterRestart.ShadowCompared }, 20*time.Second)
 }
 
 func (e *env) updateIssue(issue, description string) error {
