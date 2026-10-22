@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +39,7 @@ type env struct {
 	repo        string
 	ocBase      string
 	ocPass      string
+	ytClient    *http.Client
 	cmd         *exec.Cmd
 	logPath     string
 	client      *http.Client
@@ -71,6 +73,7 @@ func setup() *env {
 		ocBase:      strings.TrimRight(os.Getenv("OPENCODE_URL"), "/"),
 		ocPass:      firstNonEmpty(os.Getenv("FLOWHUB_OPENCODE_PASSWORD"), os.Getenv("HOMELAB_OPENCODE_PASSWORD")),
 		client:      &http.Client{Timeout: 30 * time.Second},
+		ytClient:    &http.Client{Timeout: 30 * time.Second},
 	}
 	if e.ytBase == "" {
 		e.ytBase = "https://pm.yusiwen.cn"
@@ -183,8 +186,10 @@ func (e *env) waitHealthy(timeout time.Duration) error {
 	for time.Now().Before(deadline) {
 		response, err := e.client.Get(e.baseURL + "/healthz")
 		if err == nil {
+			_, _ = io.Copy(io.Discard, response.Body)
 			_ = response.Body.Close()
 			if response.StatusCode == http.StatusOK {
+				e.client.CloseIdleConnections()
 				return nil
 			}
 		}
@@ -263,6 +268,32 @@ func (e *env) createIssue(summary, description string) (key, id string, err erro
 		return "", "", err
 	}
 	return response.IDReadable, response.ID, nil
+}
+
+func (e *env) dispatchIgnored(t *testing.T) float64 {
+	t.Helper()
+	var body struct {
+		Dispatch struct {
+			Ignored float64 `json:"ignored"`
+		} `json:"dispatch"`
+	}
+	if err := e.getJSON(t, "/healthz", &body); err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	return body.Dispatch.Ignored
+}
+
+func (e *env) dispatchPaused(t *testing.T) bool {
+	t.Helper()
+	var body struct {
+		Dispatch struct {
+			Paused bool `json:"paused"`
+		} `json:"dispatch"`
+	}
+	if err := e.getJSON(t, "/healthz", &body); err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	return body.Dispatch.Paused
 }
 
 func (e *env) dispatchHandled(t *testing.T) float64 {
@@ -566,6 +597,175 @@ func (e *env) hasRunMode(t *testing.T, want string) bool {
 	return false
 }
 
+func TestCommentTriggerStartsAPlan(t *testing.T) {
+	if os.Getenv("E2E_COMMENT") != "1" {
+		t.Skip("set E2E_COMMENT=1 to spend a real comment-trigger turn")
+	}
+	if suite.live {
+		t.Skip("comment trigger currently runs in direct mode; issueCreated would race the webhook")
+	}
+	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+	baseline := suite.dispatchHandled(t)
+	summary := "FlowHub E2E trigger " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Comment trigger E2E.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	comment, err := suite.addComment(key, "/opencode start")
+	if err != nil {
+		t.Fatalf("add comment: %v", err)
+	}
+	if status := suite.postWebhook(t, commentAddedPayload(key, comment)); status != http.StatusAccepted {
+		t.Fatalf("webhook status = %d", status)
+	}
+	suite.waitForDispatchHandled(t, baseline+1, 20*time.Second)
+	suite.waitForComment(t, key, "<!-- flowhub-auto -->", 6*time.Minute)
+	suite.waitForTurnState(t, key, 2*time.Minute)
+}
+
+func TestDuplicateWebhookIsIdempotent(t *testing.T) {
+	if suite.live {
+		t.Skip("direct duplicate injection is checked in direct mode")
+	}
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+	beforeDuplicates := suite.counters(t)["duplicates"]
+	beforeEvents := eventLineCount(t, suite.dataDir)
+	payload := issueUpdatedPayload(suite.ytIssue, "FlowHub duplicate "+time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+	if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+		t.Fatalf("first status = %d", status)
+	}
+	if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+		t.Fatalf("second status = %d", status)
+	}
+	if got := suite.counters(t)["duplicates"]; got <= beforeDuplicates {
+		t.Fatalf("duplicates did not grow: before=%v after=%v", beforeDuplicates, got)
+	}
+	if got := eventLineCount(t, suite.dataDir); got != beforeEvents+1 {
+		t.Fatalf("event lines = %d, want %d (one duplicate suppressed)", got, beforeEvents+1)
+	}
+}
+
+func TestPauseDoesNotDispatch(t *testing.T) {
+	if suite.live {
+		t.Skip("pause is checked in direct mode")
+	}
+	pause := filepath.Join(suite.dir, "DISPATCH_OFF")
+	if err := os.WriteFile(pause, []byte("test"), 0o600); err != nil {
+		t.Fatalf("pause file: %v", err)
+	}
+	defer func() { _ = os.Remove(pause) }()
+	beforeIgnored := suite.dispatchIgnored(t)
+	payload := issueUpdatedPayload(suite.ytIssue, "FlowHub paused "+time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+	if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+		t.Fatalf("status = %d", status)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if suite.dispatchIgnored(t) > beforeIgnored {
+			if !suite.dispatchPaused(t) {
+				t.Fatal("dispatch did not report paused")
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("dispatch did not ignore a delivery while paused")
+}
+
+func TestShadowSoak(t *testing.T) {
+	if suite.live {
+		t.Skip("soak posts directly so the real webhook app does not duplicate it")
+	}
+	count := 10
+	if raw := os.Getenv("E2E_SOAK"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			count = parsed
+		}
+	}
+	if err := suite.setMode("shadow", nil); err != nil {
+		t.Fatalf("set shadow: %v", err)
+	}
+	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	before := suite.flowHealth(t)
+	for i := 0; i < count; i++ {
+		description := fmt.Sprintf("FlowHub soak %d %s", i, time.Now().UTC().Format(time.RFC3339Nano))
+		if err := suite.updateIssue(suite.ytIssue, description); err != nil {
+			t.Fatalf("update %d: %v", i, err)
+		}
+		payload := issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+			t.Fatalf("webhook %d status = %d", i, status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	suite.waitForFlowHealth(t, func(f flowHealth) bool {
+		return f.ShadowCompared >= before.ShadowCompared+float64(count)
+	}, time.Duration(count)*2*time.Second+20*time.Second)
+	health := suite.flowHealth(t)
+	if health.ShadowMismatches != 0 {
+		t.Fatalf("soak mismatches = %v", health.ShadowMismatches)
+	}
+	if dropped := suite.flowDropped(t); dropped != 0 {
+		t.Fatalf("flow queue dropped %v events", dropped)
+	}
+}
+
+func (e *env) addComment(issue, text string) (string, error) {
+	body := map[string]any{"text": text}
+	var response struct {
+		ID string `json:"id"`
+	}
+	if err := e.ytRequest(http.MethodPost, "/api/issues/"+issue+"/comments?fields=id", body, &response); err != nil {
+		return "", err
+	}
+	return response.ID, nil
+}
+
+func (e *env) flowDropped(t *testing.T) float64 {
+	t.Helper()
+	var body struct {
+		Flows struct {
+			Dropped float64 `json:"dropped"`
+		} `json:"flows"`
+	}
+	if err := e.getJSON(t, "/healthz", &body); err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	return body.Flows.Dropped
+}
+
+func commentAddedPayload(key, commentID string) []byte {
+	payload := map[string]any{
+		"event":     "commentAdded",
+		"timestamp": time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		"id":        key,
+		"summary":   "FlowHub E2E trigger",
+		"project":   map[string]any{"key": "TEST", "name": "TEST", "shortName": "TEST"},
+		"comments": []map[string]any{{
+			"id": commentID, "text": "/opencode start",
+			"created": time.Now().UnixMilli(),
+			"author":  map[string]any{"login": "yusiwen", "fullName": "Siwen Yu"},
+		}},
+	}
+	data, _ := json.Marshal(payload)
+	return data
+}
+
+func eventLineCount(t *testing.T, dataDir string) int {
+	t.Helper()
+	path := filepath.Join(dataDir, "events", time.Now().UTC().Format("2006-01-02")+".jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	return len(strings.Split(strings.TrimSpace(string(data)), "\n"))
+}
+
 func (e *env) updateIssue(issue, description string) error {
 	body := map[string]any{"description": description}
 	return e.ytRequest(http.MethodPost, "/api/issues/"+issue+"?fields=id,idReadable,description", body, nil)
@@ -688,7 +888,7 @@ func (e *env) ytRequest(method, path string, body, out any) error {
 	}
 	request.Header.Set("Authorization", "Bearer "+e.ytToken)
 	request.Header.Set("Content-Type", "application/json")
-	response, err := e.client.Do(request)
+	response, err := e.ytClient.Do(request)
 	if err != nil {
 		return err
 	}
