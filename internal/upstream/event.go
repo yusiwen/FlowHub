@@ -116,7 +116,15 @@ func NewID(now time.Time) string {
 	return fmt.Sprintf("evt_%d_%s", now.UTC().UnixNano(), hex.EncodeToString(random[:]))
 }
 
-// Sink accepts events. Record must not block: it runs on the delivery path.
+// Sink accepts events asynchronously. It is kept for tests and for callers that
+// do not own the delivery path; the webhook uses DurableSink.
 type Sink interface {
 	Record(Event)
+}
+
+// DurableSink appends an event before the delivery is answered. Append must not
+// return nil unless the event is on disk; no fsync is required, but a failed write
+// must be reported so the webhook can answer 503 instead of claiming durability.
+type DurableSink interface {
+	Append(Event) error
 }

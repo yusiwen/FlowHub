@@ -151,21 +151,24 @@ tests wire the real adapter against a fake server, which is what proves the seam
 POST /hooks/youtrack/<url key>
   -> lock 1 URL key -> lock 2 header token -> lock 3 source IP
   -> body cap -> content type -> JSON -> known event -> replay window
-  -> idempotency -> audit queue (background) -> 202, empty body
+  -> idempotency -> event append (durable) -> audit queue (background) -> 202
 ```
 
 Everything after the entry locks is derived from measurements in the design
 documents. The rules below are load-bearing; do not relax them casually.
 
-1. **Never block the request path.** The published Webhook Triggers app posts
-   synchronously with a 5s timeout and no retry, so a slow handler is felt by the
-   person editing the issue. No I/O on this path except reading the body; audit
-   writes go through `store.Async` and are dropped (with a counter) if the queue
-   is full.
+1. **Never block the request path, except for the durable event append.** The
+   published Webhook Triggers app posts synchronously with a 5s timeout and no
+   retry, so a slow handler is felt by the person editing the issue. The one
+   synchronous write is the neutral event append before the `202` (M2-1): no fsync,
+   but a failed append answers `503` and releases the idempotency key instead of
+   claiming an event the flow engine will never see. Audit and dispatch stay on
+   their queues and drop with counters when full.
 2. **Every rejection looks like success.** `202` with an empty body and no
    explanatory header, so a scanner learns nothing. The reason goes to the audit
-   log and `/healthz` counters only. The two deliberate exceptions are `405` for
-   a wrong method and `413` for an oversized body.
+   log and `/healthz` counters only. The deliberate exceptions are `405` for a
+   wrong method, `413` for an oversized body, and `503` when the event append
+   fails; durability is the one thing a `202` may not lie about.
 3. **Secrets are never written to disk.** The token header, `Authorization`,
    `Proxy-Authorization`, `Cookie` and `Set-Cookie` values are replaced by
    `<masked len=… sha256:…>`. The URL key is redacted **by position** — the

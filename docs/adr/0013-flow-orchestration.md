@@ -118,7 +118,8 @@ asynchronously, exactly like today's audit/dispatch queues, and count a drop. Be
 the pilot turns `on`, the append moves before the `202` (without fsync) so an accepted
 event cannot be lost; that is an explicit amendment to rule 1 of the delivery
 pipeline, recorded in `AGENTS.md` when it lands. Shadow does not need it; a live
-cutover does.
+cutover does. It landed as M2-1: the append is synchronous before the `202`, no
+fsync, and a failed append answers `503` after releasing the idempotency key.
 
 ## Consequences
 

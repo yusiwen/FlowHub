@@ -175,10 +175,12 @@ body. What changes is what happens after acceptance:
 3. the trigger router decides which flows are candidates;
 4. in M1, dispatch still runs the live turn; the flow engine runs shadow runs.
 
-The request path stays non-blocking. M1 uses the same asynchronous append/queue as
-the audit and dispatch; a full queue drops and counts, exactly like today. Before a
-project turns `on`, the event append moves before the `202` (see §13 and ADR 0013
-decision 11).
+The event append is synchronous and happens **before** the `202` (M2-1): it
+validates, dedupes, writes the JSONL line and notifies subscribers, without fsync.
+A failed append answers `503`, records `event_append_failed`, and releases both
+idempotency keys so a retry can work; a `202` is only sent after the event is on
+disk. Audit and dispatch remain asynchronous and keep their drop counters. This is
+the amendment to AGENTS rule 1 recorded by ADR 0013 decision 11.
 
 ### 4.3 Ingress: poll (reserved)
 

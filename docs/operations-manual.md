@@ -1171,6 +1171,11 @@ picture.
 | `~/.config/opencode/opencode.json` | you (+ `runtime init` prints a snippet) | MCP servers; holds `{env:...}` references, never values |
 | `~/.config/flowhub/runtime.json` | `runtime init --token` | this host's runtime identity (mode 0600) |
 
+The event log is the only file written on the request path: it is appended
+**before** the `202` (no fsync). If the append fails, the receiver answers `503`,
+records `event_append_failed`, and releases the idempotency key so a retry can
+succeed; audit and dispatch remain asynchronous.
+
 ### 13.2 Ports
 
 | Port | Default | Purpose | Exposure |

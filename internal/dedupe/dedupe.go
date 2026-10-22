@@ -49,6 +49,17 @@ func (c *Cache) CheckAndAdd(key string) bool {
 	return false
 }
 
+// Remove forgets one key. The delivery path calls it when a later step failed:
+// leaving the key would make the retry look like a duplicate and lose the event.
+func (c *Cache) Remove(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.entries, key)
+	c.mu.Unlock()
+}
+
 // Sweep drops expired entries and returns how many were removed.
 func (c *Cache) Sweep() int {
 	if c.ttl <= 0 {
