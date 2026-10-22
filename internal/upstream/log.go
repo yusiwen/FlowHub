@@ -52,6 +52,9 @@ type Log struct {
 	file    *os.File
 	fileDay string
 
+	subMu       sync.Mutex
+	subscribers []func(Event)
+
 	recorded    atomic.Int64
 	dropped     atomic.Int64
 	duplicates  atomic.Int64
@@ -113,6 +116,18 @@ func (l *Log) Path() string {
 		return ""
 	}
 	return filepath.Join(l.dir, l.opts.Now().UTC().Format("2006-01-02")+".jsonl")
+}
+
+// Subscribe registers a listener for appended events. The listener runs on the
+// writer goroutine and must not block; the flow engine submits to its own queue.
+// Events written before the call are not replayed.
+func (l *Log) Subscribe(listener func(Event)) {
+	if l == nil || listener == nil {
+		return
+	}
+	l.subMu.Lock()
+	l.subscribers = append(l.subscribers, listener)
+	l.subMu.Unlock()
 }
 
 // Record enqueues one event. It validates the envelope, assigns an id and a
@@ -234,8 +249,14 @@ func (l *Log) write(event Event) {
 	}
 
 	day := event.ReceivedAt.UTC().Format("2006-01-02")
+	written := false
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer func() {
+		l.mu.Unlock()
+		if written {
+			l.notify(event)
+		}
+	}()
 	if l.file == nil || l.fileDay != day {
 		if l.file != nil {
 			_ = l.file.Close()
@@ -262,6 +283,16 @@ func (l *Log) write(event Event) {
 	l.recorded.Add(1)
 	l.lastEvent.Store(event.ReceivedAt.UnixNano())
 	l.setError("")
+	written = true
+}
+
+func (l *Log) notify(event Event) {
+	l.subMu.Lock()
+	subscribers := append([]func(Event){}, l.subscribers...)
+	l.subMu.Unlock()
+	for _, listener := range subscribers {
+		listener(event)
+	}
 }
 
 // prune removes daily files older than the retention window. It runs at start-up

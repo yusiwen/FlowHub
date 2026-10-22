@@ -201,3 +201,34 @@ func TestLogPrunesOldFiles(t *testing.T) {
 		t.Fatalf("recent file was pruned: %v", err)
 	}
 }
+
+func TestLogNotifiesSubscribers(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	log, err := upstream.NewLog(upstream.LogOptions{Dir: dir, Logger: logger()})
+	if err != nil {
+		t.Fatalf("new log: %v", err)
+	}
+	defer func() { _ = log.Close() }()
+	notified := make(chan upstream.Event, 2)
+	log.Subscribe(func(event upstream.Event) { notified <- event })
+
+	log.Record(event(now))
+	log.Flush()
+	select {
+	case event := <-notified:
+		if event.Subject.Key != "TEST-12" || event.ID == "" {
+			t.Fatalf("unexpected event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber was not called")
+	}
+
+	log.Record(event(now))
+	log.Flush()
+	select {
+	case event := <-notified:
+		t.Fatalf("duplicate notified: %+v", event)
+	case <-time.After(50 * time.Millisecond):
+	}
+}

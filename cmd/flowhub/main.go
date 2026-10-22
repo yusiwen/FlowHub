@@ -34,6 +34,8 @@ import (
 	"github.com/yusiwen/flowhub/internal/config"
 	"github.com/yusiwen/flowhub/internal/dedupe"
 	"github.com/yusiwen/flowhub/internal/dispatch"
+	flowbuiltin "github.com/yusiwen/flowhub/internal/flow/builtin"
+	flowengine "github.com/yusiwen/flowhub/internal/flow/engine"
 	"github.com/yusiwen/flowhub/internal/logging"
 	"github.com/yusiwen/flowhub/internal/metrics"
 	"github.com/yusiwen/flowhub/internal/projectmap"
@@ -334,9 +336,43 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	// a runtime's breadth must bound both, not each in its own world.
 	capacity := runner.NewCapacity()
 
+	// The registry is opened once and shared: dispatch owns the write side, the
+	// shadow engine reads the same rows, and two independent caches could disagree
+	// about the task an event belongs to.
+	tasks, err := registry.Open(cfg.ResolvedRegistryFile())
+	if err != nil {
+		return fmt.Errorf("open task registry: %w", err)
+	}
+
+	// The builtin flow starts in shadow: it evaluates every accepted event and
+	// writes a run, but every node that would touch a workspace, a session or a
+	// runtime is skipped. It is the comparison against dispatch, not a second
+	// consumer of the live pipeline.
+	flowDefinition, flowRaw, err := flowbuiltin.Load()
+	if err != nil {
+		return fmt.Errorf("load builtin flow: %w", err)
+	}
+	flowEngine, err := flowengine.New(flowengine.Options{
+		Flow:       flowDefinition,
+		Definition: flowRaw,
+		Projects:   projects,
+		Tasks:      tasks,
+		Policy:     src.Policy(),
+		DataDir:    cfg.DataDir,
+		QueueSize:  cfg.DispatchQueueSize,
+		Logger:     logger,
+	})
+	if err != nil {
+		return fmt.Errorf("start flow shadow: %w", err)
+	}
+	events.Subscribe(flowEngine.Submit)
+	flowEngine.Start(ctx)
+	defer func() { _ = flowEngine.Close() }()
+	logger.Info("flow shadow started", "flow", flowDefinition.Definition.ID, "runs", flowEngine.Snapshot()["dir"])
+
 	// The dispatcher is built before the handler so that a delivery can never be
 	// accepted before there is something to hand it to.
-	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger, capacity)
+	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger, capacity, tasks)
 	if err != nil {
 		return err
 	}
@@ -411,6 +447,9 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		logger.Warn("http shutdown incomplete", "error", err)
 	}
 	stopSweeper()
+	if err := flowEngine.Close(); err != nil {
+		return fmt.Errorf("closing flow shadow engine: %w", err)
+	}
 	if err := sink.Close(shutdownCtx); err != nil {
 		return fmt.Errorf("draining audit queue: %w", err)
 	}
@@ -823,7 +862,7 @@ func startControlAPI(ctx context.Context, cfg config.Config, projects *projectma
 //
 // The returned channel closes when the worker has stopped, so shutdown can wait
 // for an in-flight turn instead of killing the process under it.
-func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger, capacity *runner.Capacity) (*dispatch.Dispatcher, <-chan struct{}, error) {
+func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger, capacity *runner.Capacity, tasks *registry.Registry) (*dispatch.Dispatcher, <-chan struct{}, error) {
 	if !cfg.Dispatch {
 		return nil, nil, nil
 	}
@@ -863,11 +902,6 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 	// With an inventory the rule becomes "at least one runtime answers", because
 	// the point of several hosts is that one may be down.
 	if err := checkRuntimesReachable(ctx, cfg, inventory, defaultRuntime, factory, logger); err != nil {
-		return nil, nil, err
-	}
-
-	tasks, err := registry.Open(cfg.ResolvedRegistryFile())
-	if err != nil {
 		return nil, nil, err
 	}
 

@@ -1,0 +1,190 @@
+{
+  "version": 1,
+  "id": "default-youtrack",
+  "name": "Default YouTrack pipeline",
+  "description": "Today's dispatch behaviour expressed as a flow: analyse on creation, plan or execute on a human trigger, permit or revoke on the recorded refusals.",
+  "builtin": true,
+  "upstream": "youtrack",
+  "triggers": [
+    {
+      "id": "all-youtrack-events",
+      "event": "*",
+      "exclusive": true,
+      "priority": 0,
+      "dedupe": {
+        "scope": "event"
+      }
+    }
+  ],
+  "tasks": {
+    "primary": {
+      "identity": "upstream",
+      "reuse": true
+    }
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "name": "Start"
+    },
+    {
+      "id": "ensure",
+      "type": "task.ensure",
+      "name": "Ensure task",
+      "config": {
+        "task": "primary"
+      }
+    },
+    {
+      "id": "evaluate",
+      "type": "task.evaluate",
+      "name": "Evaluate event",
+      "config": {
+        "task": "primary",
+        "policy": "upstream"
+      }
+    },
+    {
+      "id": "branch",
+      "type": "branch",
+      "name": "Action"
+    },
+    {
+      "id": "analyze",
+      "type": "task.turn",
+      "name": "Analyze",
+      "config": {
+        "task": "primary",
+        "action": "analyze",
+        "phase": "analysis",
+        "require_reply": true
+      }
+    },
+    {
+      "id": "plan",
+      "type": "task.turn",
+      "name": "Plan",
+      "config": {
+        "task": "primary",
+        "action": "plan",
+        "phase": "analysis",
+        "require_reply": true
+      }
+    },
+    {
+      "id": "execute",
+      "type": "task.turn",
+      "name": "Execute",
+      "config": {
+        "task": "primary",
+        "action": "execute",
+        "phase": "execution",
+        "require_reply": true
+      }
+    },
+    {
+      "id": "permit",
+      "type": "task.grant",
+      "name": "Grant permit",
+      "config": {
+        "task": "primary",
+        "commands": "refusals"
+      }
+    },
+    {
+      "id": "continue",
+      "type": "task.turn",
+      "name": "Continue after permit",
+      "config": {
+        "task": "primary",
+        "action": "last",
+        "phase": "auto",
+        "require_reply": true
+      }
+    },
+    {
+      "id": "revoke",
+      "type": "task.revoke",
+      "name": "Revoke grant",
+      "config": {
+        "task": "primary"
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "name": "End",
+      "config": {
+        "state": "succeeded"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "ensure"
+    },
+    {
+      "from": "ensure",
+      "to": "evaluate"
+    },
+    {
+      "from": "evaluate",
+      "to": "branch"
+    },
+    {
+      "from": "branch",
+      "to": "analyze",
+      "when": "steps.evaluate.output.action == 'analyze'"
+    },
+    {
+      "from": "branch",
+      "to": "plan",
+      "when": "steps.evaluate.output.action == 'plan'"
+    },
+    {
+      "from": "branch",
+      "to": "execute",
+      "when": "steps.evaluate.output.action == 'execute'"
+    },
+    {
+      "from": "branch",
+      "to": "permit",
+      "when": "steps.evaluate.output.action == 'permit'"
+    },
+    {
+      "from": "branch",
+      "to": "revoke",
+      "when": "steps.evaluate.output.action == 'revoke'"
+    },
+    {
+      "from": "branch",
+      "to": "end"
+    },
+    {
+      "from": "analyze",
+      "to": "end"
+    },
+    {
+      "from": "plan",
+      "to": "end"
+    },
+    {
+      "from": "execute",
+      "to": "end"
+    },
+    {
+      "from": "permit",
+      "to": "continue"
+    },
+    {
+      "from": "continue",
+      "to": "end"
+    },
+    {
+      "from": "revoke",
+      "to": "end"
+    }
+  ]
+}

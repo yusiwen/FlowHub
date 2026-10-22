@@ -14,7 +14,9 @@ opt-in (`FLOWHUB_DISPATCH=1`) and turns an accepted delivery into one opencode
 turn inside a per-task git worktree. Every accepted delivery is also normalised
 into a neutral event and appended to `events/YYYY-MM-DD.jsonl` for the flow engine
 (`internal/upstream`, ADR 0013); the dispatcher remains the live consumer until the
-staged cutover.
+staged cutover. The builtin flow also runs in **shadow**: it evaluates every
+accepted event, writes a run under `runs/<run-id>/`, and marks every workspace/
+session/runtime node skipped.
 
 The documents below are the specification — read the relevant section before
 changing behaviour:
@@ -112,6 +114,9 @@ internal/source/    the source seam: Request, Decoded, Source, ToolPolicy (data 
 internal/source/youtrack/ the YouTrack adapter: payload model, schema report, neutral-event decoding, tools, prompt
 internal/webhook/   The delivery pipeline: entry locks, body limits, source decode, replay window, idempotency, audit, redaction
 internal/upstream/  The flow event seam: Event envelope, Normalizer, append-only per-day event log with dedupe and /healthz counters
+internal/flow/      The flow model and compiler: strict definition, typed nodes, expression/template language, parity fixture
+internal/flow/builtin/ the embedded read-only default-youtrack flow
+internal/flow/engine/ the shadow runner: trigger matching, task projection, profile evaluation, run meta/journal
 internal/projectmap/ the configuration file (v1/v2, sources, runtimes, (source, project) index, provenance) (~/.config/flowhub/config.json)
 internal/agent/       the runtime seam: Runtime, Turn/Result, Phase, Downloads, model references
 internal/agent/opencode/  the opencode implementation: one protocol-detecting client with a v1 and a v2 transport, arbiter, session rulesets, one-turn runner
