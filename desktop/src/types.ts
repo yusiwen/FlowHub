@@ -248,6 +248,7 @@ export interface HubFlowSummary {
   projects?: string[];
   updated_at?: string;
   updated_by?: string;
+  on_available?: boolean;
   triggers: HubFlowTrigger[];
   last_run: HubRunSummary | null;
 }

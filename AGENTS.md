@@ -18,7 +18,8 @@ staged cutover. The builtin flow also runs in **shadow**: it evaluates every
 accepted event, writes a run under `runs/<run-id>/`, and marks every workspace/
 session/runtime node skipped. `/hub/v1` exposes the definition and runs to the
 desktop under `FLOWHUB_HUB_TOKEN`, and `flowhub flow list|show|mode` is the local
-operator switch (`off`/`shadow`; `on` waits for the task service, M3-1).
+operator switch (`off`/`shadow`/`on`; `on` needs `FLOWHUB_DISPATCH=1` so the
+shared task service can execute turns).
 
 The documents below are the specification — read the relevant section before
 changing behaviour:
@@ -119,7 +120,8 @@ internal/webhook/   The delivery pipeline: entry locks, body limits, source deco
 internal/upstream/  The flow event seam: Event envelope, Normalizer, append-only per-day event log with dedupe and /healthz counters
 internal/flow/      The flow model and compiler: strict definition, typed nodes, expression/template language, parity fixture
 internal/flow/builtin/ the embedded read-only default-youtrack flow
-internal/flow/engine/ the shadow runner: trigger matching, task projection, profile evaluation, run meta/journal
+internal/flow/engine/ the flow runner: trigger matching, task projection, profile evaluation, shadow or on execution, run meta/journal
+internal/tasks/    the execution seam: ensure/turn/grant/revoke, implemented by dispatch and consumed by the flow engine
 internal/flow/mode/ the deployment state: off/shadow/on in `<DataDir>/flows/state.json`, live-reloaded
 internal/flow/api/ the read-only `/hub/v1` surface (flows, runs, journal), bearer token in front
 internal/projectmap/ the configuration file (v1/v2, sources, runtimes, (source, project) index, provenance) (~/.config/flowhub/config.json)

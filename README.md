@@ -162,7 +162,7 @@ flowhub runtime doctor --push# re-check and report to the control plane
 flowhub runtime uninstall    # remove exactly what the manifest records
 flowhub flow list            # builtin flow, deployment mode, revision, run count
 flowhub flow show default-youtrack   # print the flow definition JSON
-flowhub flow mode default-youtrack shadow --project TEST   # off|shadow; on needs the task service
+flowhub flow mode default-youtrack shadow --project TEST   # off|shadow|on
 ```
 
 On the service host, the same binary manages the runtime inventory over the
@@ -353,12 +353,14 @@ The control API serves `/control/v1/runtimes` (`GET` inventory, `POST …/invite
 The flow API is read-only and lives on the same listener as the webhook:
 `GET /hub/v1/flows`, `/hub/v1/flows/{id}`, `POST /hub/v1/flows/{id}/deployment`,
 `/hub/v1/runs?flow=&state=&limit=&cursor=`, `/hub/v1/runs/{id}` and
-`/hub/v1/runs/{id}/events?after=`. Every request needs
+`/hub/v1/runs/{id}/events?after=`. `on` answers `409` when the service was started
+without the task service (`FLOWHUB_DISPATCH=0`). Every request needs
 `Authorization: Bearer $FLOWHUB_HUB_TOKEN`; an unset token answers `503`. The
 builtin flow is **off** by default; `flowhub flow mode default-youtrack shadow`
-turns on the shadow evaluation (no agent turns yet). `projects` scopes a future
-`on` deployment; it is stored now and shown in `/hub/v1`, but `on` itself answers
-`409` until the task service can execute `task.turn` (M3-1).
+turns on the shadow evaluation. `on` executes the built-in pipeline through the
+shared task service and must name its projects; it requires `FLOWHUB_DISPATCH=1`
+because that process owns the task service and the runtime inventory. With `on`,
+dispatch skips those projects so exactly one orchestrator runs their turns.
 
 `FLOWHUB_DISPATCH=1` refuses to start when dispatching cannot work: no routing
 table, an entry with no `default_branch`, an entry with no `worktrees` directory

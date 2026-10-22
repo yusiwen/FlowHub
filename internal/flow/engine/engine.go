@@ -1,10 +1,9 @@
-// Package engine executes the builtin flow in shadow mode.
+// Package engine executes the builtin flow.
 //
 // A shadow run resolves the task projection, evaluates the upstream policy and
 // walks the graph, but every node that would touch a workspace, a session or a
-// runtime is recorded as skipped. It is the migration instrument: the decision it
-// produces for a real event can be compared with internal/dispatch without either
-// side affecting the other.
+// runtime is recorded as skipped. An `on` run uses the same graph and task
+// service, so the decision and the execution path are the same code.
 package engine
 
 import (
@@ -14,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,9 +21,12 @@ import (
 
 	"github.com/yusiwen/flowhub/internal/event"
 	"github.com/yusiwen/flowhub/internal/flow"
+	"github.com/yusiwen/flowhub/internal/flow/mode"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
+	"github.com/yusiwen/flowhub/internal/store"
+	tasksvc "github.com/yusiwen/flowhub/internal/tasks"
 	"github.com/yusiwen/flowhub/internal/upstream"
 )
 
@@ -48,9 +51,20 @@ type Options struct {
 	QueueSize  int
 	Logger     *slog.Logger
 	Now        func() time.Time
+	// PauseFile is the dispatch kill switch; an `on` flow must honour it too.
+	PauseFile string
+	// MaxCostPerTask stops an `on` turn whose task has already spent this much.
+	// Zero disables the check.
+	MaxCostPerTask float64
 	// ModeEnabled gates shadow execution. Nil means enabled (tests and callers
-	// that do not have a deployment state yet).
+	// that do not have a deployment state yet). ModeFor supersedes it when set:
+	// it answers off/shadow/on for one project.
 	ModeEnabled func(flowID string) bool
+	ModeFor     func(flowID, project string) string
+	// TaskService and TaskSelector are required for `on`; nil keeps the engine
+	// shadow-only.
+	TaskService  tasksvc.Service
+	TaskSelector tasksvc.Selector
 }
 
 // Engine consumes events and writes shadow runs.
@@ -113,7 +127,7 @@ func New(opts Options) (*Engine, error) {
 	}, nil
 }
 
-// Start runs the single shadow worker until ctx is done or Close is called.
+// Start runs the single worker until ctx is done or Close is called.
 func (e *Engine) Start(ctx context.Context) {
 	e.wg.Add(1)
 	go func() {
@@ -126,9 +140,9 @@ func (e *Engine) Start(ctx context.Context) {
 				if !ok {
 					return
 				}
-				if _, err := e.RunEvent(event); err != nil {
+				if _, err := e.RunEventContext(ctx, event); err != nil {
 					e.failed.Add(1)
-					e.log.Error("shadow run failed", "event", event.ID, "error", err)
+					e.log.Error("flow run failed", "event", event.ID, "error", err)
 				}
 			}
 		}
@@ -179,15 +193,22 @@ func (e *Engine) Snapshot() map[string]any {
 		return map[string]any{"enabled": false}
 	}
 	return map[string]any{
-		"enabled":   true,
-		"mode":      "shadow",
-		"flow":      e.opts.Flow.Definition.ID,
-		"submitted": e.submitted.Load(),
-		"dropped":   e.dropped.Load(),
-		"runs":      e.runs.Load(),
-		"failed":    e.failed.Load(),
-		"dir":       e.store.Dir(),
+		"enabled":      true,
+		"mode":         "shadow",
+		"flow":         e.opts.Flow.Definition.ID,
+		"submitted":    e.submitted.Load(),
+		"dropped":      e.dropped.Load(),
+		"runs":         e.runs.Load(),
+		"failed":       e.failed.Load(),
+		"on_available": e.CanExecuteOn(),
+		"dir":          e.store.Dir(),
 	}
+}
+
+// CanExecuteOn reports whether an `on` deployment can run turns in this process:
+// both the task service and the runtime selector are wired.
+func (e *Engine) CanExecuteOn() bool {
+	return e != nil && e.opts.TaskService != nil && e.opts.TaskSelector != nil
 }
 
 // RunStore exposes the run store to the hub API.
@@ -198,11 +219,37 @@ func (e *Engine) RunStore() *Store {
 	return e.store
 }
 
-// RunEvent executes one event synchronously. It is exported for the parity
-// harness; the worker uses it too.
+// RunEvent executes one event synchronously with a background context. It is
+// exported for the parity harness.
 func (e *Engine) RunEvent(event upstream.Event) (*Run, error) {
-	if e.opts.ModeEnabled != nil && !e.opts.ModeEnabled(e.opts.Flow.Definition.ID) {
+	return e.RunEventContext(context.Background(), event)
+}
+
+// RunEventContext executes one event synchronously. The worker passes its own
+// context so an `on` turn is cancelled on shutdown.
+func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (*Run, error) {
+	deployment := e.modeFor(event)
+	if deployment == mode.Off || deployment == "" {
 		return nil, nil
+	}
+	if e.paused() {
+		e.log.Warn("flow engine is paused; delivery ignored", "pause_file", e.opts.PauseFile, "event", event.ID)
+		return nil, nil
+	}
+	if deployment == mode.On && !e.CanExecuteOn() {
+		return nil, fmt.Errorf("on needs a task service; this process has none")
+	}
+	if deployment == mode.On {
+		if !e.authorAllowed(event) {
+			e.log.Warn("actor is not on the project's author allowlist; flow delivery ignored",
+				"issue", event.Subject.Key, "project", event.Subject.Project, "actor", event.Actor.Login)
+			return nil, nil
+		}
+		if task, known := e.task(event); known && e.opts.MaxCostPerTask > 0 && task.Cost >= e.opts.MaxCostPerTask {
+			e.log.Warn("task exceeded its cost budget; a human must take over",
+				"issue", event.Subject.Key, "cost", task.Cost, "budget", e.opts.MaxCostPerTask)
+			return nil, nil
+		}
 	}
 	trigger := e.triggerFor(event)
 	if trigger == nil {
@@ -217,7 +264,7 @@ func (e *Engine) RunEvent(event upstream.Event) (*Run, error) {
 	e.seen[key] = true
 	e.mu.Unlock()
 
-	run, err := e.runShadow(event, trigger)
+	run, err := e.run(ctx, event, trigger, deployment)
 	if err != nil {
 		e.failed.Add(1)
 		return run, err
@@ -226,7 +273,7 @@ func (e *Engine) RunEvent(event upstream.Event) (*Run, error) {
 	return run, nil
 }
 
-type shadowStep struct {
+type stepOutcome struct {
 	state    StepState
 	output   map[string]any
 	next     string
@@ -234,19 +281,36 @@ type shadowStep struct {
 	runState State
 }
 
-func (e *Engine) runShadow(event upstream.Event, trigger *flow.CompiledTrigger) (*Run, error) {
+// liveExecution is the state an `on` run threads through the graph: the record the
+// task service expects, the routing entry and the runtime host chosen for the task.
+type liveExecution struct {
+	record *store.Record
+	entry  *projectmap.Entry
+	host   tasksvc.Host
+	task   registry.Task
+	basis  string
+}
+
+func (e *Engine) run(ctx context.Context, event upstream.Event, trigger *flow.CompiledTrigger, deployment string) (*Run, error) {
 	now := e.now().UTC()
 	revision := sha256.Sum256(e.opts.Definition)
 	run := &Run{
 		ID:        newRunID(now),
 		Flow:      e.opts.Flow.Definition.ID,
 		Revision:  hex.EncodeToString(revision[:]),
-		Mode:      "shadow",
+		Mode:      deployment,
 		State:     StateRunning,
 		Trigger:   trigger.Trigger.ID,
 		Event:     event,
 		StartedAt: now,
 		Steps:     map[string]*Step{},
+	}
+	var live *liveExecution
+	if deployment == mode.On {
+		if e.opts.TaskService == nil || e.opts.TaskSelector == nil {
+			return e.failRun(run, "", fmt.Errorf("on needs a task service; this process has none"))
+		}
+		live = &liveExecution{record: recordFor(event)}
 	}
 	if err := e.store.Create(run); err != nil {
 		return run, err
@@ -281,7 +345,7 @@ func (e *Engine) runShadow(event upstream.Event, trigger *flow.CompiledTrigger) 
 		if err != nil {
 			return e.failStep(run, step, err)
 		}
-		outcome, err := e.execute(node, event, context, views)
+		outcome, err := e.execute(ctx, node, event, context, views, live)
 		if err != nil {
 			return e.failStep(run, step, err)
 		}
@@ -327,15 +391,18 @@ func (e *Engine) runShadow(event upstream.Event, trigger *flow.CompiledTrigger) 
 	return e.failRun(run, "", fmt.Errorf("the graph reached no end node"))
 }
 
-func (e *Engine) execute(node *flow.CompiledNode, event upstream.Event, context map[string]any, views map[string]rules.TaskView) (shadowStep, error) {
+func (e *Engine) execute(ctx context.Context, node *flow.CompiledNode, event upstream.Event, context map[string]any, views map[string]rules.TaskView, live *liveExecution) (stepOutcome, error) {
 	next := ""
 	if len(node.Next) > 0 {
 		next = node.Next[0].Edge.To
 	}
 	switch flow.NodeType(node.Node.Type) {
 	case flow.NodeStart:
-		return shadowStep{state: StepSucceeded, next: next}, nil
+		return stepOutcome{state: StepSucceeded, next: next}, nil
 	case flow.NodeEnsure:
+		if live != nil {
+			return e.ensureLive(ctx, live, event, next)
+		}
 		task, found := e.task(event)
 		routable := false
 		project := event.Subject.Project
@@ -359,18 +426,25 @@ func (e *Engine) execute(node *flow.CompiledNode, event upstream.Event, context 
 			"runtime":  runtime,
 			"reused":   found,
 		}
-		return shadowStep{state: StepSucceeded, output: output, next: next}, nil
+		return stepOutcome{state: StepSucceeded, output: output, next: next}, nil
 	case flow.NodeEvaluate:
 		config := node.Config.(*flow.EvaluateConfig)
 		if !routableFromSteps(context) {
-			return shadowStep{state: StepSucceeded, output: map[string]any{
+			return stepOutcome{state: StepSucceeded, output: map[string]any{
 				"action": "ignore",
 				"basis":  "routing",
 				"reason": fmt.Sprintf("no routing entry for %s/%s", event.Upstream, event.Subject.Project),
 			}, next: next}, nil
 		}
-		decision := e.opts.Policy.Decide(neutralEvent(event), views[config.Task])
-		return shadowStep{state: StepSucceeded, output: map[string]any{
+		view := views[config.Task]
+		if live != nil && live.task.Key != "" {
+			view = viewOf(live.task)
+		}
+		decision := e.opts.Policy.Decide(neutralEvent(event), view)
+		if live != nil {
+			live.basis = decision.Reason
+		}
+		return stepOutcome{state: StepSucceeded, output: map[string]any{
 			"action": string(decision.Action),
 			"basis":  string(decision.Trigger),
 			"reason": decision.Reason,
@@ -378,21 +452,189 @@ func (e *Engine) execute(node *flow.CompiledNode, event upstream.Event, context 
 	case flow.NodeBranch:
 		selected, err := selectEdge(node, context)
 		if err != nil {
-			return shadowStep{}, err
+			return stepOutcome{}, err
 		}
-		return shadowStep{state: StepSucceeded, output: map[string]any{"selected": selected}, next: selected}, nil
-	case flow.NodeTurn, flow.NodeGrant, flow.NodeRevoke:
-		// Shadow never touches a workspace, a session or a registry row.
-		return shadowStep{state: StepSkipped, next: next}, nil
+		return stepOutcome{state: StepSucceeded, output: map[string]any{"selected": selected}, next: selected}, nil
+	case flow.NodeTurn:
+		if live == nil {
+			// Shadow never touches a workspace, a session or a runtime.
+			return stepOutcome{state: StepSkipped, next: next}, nil
+		}
+		return e.turnLive(ctx, live, node, event, next)
+	case flow.NodeGrant:
+		if live == nil {
+			return stepOutcome{state: StepSkipped, next: next}, nil
+		}
+		return e.grantLive(ctx, live, node, next)
+	case flow.NodeRevoke:
+		if live == nil {
+			return stepOutcome{state: StepSkipped, next: next}, nil
+		}
+		return e.revokeLive(ctx, live, next)
 	case flow.NodeEnd:
 		config := node.Config.(*flow.EndConfig)
 		state := StateSucceeded
 		if config.State == "failed" {
 			state = StateFailed
 		}
-		return shadowStep{state: StepSucceeded, finished: true, runState: state}, nil
+		return stepOutcome{state: StepSucceeded, finished: true, runState: state}, nil
 	default:
-		return shadowStep{}, fmt.Errorf("node %q: type %q has no shadow executor", node.Node.ID, node.Node.Type)
+		return stepOutcome{}, fmt.Errorf("node %q: type %q has no shadow executor", node.Node.ID, node.Node.Type)
+	}
+}
+
+func (e *Engine) paused() bool {
+	if e == nil || e.opts.PauseFile == "" {
+		return false
+	}
+	_, err := os.Stat(e.opts.PauseFile)
+	return err == nil
+}
+
+func (e *Engine) authorAllowed(event upstream.Event) bool {
+	if e.opts.Projects == nil {
+		return true
+	}
+	match, ok := e.opts.Projects.Match(event.Upstream, event.Subject.Project)
+	if !ok || match.Entry == nil || len(match.Entry.Authors) == 0 {
+		return true
+	}
+	for _, allowed := range match.Entry.Authors {
+		if strings.EqualFold(strings.TrimSpace(allowed), strings.TrimSpace(event.Actor.Login)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) modeFor(event upstream.Event) string {
+	if e.opts.ModeFor != nil {
+		return e.opts.ModeFor(e.opts.Flow.Definition.ID, event.Subject.Project)
+	}
+	if e.opts.ModeEnabled != nil && !e.opts.ModeEnabled(e.opts.Flow.Definition.ID) {
+		return mode.Off
+	}
+	return mode.Shadow
+}
+
+func recordFor(event upstream.Event) *store.Record {
+	return &store.Record{
+		Kind: "POST", Event: event.Kind, IssueID: event.Subject.Key,
+		ProjectKey: event.Subject.Project, PrimaryActor: event.Actor.Login,
+		Accepted: true, Time: event.ReceivedAt, RawBody: string(event.Payload),
+	}
+}
+
+func viewOf(task registry.Task) rules.TaskView {
+	return rules.TaskView{
+		Known: task.Key != "", Plan: task.Plan, Turns: task.Turns,
+		LastReply: task.LastReply, Refusals: task.Refusals,
+	}
+}
+
+func (e *Engine) ensureLive(ctx context.Context, live *liveExecution, event upstream.Event, next string) (stepOutcome, error) {
+	match, ok := e.opts.Projects.Match(event.Upstream, event.Subject.Project)
+	if !ok {
+		return stepOutcome{state: StepSucceeded, output: map[string]any{
+			"task_id": event.Subject.Key, "routable": false,
+			"project": event.Subject.Project, "runtime": "", "reused": false,
+		}, next: next}, nil
+	}
+	host, err := e.opts.TaskSelector.Select(ctx, live.record, match.Entry)
+	if err != nil {
+		return stepOutcome{}, fmt.Errorf("select a runtime: %w", err)
+	}
+	_, found := e.task(event)
+	task, err := e.opts.TaskService.Ensure(ctx, tasksvc.EnsureRequest{
+		Record: live.record, Delivery: neutralEvent(event), Entry: match.Entry, Host: host,
+	})
+	if err != nil {
+		return stepOutcome{}, fmt.Errorf("ensure the task: %w", err)
+	}
+	live.entry = match.Entry
+	live.host = host
+	live.task = task
+	return stepOutcome{state: StepSucceeded, output: map[string]any{
+		"task_id": task.Key, "routable": true, "project": event.Subject.Project,
+		"runtime": host.Name, "reused": found,
+	}, next: next}, nil
+}
+
+func (e *Engine) turnLive(ctx context.Context, live *liveExecution, node *flow.CompiledNode, event upstream.Event, next string) (stepOutcome, error) {
+	config := node.Config.(*flow.TurnConfig)
+	if live.task.Key == "" {
+		return stepOutcome{}, fmt.Errorf("task.turn %q has no ensured task", node.Node.ID)
+	}
+	action := rules.Action(config.Action)
+	if config.Action == "last" {
+		action = rules.Action(strings.TrimSpace(live.task.LastAction))
+	}
+	result, err := e.opts.TaskService.Turn(ctx, tasksvc.TurnRequest{
+		Record: live.record, Delivery: neutralEvent(event), Task: live.task,
+		Entry: live.entry, Host: live.host, Action: action,
+		RequireReply: config.RequireReply, Basis: live.basis,
+	})
+	if err != nil {
+		return stepOutcome{}, fmt.Errorf("turn %q: %w", node.Node.ID, err)
+	}
+	if result.Task.Key != "" {
+		live.task = result.Task
+	}
+	if config.RequireReply && !result.Replied {
+		return stepOutcome{}, fmt.Errorf("turn %q finished without posting a comment", node.Node.ID)
+	}
+	return stepOutcome{state: StepSucceeded, output: map[string]any{
+		"session_id": result.SessionID, "reply": result.Text,
+		"cost": result.Cost, "tokens": result.Tokens,
+		"timed_out": result.TimedOut, "replied": result.Replied,
+		"refusals": refusals(result.Refusals), "action": string(result.Action),
+	}, next: next}, nil
+}
+
+func (e *Engine) grantLive(ctx context.Context, live *liveExecution, node *flow.CompiledNode, next string) (stepOutcome, error) {
+	config := node.Config.(*flow.GrantConfig)
+	var commands []string
+	if config.Mode != "refusals" {
+		commands = config.List
+	}
+	result, err := e.opts.TaskService.Grant(ctx, tasksvc.GrantRequest{
+		Record: live.record, Task: live.task, Entry: live.entry, Commands: commands, Trigger: live.basis,
+	})
+	if err != nil {
+		return stepOutcome{}, fmt.Errorf("grant %q: %w", node.Node.ID, err)
+	}
+	if result.Task.Key != "" {
+		live.task = result.Task
+	}
+	granted := []string{}
+	actor := ""
+	if live.task.Grant != nil {
+		granted = append(granted, live.task.Grant.Commands...)
+		actor = live.task.Grant.By
+	}
+	return stepOutcome{state: StepSucceeded, output: map[string]any{
+		"granted": granted, "actor": actor, "action": string(result.Action),
+	}, next: next}, nil
+}
+
+func (e *Engine) revokeLive(ctx context.Context, live *liveExecution, next string) (stepOutcome, error) {
+	if err := e.opts.TaskService.Revoke(ctx, tasksvc.RevokeRequest{Record: live.record, Task: live.task}); err != nil {
+		return stepOutcome{}, fmt.Errorf("revoke: %w", err)
+	}
+	if task, ok := e.task(taskEvent(live.record)); ok {
+		live.task = task
+	}
+	return stepOutcome{state: StepSucceeded, output: map[string]any{"revoked": true}, next: next}, nil
+}
+
+func taskEvent(rec *store.Record) upstream.Event {
+	if rec == nil {
+		return upstream.Event{}
+	}
+	return upstream.Event{
+		Upstream: "youtrack", Kind: rec.Event,
+		Subject: upstream.Subject{Key: rec.IssueID, Project: rec.ProjectKey},
+		Actor:   upstream.Actor{Login: rec.PrimaryActor},
 	}
 }
 

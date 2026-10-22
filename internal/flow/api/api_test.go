@@ -26,6 +26,11 @@ type fixture struct {
 
 func newFixture(t *testing.T, token string) fixture {
 	t.Helper()
+	return newFixtureWith(t, token, false)
+}
+
+func newFixtureWith(t *testing.T, token string, onAvailable bool) fixture {
+	t.Helper()
 	compiled, raw, err := builtin.Load()
 	if err != nil {
 		t.Fatalf("builtin: %v", err)
@@ -41,7 +46,8 @@ func newFixture(t *testing.T, token string) fixture {
 	}
 	handler, err := api.New(api.Options{
 		Token: token, Flow: compiled, Definition: raw, Modes: modes, Runs: runs,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnAvailable: onAvailable,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("api: %v", err)
@@ -248,5 +254,21 @@ func TestDeploymentWritesProjectScope(t *testing.T) {
 	}
 	if recorder := postJSON(t, f.handler, path, "wrong", `{"mode":"shadow"}`); recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("auth status = %d, want 401", recorder.Code)
+	}
+}
+
+func TestDeploymentOnIsAcceptedWhenTheTaskServiceIsAvailable(t *testing.T) {
+	t.Setenv("FLOWHUB_OPERATOR", "operator-b")
+	f := newFixtureWith(t, "sekret", true)
+	path := "/hub/v1/flows/" + f.flowID + "/deployment"
+	body := decode(t, postJSON(t, f.handler, path, "sekret", `{"mode":"on","projects":["TEST"]}`))
+	// The handler is only asked to store the state; executing it is the engine's work.
+	if body["mode"] != mode.On || body["updated_by"] != "operator-b" {
+		t.Fatalf("deployment = %+v", body)
+	}
+	flows := decode(t, request(t, f.handler, "/hub/v1/flows", "sekret"))
+	summary := flows["flows"].([]any)[0].(map[string]any)
+	if summary["mode"] != mode.On || summary["on_available"] != true {
+		t.Fatalf("summary = %+v", summary)
 	}
 }

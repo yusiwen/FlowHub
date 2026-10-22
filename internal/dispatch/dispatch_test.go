@@ -1577,3 +1577,31 @@ func TestAFailedTurnRecordsWhyOnTheRow(t *testing.T) {
 		t.Fatalf("last_error = %q, want the silent finish named", task.LastError)
 	}
 }
+
+func TestAProjectOwnedByAFlowIsSkippedBeforeQueueing(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, _ := newScheduledDispatcher(t, fake, server, "")
+	dispatcher.opts.Skip = func(rec *store.Record) (bool, string) {
+		if rec.ProjectKey == "TEST" {
+			return true, "flow owns TEST"
+		}
+		return false, ""
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dispatcher.Run(ctx)
+
+	dispatcher.Dispatch(delivery("TEST-80", "issueCreated", issueCreatedBody("TEST-80")))
+	time.Sleep(300 * time.Millisecond)
+	if got := dispatcher.Snapshot()["handled"].(int64); got != 0 {
+		t.Fatalf("handled = %d, want 0", got)
+	}
+	if got := dispatcher.Snapshot()["ignored"].(int64); got == 0 {
+		t.Fatalf("ignored = %d, want the skip counted", got)
+	}
+	if got := fake.promptCount(); got != 0 {
+		t.Fatalf("prompts = %d, want no dispatch turn", got)
+	}
+}

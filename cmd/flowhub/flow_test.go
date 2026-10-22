@@ -54,3 +54,19 @@ func TestFlowCommandLifecycle(t *testing.T) {
 		t.Fatal("a missing subcommand must be refused")
 	}
 }
+
+func TestFlowModeOnNeedsDispatch(t *testing.T) {
+	t.Setenv("FLOWHUB_DATA_DIR", t.TempDir())
+	t.Setenv("FLOWHUB_DISPATCH", "1")
+	var stdout, stderr bytes.Buffer
+	if code := runFlowCommand([]string{"mode", "default-youtrack", "on", "--project", "TEST"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("on code = %d, stderr = %s", code, stderr.String())
+	}
+	stdout.Reset()
+	if code := runFlowCommand([]string{"list"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("list code = %d", code)
+	}
+	if !strings.Contains(stdout.String(), "on") || !strings.Contains(stdout.String(), "TEST") {
+		t.Fatalf("list output = %q", stdout.String())
+	}
+}

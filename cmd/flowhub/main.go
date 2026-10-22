@@ -349,10 +349,8 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		return fmt.Errorf("open task registry: %w", err)
 	}
 
-	// The builtin flow starts in shadow: it evaluates every accepted event and
-	// writes a run, but every node that would touch a workspace, a session or a
-	// runtime is skipped. It is the comparison against dispatch, not a second
-	// consumer of the live pipeline.
+	// The builtin flow is loaded and its deployment state read before dispatch is
+	// constructed: dispatch consults the state to skip a project the flow owns.
 	flowDefinition, flowRaw, err := flowbuiltin.Load()
 	if err != nil {
 		return fmt.Errorf("load builtin flow: %w", err)
@@ -361,41 +359,52 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	if err != nil {
 		return fmt.Errorf("open flow deployment state: %w", err)
 	}
+
+	// The dispatcher is built before the handler so that a delivery can never be
+	// accepted before there is something to hand it to. It also implements the task
+	// service the flow engine uses for `on`; a project owned by an `on` flow is
+	// skipped here, so exactly one orchestrator runs its turns.
+	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger, capacity, tasks, modes, flowDefinition.Definition.ID)
+	if err != nil {
+		return err
+	}
+
+	// The flow engine runs shadow by default and `on` when the deployment state says
+	// so and this process has the task service. It consumes the durable event log;
+	// dispatch is the live consumer only for projects the flow does not own.
 	flowEngine, err := flowengine.New(flowengine.Options{
-		Flow:       flowDefinition,
-		Definition: flowRaw,
-		Projects:   projects,
-		Tasks:      tasks,
-		Policy:     src.Policy(),
-		DataDir:    cfg.DataDir,
-		QueueSize:  cfg.DispatchQueueSize,
-		Logger:     logger,
-		ModeEnabled: func(id string) bool {
-			return modes.Mode(id) == flowmode.Shadow
+		Flow:           flowDefinition,
+		Definition:     flowRaw,
+		Projects:       projects,
+		Tasks:          tasks,
+		TaskService:    dispatcher.TaskService(),
+		TaskSelector:   dispatcher.TaskSelector(),
+		Policy:         src.Policy(),
+		DataDir:        cfg.DataDir,
+		QueueSize:      cfg.DispatchQueueSize,
+		Logger:         logger,
+		PauseFile:      cfg.ResolvedPauseFile(),
+		MaxCostPerTask: cfg.TaskMaxCost,
+		ModeFor: func(id, project string) string {
+			return flowDeploymentMode(modes, id, project)
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("start flow shadow: %w", err)
+		return fmt.Errorf("start flow engine: %w", err)
 	}
 	events.Subscribe(flowEngine.Submit)
 	flowEngine.Start(ctx)
 	defer func() { _ = flowEngine.Close() }()
 	logger.Info("flow engine started",
 		"flow", flowDefinition.Definition.ID, "mode", modes.Mode(flowDefinition.Definition.ID),
-		"runs", flowEngine.Snapshot()["dir"])
+		"on_available", flowEngine.CanExecuteOn(), "runs", flowEngine.Snapshot()["dir"])
 	hubAPI, err := flowapi.New(flowapi.Options{
 		Token: cfg.HubToken, Flow: flowDefinition, Definition: flowRaw,
-		Modes: modes, Runs: flowEngine.RunStore(), Logger: logger,
+		Modes: modes, Runs: flowEngine.RunStore(), OnAvailable: dispatcher != nil,
+		Logger: logger,
 	})
 	if err != nil {
 		return fmt.Errorf("start hub API: %w", err)
-	}
-
-	// The dispatcher is built before the handler so that a delivery can never be
-	// accepted before there is something to hand it to.
-	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger, capacity, tasks)
-	if err != nil {
-		return err
 	}
 
 	// The control API is the only authenticated write surface in this process, and
@@ -884,7 +893,7 @@ func startControlAPI(ctx context.Context, cfg config.Config, projects *projectma
 //
 // The returned channel closes when the worker has stopped, so shutdown can wait
 // for an in-flight turn instead of killing the process under it.
-func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger, capacity *runner.Capacity, tasks *registry.Registry) (*dispatch.Dispatcher, <-chan struct{}, error) {
+func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger, capacity *runner.Capacity, tasks *registry.Registry, modes *flowmode.Store, flowID string) (*dispatch.Dispatcher, <-chan struct{}, error) {
 	if !cfg.Dispatch {
 		return nil, nil, nil
 	}
@@ -951,6 +960,19 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 		PauseFile:      cfg.ResolvedPauseFile(),
 		Capacity:       capacity,
 		MaxCostPerTask: cfg.TaskMaxCost,
+		Skip: func(rec *store.Record) (bool, string) {
+			if modes == nil {
+				return false, ""
+			}
+			entry, _ := modes.Entry(flowID)
+			if entry.Mode != flowmode.On {
+				return false, ""
+			}
+			if len(entry.Projects) > 0 && !containsProject(entry.Projects, rec.ProjectKey) {
+				return false, ""
+			}
+			return true, "flow " + flowID + " owns project " + rec.ProjectKey
+		},
 	})
 	if err != nil {
 		return nil, nil, err
@@ -1119,6 +1141,36 @@ func startSweeper(ctx context.Context, cache *dedupe.Cache, ttl time.Duration, l
 	return func() { <-done }
 }
 
+// flowDeploymentMode applies the project scope: shadow is always all projects;
+// on is limited to the recorded set (empty means all); off is none.
+func flowDeploymentMode(modes *flowmode.Store, flowID, project string) string {
+	if modes == nil {
+		return flowmode.Off
+	}
+	entry, _ := modes.Entry(flowID)
+	switch entry.Mode {
+	case flowmode.On:
+		if len(entry.Projects) == 0 || containsProject(entry.Projects, project) {
+			return flowmode.On
+		}
+		return flowmode.Off
+	case flowmode.Shadow, flowmode.Off:
+		return entry.Mode
+	default:
+		return flowmode.Off
+	}
+}
+
+func containsProject(projects []string, project string) bool {
+	project = strings.TrimSpace(project)
+	for _, candidate := range projects {
+		if strings.EqualFold(strings.TrimSpace(candidate), project) {
+			return true
+		}
+	}
+	return false
+}
+
 // healthHandler serves GET /healthz for local operations. nginx never proxies
 // this path, so it is not part of the public attack surface.
 func healthHandler(cfg config.Config, projects *projectmap.Map, stats *metrics.Counters, sink *store.Async, cache *dedupe.Cache, audit *store.JSONL, detail *store.Detail, events *upstream.Log, dispatcher *dispatch.Dispatcher, inventory *runtimes.Inventory, flowEngine *flowengine.Engine, modes *flowmode.Store, started time.Time) http.HandlerFunc {
@@ -1201,8 +1253,8 @@ func flowHealth(engine *flowengine.Engine, modes *flowmode.Store) map[string]any
 			snapshot["updated_by"] = entry.UpdatedBy
 			snapshot["updated_at"] = entry.UpdatedAt
 		}
-		if mode == flowmode.On {
-			snapshot["state_error"] = "on needs the task service (M3-1); the flow cannot execute task.turn yet"
+		if mode == flowmode.On && !engine.CanExecuteOn() {
+			snapshot["state_error"] = "on needs FLOWHUB_DISPATCH=1 and the task service; the flow cannot execute task.turn"
 		}
 	}
 	snapshot["definitions"] = 1

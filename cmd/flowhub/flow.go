@@ -83,8 +83,10 @@ func runFlowCommand(args []string, stdout, stderr io.Writer) int {
 		switch next {
 		case mode.Off, mode.Shadow:
 		case mode.On:
-			fmt.Fprintln(stderr, "flowhub flow mode: on needs the task service (M3-1); use off or shadow")
-			return 1
+			if !dispatchEnabled() {
+				fmt.Fprintln(stderr, "flowhub flow mode: on needs FLOWHUB_DISPATCH=1 and the task service; use off or shadow")
+				return 1
+			}
 		default:
 			fmt.Fprintln(stderr, "flowhub flow mode: mode must be off or shadow")
 			return 1
@@ -107,6 +109,15 @@ func runFlowCommand(args []string, stdout, stderr io.Writer) int {
 	default:
 		flowUsage(stderr)
 		return 1
+	}
+}
+
+func dispatchEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FLOWHUB_DISPATCH"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 
