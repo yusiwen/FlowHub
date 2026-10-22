@@ -1,6 +1,8 @@
 package webhook
 
 import (
+	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -11,12 +13,27 @@ import (
 type captureEvents struct {
 	mu     sync.Mutex
 	events []upstream.Event
+	err    error
 }
 
 func (c *captureEvents) Record(event upstream.Event) {
+	_ = c.Append(event)
+}
+
+func (c *captureEvents) Append(event upstream.Event) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.err != nil {
+		return c.err
+	}
 	c.events = append(c.events, event)
+	return nil
+}
+
+func (c *captureEvents) fail(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = err
 }
 
 func (c *captureEvents) all() []upstream.Event {
@@ -87,5 +104,38 @@ func TestDuplicateDeliveryRecordsOneEvent(t *testing.T) {
 	h.post(t, keyedPath(), testToken, body)
 	if events := sink.all(); len(events) != 1 {
 		t.Fatalf("duplicate delivery recorded %d events", len(events))
+	}
+}
+
+func TestAppendFailureIsA503AndReleasesTheDedupeKey(t *testing.T) {
+	sink := &captureEvents{}
+	sink.fail(errors.New("disk full"))
+	h := newHarness(t, func(opts *Options) { opts.Events = sink })
+	body := issueUpdatedBody(freshTimestamp())
+
+	resp := h.post(t, keyedPath(), testToken, body)
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.Code)
+	}
+	if resp.Body.Len() != 0 {
+		t.Fatalf("body = %q, want empty", resp.Body.String())
+	}
+	got := h.sink.last(t)
+	if got.Accepted || got.Reason != ReasonEventAppendFailed {
+		t.Fatalf("audit = accepted=%v reason=%q", got.Accepted, got.Reason)
+	}
+	if events := sink.all(); len(events) != 0 {
+		t.Fatalf("failed append recorded %d events", len(events))
+	}
+
+	// The idempotency key must not swallow the retry: the first attempt was
+	// answered 503 precisely so the delivery can be tried again.
+	sink.fail(nil)
+	resp = h.post(t, keyedPath(), testToken, body)
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("retry status = %d, want 202", resp.Code)
+	}
+	if events := sink.all(); len(events) != 1 {
+		t.Fatalf("retry events = %d, want 1", len(events))
 	}
 }

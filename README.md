@@ -929,12 +929,15 @@ store the secret. `TestRedactionNeverEchoesAnUnrecognisedKey` pins it.
 
 ```
 three locks -> body cap -> content type -> JSON -> known event -> replay window
-            -> idempotency -> audit (background) -> 202 empty
+            -> idempotency -> event append (durable) -> audit (background) -> 202 empty
 ```
 
 Rejections are deliberately indistinguishable from success at the HTTP layer:
 status `202`, empty body, no explanatory header. The reason is written only to the
-local audit log and to the `/healthz` counters.
+local audit log and to the `/healthz` counters. The deliberate exceptions are
+`405` for a wrong method, `413` for an oversized body, and `503` when the durable
+event append fails: answering `202` there would claim an accepted event that the
+flow engine will never see.
 
 | Reason | Trigger |
 | --- | --- |
@@ -950,6 +953,8 @@ local audit log and to the `/healthz` counters.
 | `unparseable_timestamp` | `timestamp` is neither RFC 3339 nor epoch milliseconds |
 | `outside_replay_window` | `timestamp` is further than the replay window from local time |
 | `duplicate` | The idempotency key was seen within `FLOWHUB_DEDUPE_TTL` |
+| `event_normalize_failed` | The source could not produce a neutral flow event (answered `503`) |
+| `event_append_failed` | The event log could not append the event (answered `503`); the idempotency key is released so a retry can work |
 
 `event` values accepted: `issueCreated`, `issueUpdated`, `issueDeleted`,
 `commentAdded`, `commentUpdated`, `commentDeleted`, `workItemAdded`,
@@ -958,14 +963,16 @@ local audit log and to the `/healthz` counters.
 
 ## Log files
 
-Three files land in `FLOWHUB_DATA_DIR`, all written on the background queue
-goroutine so they never delay the `202`:
+The audit, payload and application logs are written on background queues. The
+flow event log is the exception: it is appended before the `202`, because an
+accepted event must not be lost.
 
 | File | Audience | Contents |
 | --- | --- | --- |
 | `flowhub.log` | operator | Startup banner, one line per verdict, errors. Rotates by size (`flowhub.log.1`…`.N`), also tees to stderr |
 | `payload-YYYY-MM-DD.log` | you, reading the real wire format | One verbose block per delivery: request line, source addresses, masked headers, locks, verdict, payload keys, a per-path type schema, and the pretty-printed body |
 | `webhook-YYYY-MM-DD.jsonl` | machines | One JSON object per delivery, including the full raw body, for replay and `jq` |
+| `events/YYYY-MM-DD.jsonl` | flow engine | The neutral event envelope of every accepted delivery. **Appended synchronously before the `202`** (no fsync), `0600`, 30-day retention |
 
 ```bash
 # Watch deliveries as they arrive, readable form

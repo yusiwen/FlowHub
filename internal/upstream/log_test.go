@@ -232,3 +232,138 @@ func TestLogNotifiesSubscribers(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+func TestAppendWritesBeforeItReturns(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	log, err := upstream.NewLog(upstream.LogOptions{
+		Dir: dir, Logger: logger(), Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("new log: %v", err)
+	}
+	defer func() { _ = log.Close() }()
+
+	if err := log.Append(event(now)); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "events", "2026-10-21.jsonl"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if lines := strings.Count(strings.TrimSpace(string(data)), "\n") + 1; lines != 1 {
+		t.Fatalf("lines = %d, body = %s", lines, data)
+	}
+	var stored upstream.Event
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &stored); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if stored.ID == "" || stored.ReceivedAt.IsZero() {
+		t.Fatalf("stored = %+v", stored)
+	}
+}
+
+func TestAppendAbsorbsADuplicate(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	log, err := upstream.NewLog(upstream.LogOptions{
+		Dir: dir, Logger: logger(), Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("new log: %v", err)
+	}
+	defer func() { _ = log.Close() }()
+
+	if err := log.Append(event(now)); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if err := log.Append(event(now)); err != nil {
+		t.Fatalf("duplicate: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "events", "2026-10-21.jsonl"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if lines := strings.Count(strings.TrimSpace(string(data)), "\n") + 1; lines != 1 {
+		t.Fatalf("lines = %d, body = %s", lines, data)
+	}
+	if got := log.Snapshot()["duplicates"]; got != int64(1) {
+		t.Fatalf("duplicates = %v", got)
+	}
+}
+
+func TestAFailedAppendReleasesItsDedupeKey(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	log, err := upstream.NewLog(upstream.LogOptions{
+		Dir: dir, Logger: logger(), Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("new log: %v", err)
+	}
+	defer func() { _ = log.Close() }()
+	eventsDir := filepath.Join(dir, "events")
+	// A directory at the day-file path makes OpenFile fail deterministically, also
+	// for a test process running as root.
+	if err := os.Mkdir(filepath.Join(eventsDir, "2026-10-21.jsonl"), 0o700); err != nil {
+		t.Fatalf("block day file: %v", err)
+	}
+	if err := log.Append(event(now)); err == nil {
+		t.Fatal("expected the append to fail while the day-file path is a directory")
+	}
+	if err := os.Remove(filepath.Join(eventsDir, "2026-10-21.jsonl")); err != nil {
+		t.Fatalf("unblock: %v", err)
+	}
+	if err := log.Append(event(now)); err != nil {
+		t.Fatalf("the retry must not be absorbed as a duplicate: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(eventsDir, "2026-10-21.jsonl"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if lines := strings.Count(strings.TrimSpace(string(data)), "\n") + 1; lines != 1 {
+		t.Fatalf("lines = %d, body = %s", lines, data)
+	}
+}
+
+func TestAppendAfterCloseIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	log, err := upstream.NewLog(upstream.LogOptions{
+		Dir: dir, Logger: logger(), Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("new log: %v", err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := log.Append(event(now)); err == nil {
+		t.Fatal("append after close must fail")
+	}
+}
+
+func TestAppendNotifiesBeforeReturning(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	log, err := upstream.NewLog(upstream.LogOptions{
+		Dir: dir, Logger: logger(), Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("new log: %v", err)
+	}
+	defer func() { _ = log.Close() }()
+	notified := make(chan upstream.Event, 1)
+	log.Subscribe(func(event upstream.Event) { notified <- event })
+	if err := log.Append(event(now)); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	select {
+	case event := <-notified:
+		if event.ID == "" || event.Subject.Key != "TEST-12" {
+			t.Fatalf("unexpected event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the subscriber was not called before Append returned")
+	}
+}

@@ -48,6 +48,11 @@ type Log struct {
 
 	dedupe *dedupe.Cache
 
+	// writeMu serializes dedupe + file write between the asynchronous writer and
+	// a synchronous Append. Without it two identical deliveries could both pass the
+	// dedupe check, and a failed append could not safely release its key.
+	writeMu sync.Mutex
+
 	mu      sync.Mutex
 	file    *os.File
 	fileDay string
@@ -229,34 +234,59 @@ func (l *Log) loop() {
 	}
 }
 
+// Append writes one event synchronously and returns nil only after it is on disk.
+// It is the delivery path: the webhook answers 202 only after this returns nil. It
+// does not fsync; the explicit durability contract is "the write reached the OS",
+// which is enough to survive a process crash and is the append-before-202 rule.
+func (l *Log) Append(event Event) error {
+	if l == nil {
+		return fmt.Errorf("upstream: no event log")
+	}
+	// Hold sendMu so Close cannot close the file under an append that is in
+	// progress, and so an append after Close is refused rather than written to a
+	// closed file.
+	l.sendMu.Lock()
+	defer l.sendMu.Unlock()
+	if l.closed {
+		return fmt.Errorf("upstream: event log is closed")
+	}
+	return l.persist(event)
+}
+
 func (l *Log) write(event Event) {
+	_ = l.persist(event)
+}
+
+func (l *Log) persist(event Event) error {
 	if event.ID == "" {
 		event.ID = NewID(l.opts.Now())
 	}
 	if event.ReceivedAt.IsZero() {
 		event.ReceivedAt = l.opts.Now()
 	}
+	if err := event.Validate(); err != nil {
+		l.invalid.Add(1)
+		l.setError(err.Error())
+		return err
+	}
 	key := event.Upstream + "\x00" + event.DedupeKey
+
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
 	if l.dedupe.CheckAndAdd(key) {
 		l.duplicates.Add(1)
-		return
+		return nil
 	}
 	data, err := json.Marshal(event)
 	if err != nil {
+		l.dedupe.Remove(key)
 		l.writeErrors.Add(1)
 		l.setError(fmt.Sprintf("marshal event: %v", err))
-		return
+		return fmt.Errorf("marshal event: %w", err)
 	}
 
 	day := event.ReceivedAt.UTC().Format("2006-01-02")
-	written := false
 	l.mu.Lock()
-	defer func() {
-		l.mu.Unlock()
-		if written {
-			l.notify(event)
-		}
-	}()
 	if l.file == nil || l.fileDay != day {
 		if l.file != nil {
 			_ = l.file.Close()
@@ -266,24 +296,32 @@ func (l *Log) write(event Event) {
 		path := filepath.Join(l.dir, day+".jsonl")
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
+			l.mu.Unlock()
+			l.dedupe.Remove(key)
 			l.writeErrors.Add(1)
 			l.setError(fmt.Sprintf("open %s: %v", path, err))
-			return
+			return fmt.Errorf("open %s: %w", path, err)
 		}
 		l.file = file
 		l.fileDay = day
 	}
 	if _, err := l.file.Write(append(data, '\n')); err != nil {
-		l.writeErrors.Add(1)
-		l.setError(fmt.Sprintf("write %s: %v", l.file.Name(), err))
+		name := l.file.Name()
 		_ = l.file.Close()
 		l.file = nil
-		return
+		l.mu.Unlock()
+		l.dedupe.Remove(key)
+		l.writeErrors.Add(1)
+		l.setError(fmt.Sprintf("write %s: %v", name, err))
+		return fmt.Errorf("write %s: %w", name, err)
 	}
+	l.mu.Unlock()
+
 	l.recorded.Add(1)
 	l.lastEvent.Store(event.ReceivedAt.UnixNano())
 	l.setError("")
-	written = true
+	l.notify(event)
+	return nil
 }
 
 func (l *Log) notify(event Event) {

@@ -56,3 +56,17 @@ func TestZeroTTLDisablesDeduplication(t *testing.T) {
 		t.Fatalf("len = %d, want 0", cache.Len())
 	}
 }
+
+func TestRemoveForgetsAKey(t *testing.T) {
+	cache := New(time.Hour)
+	if cache.CheckAndAdd("key") {
+		t.Fatal("first delivery must not be a duplicate")
+	}
+	cache.Remove("key")
+	if cache.CheckAndAdd("key") {
+		t.Fatal("a removed key must be accepted again")
+	}
+	if cache.Len() != 1 {
+		t.Fatalf("len = %d, want 1", cache.Len())
+	}
+}

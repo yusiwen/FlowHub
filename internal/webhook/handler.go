@@ -45,6 +45,8 @@ const (
 	ReasonUnparseableTimestamp  = "unparseable_timestamp"
 	ReasonOutsideReplayWindow   = "outside_replay_window"
 	ReasonDuplicate             = "duplicate"
+	ReasonEventNormalizeFailed  = "event_normalize_failed"
+	ReasonEventAppendFailed     = "event_append_failed"
 )
 
 // AllReasons lists every stable rejection label, in evaluation order.
@@ -61,6 +63,8 @@ var AllReasons = []string{
 	ReasonUnparseableTimestamp,
 	ReasonOutsideReplayWindow,
 	ReasonDuplicate,
+	ReasonEventNormalizeFailed,
+	ReasonEventAppendFailed,
 }
 
 // IsKnownReason reports whether reason is one of the stable rejection labels.
@@ -103,10 +107,10 @@ type Options struct {
 	// receiver owns the transport locks, and the adapter owns what a delivery from
 	// *its* tracker means. Required.
 	Source source.Source
-	// Events, when set, receives the neutral envelope of every accepted delivery.
-	// The source must also implement upstream.Normalizer; an adapter that does not
-	// keeps working without an event log.
-	Events upstream.Sink
+	// Events, when set, durably appends the neutral envelope of every accepted
+	// delivery before the 202. The source must also implement
+	// upstream.Normalizer; a nil sink keeps the receiver record-only.
+	Events upstream.DurableSink
 }
 
 // Dispatcher receives accepted deliveries for asynchronous work.
@@ -284,30 +288,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The event log is the durable input. It is written before the 202: an event
+	// that cannot be appended is not accepted, and a retry must be able to try
+	// again, so the idempotency key is released on failure.
+	if reason, err := h.appendEvent(decoded, request, start); err != nil {
+		h.dd.Remove(dedupeKey)
+		h.log.Error("flow event was not appended",
+			"reason", reason, "issue_id", rec.IssueID, "error", err)
+		h.respond(w, rec, reason, http.StatusServiceUnavailable)
+		return
+	}
 	h.respond(w, rec, "", http.StatusAccepted)
-	h.recordEvent(decoded, request, start)
 }
 
-// recordEvent appends the neutral envelope of an accepted delivery.
+// appendEvent normalizes and durably appends the neutral envelope of an accepted
+// delivery. It returns a stable reason when the delivery cannot become an event,
+// so the audit row says which side failed.
 //
-// It runs after the response is written and only when an event log is configured.
 // The source is type-asserted instead of widening source.Source, so an adapter
-// that has not been taught the flow envelope still serves the webhook.
-func (h *Handler) recordEvent(decoded source.Decoded, request *source.Request, received time.Time) {
-	if h.opts.Events == nil || h.opts.Source == nil {
-		return
+// that has not been taught the flow envelope is refused rather than silently
+// accepted when an event log is configured.
+func (h *Handler) appendEvent(decoded source.Decoded, request *source.Request, received time.Time) (string, error) {
+	if h.opts.Events == nil {
+		return "", nil
+	}
+	if h.opts.Source == nil {
+		return ReasonEventNormalizeFailed, fmt.Errorf("no source is configured to normalize the event")
 	}
 	normalizer, ok := h.opts.Source.(upstream.Normalizer)
 	if !ok {
-		h.log.Error("source cannot normalize an event for the flow log", "source", h.opts.Source.Name())
-		return
+		return ReasonEventNormalizeFailed, fmt.Errorf("source %q cannot normalize a flow event", h.opts.Source.Name())
 	}
 	envelope, err := normalizer.Normalize(decoded, request, received)
 	if err != nil {
-		h.log.Error("normalize event for the flow log", "source", h.opts.Source.Name(), "error", err)
-		return
+		return ReasonEventNormalizeFailed, fmt.Errorf("normalize event: %w", err)
 	}
-	h.opts.Events.Record(envelope)
+	if err := h.opts.Events.Append(envelope); err != nil {
+		return ReasonEventAppendFailed, fmt.Errorf("append event: %w", err)
+	}
+	return "", nil
 }
 
 // describe fills the record from what the source decoded.
