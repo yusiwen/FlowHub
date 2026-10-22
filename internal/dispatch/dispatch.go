@@ -1200,13 +1200,30 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 // anyToolCompleted reports whether the turn called one of the source's reply
 // tools successfully, which is what "the issue got an answer" means. The list is
 // the source's; the loop is the dispatcher's.
+// sameTool compares a source's tool name with the name the server reported. On
+// v2 the MCP surface spells a name `youtrack.add_issue_comment`, while the source
+// contract and the prompt use `youtrack_add_issue_comment`; treating those as two
+// tools made a posted comment look like silence (found by the real E2E).
+func sameTool(got, want string) bool {
+	if got == want {
+		return true
+	}
+	normalize := func(name string) string {
+		name = strings.TrimSpace(name)
+		name = strings.ReplaceAll(name, ".", "_")
+		name = strings.ReplaceAll(name, "-", "_")
+		return name
+	}
+	return normalize(got) == normalize(want)
+}
+
 func anyToolCompleted(calls []agent.ToolCall, replyTools []string) bool {
 	for _, call := range calls {
 		if call.Status != "completed" {
 			continue
 		}
 		for _, reply := range replyTools {
-			if call.Name == reply {
+			if sameTool(call.Name, reply) {
 				return true
 			}
 		}

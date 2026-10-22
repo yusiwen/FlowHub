@@ -220,6 +220,29 @@ func TestV2MessagesProjection(t *testing.T) {
 		t.Fatalf("parts = %+v", message.Parts)
 	}
 
+	// A v2 execute call carries the real MCP calls in metadata.toolCalls; the
+	// outer part is only "execute". Flattening is what lets reply detection see
+	// the comment call the model actually made.
+	execute := messageV2{ID: "m4", Type: "assistant"}
+	if err := json.Unmarshal([]byte(`[{
+		"type":"tool","name":"execute",
+		"state":{"status":"completed","input":{"code":"..."},
+		"metadata":{"toolCalls":[
+			{"tool":"youtrack.add_issue_comment","status":"completed","input":{"issueId":"TEST-1"}}
+		]}}}]`), &execute.Content); err != nil {
+		t.Fatal(err)
+	}
+	executeMsg := execute.toMessage()
+	found := false
+	for _, part := range executeMsg.Parts {
+		if part.Tool == "youtrack.add_issue_comment" && part.State != nil && part.State.Status == "completed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("nested MCP call not projected: %+v", executeMsg.Parts)
+	}
+
 	idle := messageV2{ID: "m3", Type: "idle", Outcome: "failed"}
 	idle.Time.Created = 4
 	idle.Error = &structuredErrorV2{Type: "provider.auth", Message: "bad key"}
