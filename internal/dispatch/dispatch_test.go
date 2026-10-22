@@ -971,9 +971,15 @@ func TestOneRuntimeStillRunsOneTurnAtATime(t *testing.T) {
 	dispatcher.Dispatch(delivery("TEST-52", "issueCreated", issueCreatedBody("TEST-52")))
 	dispatcher.Dispatch(delivery("TEST-53", "issueCreated", issueCreatedBody("TEST-53")))
 
-	// The first turn is held open, so a second prompt on the same runtime would mean
-	// two turns on one session host at once.
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the first turn to reach the fake server. Worktree preparation can take
+	// longer than half a second on a cold macOS runner, and a fixed sleep then read
+	// zero in-flight prompts and failed a correct dispatcher (measured 2026-10-22).
+	waitFor(t, 10*time.Second, func() bool {
+		return fake.promptCount() == 1
+	})
+	// Now hold it long enough that a second prompt would have arrived if the
+	// scheduler had started one.
+	time.Sleep(300 * time.Millisecond)
 	if got := fake.promptCount(); got != 1 {
 		t.Fatalf("prompts in flight = %d, want 1: one runtime runs one turn at a time", got)
 	}
