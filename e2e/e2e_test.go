@@ -1,7 +1,7 @@
 //go:build e2e
 
-// Package e2e drives a real FlowHub process against the self-hosted YouTrack
-// TEST project and the local opencode server. It is opt-in: the normal test
+// Package e2e drives a real FlowHub process against a configured YouTrack test
+// project and a local opencode server. It is opt-in: the normal test
 // suite never starts a process that talks to production services.
 package e2e
 
@@ -78,28 +78,17 @@ func setup() *env {
 		client:      &http.Client{Timeout: 30 * time.Second},
 		ytClient:    &http.Client{Timeout: 30 * time.Second},
 	}
-	if e.ytBase == "" {
-		e.ytBase = "https://pm.yusiwen.cn"
-	}
-	if e.ytProject == "" {
-		e.ytProject = "TEST"
-	}
-	if e.ytProjectID == "" {
-		e.ytProjectID = "0-2"
-	}
 	if e.ocBase == "" {
 		e.ocBase = "http://127.0.0.1:4096"
-	}
-	if e.repo == "" {
-		e.repo = "/Users/yusiwen/git/mine/test"
-	}
-	if e.ytIssue == "" {
-		e.ytIssue = "TEST-38"
 	}
 	required := map[string]string{
 		"FLOWHUB_HOOK_KEY": e.hookKey,
 		"FLOWHUB_TOKEN":    e.hookToken,
+		"YOUTRACK_URL":     e.ytBase,
 		"YOUTRACK_TOKEN":   e.ytToken,
+		"YOUTRACK_PROJECT": e.ytProject,
+		"E2E_REPO":         e.repo,
+		"E2E_ISSUE":        e.ytIssue,
 	}
 	for name, value := range required {
 		if value == "" {
@@ -114,7 +103,7 @@ func setup() *env {
 	if e.live {
 		e.addr = os.Getenv("E2E_ADDR")
 		if e.addr == "" {
-			e.addr = "192.168.8.20:8080"
+			fatalf("e2e: E2E_ADDR is required in live mode (the address the YouTrack app posts to)")
 		}
 	} else {
 		e.addr = "127.0.0.1:18080"
@@ -228,7 +217,7 @@ func TestWebhookDeliversAnIssueUpdate(t *testing.T) {
 	if suite.live {
 		suite.waitForAudit(t, issue, "issueUpdated", 20*time.Second)
 	} else {
-		payload := issueUpdatedPayload(issue, description, stamp)
+		payload := issueUpdatedPayload(issue, description, stamp, suite.ytProject)
 		response := suite.postWebhook(t, payload)
 		if response != http.StatusAccepted {
 			t.Fatalf("webhook status = %d, want 202", response)
@@ -255,7 +244,7 @@ func TestIssueCreatedRunsOneDispatchTurn(t *testing.T) {
 	}
 	t.Logf("created %s (%s)", key, id)
 	if !suite.live {
-		if status := suite.postWebhook(t, issueCreatedPayload(key, summary)); status != http.StatusAccepted {
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, suite.ytProject)); status != http.StatusAccepted {
 			t.Fatalf("webhook status = %d, want 202", status)
 		}
 	}
@@ -272,6 +261,11 @@ func TestIssueCreatedRunsOneDispatchTurn(t *testing.T) {
 }
 
 func (e *env) createIssue(summary, description string) (key, id string, err error) {
+	if e.ytProjectID == "" {
+		if err := e.resolveProjectID(); err != nil {
+			return "", "", err
+		}
+	}
 	body := map[string]any{
 		"project":     map[string]any{"id": e.ytProjectID},
 		"summary":     summary,
@@ -324,6 +318,23 @@ func (e *env) dispatchHandled(t *testing.T) float64 {
 		t.Fatalf("health: %v", err)
 	}
 	return body.Dispatch.Handled
+}
+
+func (e *env) resolveProjectID() error {
+	var projects []struct {
+		ID        string `json:"id"`
+		ShortName string `json:"shortName"`
+	}
+	if err := e.ytRequest(http.MethodGet, "/api/admin/projects?fields=id,shortName&$top=100", nil, &projects); err != nil {
+		return err
+	}
+	for _, project := range projects {
+		if project.ShortName == e.ytProject {
+			e.ytProjectID = project.ID
+			return nil
+		}
+	}
+	return fmt.Errorf("YouTrack project %q was not found", e.ytProject)
 }
 
 func (e *env) waitForDispatchHandled(t *testing.T, minimum float64, timeout time.Duration) {
@@ -419,13 +430,13 @@ func (e *env) openCodeSessionsIn(t *testing.T, directory string) int {
 	return len(body.Data)
 }
 
-func issueCreatedPayload(key, summary string) []byte {
+func issueCreatedPayload(key, summary, project string) []byte {
 	payload := map[string]any{
 		"event":       "issueCreated",
 		"timestamp":   time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 		"id":          key,
 		"summary":     summary,
-		"project":     map[string]any{"key": "TEST", "name": "TEST", "shortName": "TEST"},
+		"project":     map[string]any{"key": project, "name": project, "shortName": project},
 		"description": "Created by the FlowHub E2E turn test.",
 		"created":     time.Now().UnixMilli(),
 		"reporter":    map[string]any{"login": "yusiwen", "fullName": "Siwen Yu"},
@@ -460,7 +471,7 @@ func TestShadowComparisonOnIssueUpdate(t *testing.T) {
 	if suite.live {
 		suite.waitForAudit(t, suite.ytIssue, "issueUpdated", 20*time.Second)
 	} else {
-		payload := issueUpdatedPayload(suite.ytIssue, updateIssueDescription, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+		payload := issueUpdatedPayload(suite.ytIssue, updateIssueDescription, time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)
 		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
 			t.Fatalf("webhook status = %d", status)
 		}
@@ -479,7 +490,7 @@ func TestOnExecutesAndRollsBack(t *testing.T) {
 		t.Skip("set E2E_FLOW=1 to run shadow/on checks")
 	}
 	t.Cleanup(func() { _ = suite.setMode("off", nil) })
-	if err := suite.setMode("on", []string{"TEST"}); err != nil {
+	if err := suite.setMode("on", []string{suite.ytProject}); err != nil {
 		t.Fatalf("set on: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -490,7 +501,7 @@ func TestOnExecutesAndRollsBack(t *testing.T) {
 		t.Fatalf("create issue: %v", err)
 	}
 	if !suite.live {
-		if status := suite.postWebhook(t, issueCreatedPayload(key, summary)); status != http.StatusAccepted {
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, suite.ytProject)); status != http.StatusAccepted {
 			t.Fatalf("webhook status = %d", status)
 		}
 	}
@@ -516,7 +527,7 @@ func TestOnExecutesAndRollsBack(t *testing.T) {
 		t.Fatalf("rollback update: %v", err)
 	}
 	if !suite.live {
-		if status := suite.postWebhook(t, issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"))); status != http.StatusAccepted {
+		if status := suite.postWebhook(t, issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)); status != http.StatusAccepted {
 			t.Fatalf("rollback webhook status = %d", status)
 		}
 	}
@@ -637,7 +648,7 @@ func TestCommentTriggerStartsAPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add comment: %v", err)
 	}
-	if status := suite.postWebhook(t, commentAddedPayload(key, comment)); status != http.StatusAccepted {
+	if status := suite.postWebhook(t, commentAddedPayload(key, comment, suite.ytProject)); status != http.StatusAccepted {
 		t.Fatalf("webhook status = %d", status)
 	}
 	suite.waitForDispatchHandled(t, baseline+1, 20*time.Second)
@@ -654,7 +665,7 @@ func TestDuplicateWebhookIsIdempotent(t *testing.T) {
 	}
 	beforeDuplicates := suite.counters(t)["duplicates"]
 	beforeEvents := eventLineCount(t, suite.dataDir)
-	payload := issueUpdatedPayload(suite.ytIssue, "FlowHub duplicate "+time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+	payload := issueUpdatedPayload(suite.ytIssue, "FlowHub duplicate "+time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)
 	if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
 		t.Fatalf("first status = %d", status)
 	}
@@ -679,7 +690,7 @@ func TestPauseDoesNotDispatch(t *testing.T) {
 	}
 	defer func() { _ = os.Remove(pause) }()
 	beforeIgnored := suite.dispatchIgnored(t)
-	payload := issueUpdatedPayload(suite.ytIssue, "FlowHub paused "+time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+	payload := issueUpdatedPayload(suite.ytIssue, "FlowHub paused "+time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)
 	if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
 		t.Fatalf("status = %d", status)
 	}
@@ -716,7 +727,7 @@ func TestShadowSoak(t *testing.T) {
 		if err := suite.updateIssue(suite.ytIssue, description); err != nil {
 			t.Fatalf("update %d: %v", i, err)
 		}
-		payload := issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+		payload := issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)
 		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
 			t.Fatalf("webhook %d status = %d", i, status)
 		}
@@ -758,13 +769,13 @@ func (e *env) flowDropped(t *testing.T) float64 {
 	return body.Flows.Dropped
 }
 
-func commentAddedPayload(key, commentID string) []byte {
+func commentAddedPayload(key, commentID, project string) []byte {
 	payload := map[string]any{
 		"event":     "commentAdded",
 		"timestamp": time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 		"id":        key,
 		"summary":   "FlowHub E2E trigger",
-		"project":   map[string]any{"key": "TEST", "name": "TEST", "shortName": "TEST"},
+		"project":   map[string]any{"key": project, "name": project, "shortName": project},
 		"comments": []map[string]any{{
 			"id": commentID, "text": "/opencode start",
 			"created": time.Now().UnixMilli(),
@@ -801,7 +812,7 @@ func TestRestartKeepsComparisonState(t *testing.T) {
 	if err := suite.updateIssue(suite.ytIssue, description); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if status := suite.postWebhook(t, issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"))); status != http.StatusAccepted {
+	if status := suite.postWebhook(t, issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)); status != http.StatusAccepted {
 		t.Fatalf("webhook status = %d", status)
 	}
 	suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.ShadowCompared > before.ShadowCompared }, 20*time.Second)
@@ -822,7 +833,7 @@ func TestRestartKeepsComparisonState(t *testing.T) {
 	if err := suite.updateIssue(suite.ytIssue, description); err != nil {
 		t.Fatalf("update after restart: %v", err)
 	}
-	if status := suite.postWebhook(t, issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"))); status != http.StatusAccepted {
+	if status := suite.postWebhook(t, issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)); status != http.StatusAccepted {
 		t.Fatalf("webhook after restart status = %d", status)
 	}
 	suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.ShadowCompared > afterRestart.ShadowCompared }, 20*time.Second)
@@ -965,13 +976,13 @@ func (e *env) ytRequest(method, path string, body, out any) error {
 	return nil
 }
 
-func issueUpdatedPayload(issue, description, timestamp string) []byte {
+func issueUpdatedPayload(issue, description, timestamp, project string) []byte {
 	payload := map[string]any{
 		"event":       "issueUpdated",
 		"timestamp":   timestamp,
 		"id":          issue,
 		"summary":     "FlowHub E2E webhook check",
-		"project":     map[string]any{"key": "TEST", "name": "TEST", "shortName": "TEST"},
+		"project":     map[string]any{"key": project, "name": project, "shortName": project},
 		"description": description,
 		"updated":     time.Now().UnixMilli(),
 		"updatedBy":   map[string]any{"login": "yusiwen", "fullName": "Siwen Yu"},

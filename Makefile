@@ -73,11 +73,11 @@ e2e: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 go test -tags=e2e ./e2e -count=1 -v
 
-# Requires the test FlowHub to own the address the YouTrack app posts to
-# (default 192.168.8.20:8080) and no real receiver on that port.
+# Requires the test FlowHub to own the address the YouTrack app posts to; set
+# E2E_ADDR to that address and stop any real receiver on that port first.
 e2e-live: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
-		FLOWHUB_E2E=1 FLOWHUB_E2E_LIVE=1 E2E_ADDR=$${E2E_ADDR:-192.168.8.20:8080} \
+		FLOWHUB_E2E=1 FLOWHUB_E2E_LIVE=1 E2E_ADDR=$${E2E_ADDR:?set E2E_ADDR to the webhook target} \
 		go test -tags=e2e ./e2e -count=1 -v
 
 # Opt-in: shadow comparison and a real on-mode turn, then rollback to off.
@@ -100,7 +100,7 @@ e2e-restart: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 E2E_RESTART=1 go test -tags=e2e ./e2e -count=1 -v
 
-# Opt-in: spends one real opencode turn and creates one TEST issue.
+# Opt-in: spends one real opencode turn and creates one test-project issue.
 e2e-turn: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 E2E_TURN=1 go test -tags=e2e ./e2e -count=1 -v
