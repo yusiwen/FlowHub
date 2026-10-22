@@ -98,6 +98,13 @@ func normalizedDedupeKey(e *event.Event, decoded source.Decoded) string {
 		e.Comment,
 		e.State,
 	}
+	if !e.IsComment() && len(e.Raw) > 0 {
+		// An issue update carries its changed content in the body, not in the
+		// Event fields. Without this, two legitimate updates in the same second
+		// (different descriptions, same key/instant) collapse into one event.
+		// A retried webhook still has the same body and is still deduped.
+		parts = append(parts, string(e.Raw))
+	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }

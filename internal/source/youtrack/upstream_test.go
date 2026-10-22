@@ -99,3 +99,15 @@ func TestNormalizeCreated(t *testing.T) {
 		t.Fatalf("subject = %+v", event.Subject)
 	}
 }
+
+func TestIssueUpdateDedupeIncludesChangedContent(t *testing.T) {
+	first := normalize(t, updatedBody)
+	changed := strings.Replace(updatedBody, `"value":{"name":"In Progress"}}]}`, `"value":{"name":"In Progress"},"description":"second"}]}`, 1)
+	if changed == updatedBody {
+		t.Fatal("test body did not change")
+	}
+	second := normalize(t, changed)
+	if first.DedupeKey == second.DedupeKey {
+		t.Fatalf("different issue updates share a dedupe key: %q", first.DedupeKey)
+	}
+}
