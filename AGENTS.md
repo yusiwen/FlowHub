@@ -335,6 +335,11 @@ documents. The rules below are load-bearing; do not relax them casually.
    task's work drains, so two deliveries of one issue cannot reach two hosts. Do not
    replace the scheduler with a per-task mutex taken after dequeueing: that parks a
    worker on another task's turn (`internal/dispatch/schedule.go`, ADR 0003).
+   A task left in `analyzing`, `planning` or `executing` by a SIGKILL is marked
+   `failed` at the next startup with `last_error: "interrupted by a restart;
+   inspect before retrying"`; its session/worktree/turn count are kept for
+   inspection, and no turn is replayed automatically. Only flow-engine runs get the
+   separate `needs_attention` recovery.
 10. **The agent's reply must never start another turn.** Our own comments are
     recognised by content, because the agent posts as the same YouTrack user as
     the human. Three independent layers: the `<!-- flowhub-auto -->` marker in the

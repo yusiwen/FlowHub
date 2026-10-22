@@ -256,6 +256,28 @@ func (r *Registry) Update(source, key string, mutate func(*Task)) (Task, error) 
 	return stored, nil
 }
 
+// RecoverInterrupted marks tasks left in a running state by a previous process.
+// Their session/worktree/turn count are kept for inspection; the row says failed
+// with a reason instead of pretending the turn is still running.
+func (r *Registry) RecoverInterrupted() (int, error) {
+	recovered := 0
+	for _, task := range r.List() {
+		switch task.State {
+		case StateAnalyzing, StatePlanning, StateExecuting:
+		default:
+			continue
+		}
+		if _, err := r.Update(task.Source, task.Key, func(t *Task) {
+			t.State = StateFailed
+			t.LastError = "interrupted by a restart; inspect before retrying"
+		}); err != nil {
+			return recovered, err
+		}
+		recovered++
+	}
+	return recovered, nil
+}
+
 // Ensure returns the task, creating it with the given seed when it is unknown.
 func (r *Registry) Ensure(source, key string, seed func(*Task)) (Task, bool, error) {
 	if task, ok := r.Get(source, key); ok {
