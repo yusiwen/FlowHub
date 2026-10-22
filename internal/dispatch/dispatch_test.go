@@ -1621,3 +1621,13 @@ func TestDispatchPublishesItsDecisionForTheEventID(t *testing.T) {
 		t.Fatalf("observed = %+v", observed)
 	}
 }
+
+func TestReplyToolNamesFromV2MCPAreNormalized(t *testing.T) {
+	calls := []agent.ToolCall{{Name: "youtrack.add_issue_comment", Status: "completed"}}
+	if !anyToolCompleted(calls, []string{"youtrack_add_issue_comment"}) {
+		t.Fatal("a dotted v2 MCP name must count as the source's underscore reply tool")
+	}
+	if anyToolCompleted([]agent.ToolCall{{Name: "youtrack.add_issue_comment", Status: "error"}}, []string{"youtrack_add_issue_comment"}) {
+		t.Fatal("a failed call must not count as a reply")
+	}
+}

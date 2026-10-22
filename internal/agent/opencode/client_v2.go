@@ -337,6 +337,13 @@ type toolStateV2 struct {
 		Text string `json:"text"`
 		URI  string `json:"uri"`
 	} `json:"content"`
+	Metadata struct {
+		ToolCalls []struct {
+			Tool   string          `json:"tool"`
+			Status string          `json:"status"`
+			Input  json.RawMessage `json:"input"`
+		} `json:"toolCalls"`
+	} `json:"metadata"`
 	Error *structuredErrorV2 `json:"error"`
 }
 
@@ -424,6 +431,18 @@ func (m messageV2) toMessage() Message {
 				part.State = state
 			}
 			message.Parts = append(message.Parts, part)
+			if content.State != nil {
+				// A v2 `execute` tool runs MCP calls inside its JavaScript sandbox;
+				// the outer call is named `execute`, while the actual work (including
+				// the reply tool) is in metadata.toolCalls. Flatten those so reply
+				// detection sees what happened instead of "a code block ran".
+				for _, call := range content.State.Metadata.ToolCalls {
+					message.Parts = append(message.Parts, Part{
+						Type: "tool", Tool: call.Tool,
+						State: &ToolState{Status: call.Status, Input: call.Input},
+					})
+				}
+			}
 		case "reasoning":
 			// Reasoning is not the answer and must not become part of it; the v1
 			// projection drops it for the same reason.
