@@ -52,6 +52,13 @@ Real dispatch turn (creates a new TEST issue and spends one opencode turn):
 make e2e-turn
 ```
 
+Shadow/on/rollback (one shadow comparison plus an `on` turn; leaves the test
+instance `off`):
+
+```bash
+make e2e-flow
+```
+
 `E2E_ISSUE` defaults to `TEST-38` for the `issueUpdated` webhook test; the turn
 test creates a fresh issue itself.
 
@@ -69,7 +76,11 @@ Do not point the production YouTrack webhook app at a test instance.
 
 - live and direct webhook delivery of an issue update;
 - one real dispatch analysis turn, one worktree/session, one YouTrack comment,
-  terminal `awaiting_input` state.
+  terminal `awaiting_input` state;
+- a shadow comparison on a real issue update (`shadow_compared` grows,
+  `shadow_mismatches` stays zero);
+- an `on` turn through the flow task service, then rollback to `off` and a
+  dispatch-handled delivery again.
 
-The next scenarios (comment trigger, permit/revoke, duplicate, pause, mode
-switch/`on`, restart and soak) are tracked in #118.
+The next scenarios (comment trigger, permit/revoke, duplicate, pause, restart and
+soak) are tracked in #119.

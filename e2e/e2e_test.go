@@ -265,6 +265,19 @@ func (e *env) createIssue(summary, description string) (key, id string, err erro
 	return response.IDReadable, response.ID, nil
 }
 
+func (e *env) dispatchHandled(t *testing.T) float64 {
+	t.Helper()
+	var body struct {
+		Dispatch struct {
+			Handled float64 `json:"handled"`
+		} `json:"dispatch"`
+	}
+	if err := e.getJSON(t, "/healthz", &body); err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	return body.Dispatch.Handled
+}
+
 func (e *env) waitForDispatchHandled(t *testing.T, minimum float64, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -380,6 +393,177 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func TestShadowComparisonOnIssueUpdate(t *testing.T) {
+	if os.Getenv("E2E_FLOW") != "1" {
+		t.Skip("set E2E_FLOW=1 to run shadow/on checks")
+	}
+	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	if err := suite.setMode("shadow", nil); err != nil {
+		t.Fatalf("set shadow: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	before := suite.flowHealth(t)
+	updateIssueDescription := "FlowHub E2E shadow " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	if err := suite.updateIssue(suite.ytIssue, updateIssueDescription); err != nil {
+		t.Fatalf("update issue: %v", err)
+	}
+	if suite.live {
+		suite.waitForAudit(t, suite.ytIssue, "issueUpdated", 20*time.Second)
+	} else {
+		payload := issueUpdatedPayload(suite.ytIssue, updateIssueDescription, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+	}
+	suite.waitForFlowHealth(t, func(f flowHealth) bool {
+		return f.Runs > before.Runs && f.ShadowCompared > before.ShadowCompared
+	}, 20*time.Second)
+	health := suite.flowHealth(t)
+	if health.ShadowMismatches != 0 {
+		t.Fatalf("shadow mismatches = %v", health.ShadowMismatches)
+	}
+}
+
+func TestOnExecutesAndRollsBack(t *testing.T) {
+	if os.Getenv("E2E_FLOW") != "1" {
+		t.Skip("set E2E_FLOW=1 to run shadow/on checks")
+	}
+	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	if err := suite.setMode("on", []string{"TEST"}); err != nil {
+		t.Fatalf("set on: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	before := suite.flowHealth(t)
+	summary := "FlowHub E2E on " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Created by the FlowHub E2E on test.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	if !suite.live {
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary)); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+	}
+	suite.waitForComment(t, key, "<!-- flowhub-auto -->", 6*time.Minute)
+	suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.Runs > before.Runs }, 30*time.Second)
+	worktree, state := suite.waitForTurnState(t, key, 2*time.Minute)
+	if state == "failed" {
+		t.Fatalf("on task %s ended failed", key)
+	}
+	if count := suite.openCodeSessionsIn(t, worktree); count == 0 {
+		t.Fatalf("no opencode session in on worktree %s", worktree)
+	}
+	if !suite.hasRunMode(t, "on") {
+		t.Fatal("no on run appeared in /hub/v1/runs")
+	}
+	// Roll back and prove dispatch takes the next delivery again.
+	handledBefore := suite.dispatchHandled(t)
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("rollback off: %v", err)
+	}
+	description := "FlowHub E2E rollback " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	if err := suite.updateIssue(suite.ytIssue, description); err != nil {
+		t.Fatalf("rollback update: %v", err)
+	}
+	if !suite.live {
+		if status := suite.postWebhook(t, issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05Z"))); status != http.StatusAccepted {
+			t.Fatalf("rollback webhook status = %d", status)
+		}
+	}
+	suite.waitForDispatchHandled(t, handledBefore+1, 10*time.Second)
+}
+
+type flowHealth struct {
+	Runs             float64
+	Submitted        float64
+	ShadowCompared   float64
+	ShadowMismatches float64
+}
+
+func (e *env) flowHealth(t *testing.T) flowHealth {
+	t.Helper()
+	var body struct {
+		Flows struct {
+			Runs             float64 `json:"runs"`
+			Submitted        float64 `json:"submitted"`
+			ShadowCompared   float64 `json:"shadow_compared"`
+			ShadowMismatches float64 `json:"shadow_mismatches"`
+		} `json:"flows"`
+	}
+	if err := e.getJSON(t, "/healthz", &body); err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	return flowHealth{Runs: body.Flows.Runs, Submitted: body.Flows.Submitted,
+		ShadowCompared: body.Flows.ShadowCompared, ShadowMismatches: body.Flows.ShadowMismatches}
+}
+
+func (e *env) waitForFlowHealth(t *testing.T, ok func(flowHealth) bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ok(e.flowHealth(t)) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("flow health did not reach the expected state within %s", timeout)
+}
+
+func (e *env) setMode(mode string, projects []string) error {
+	body := map[string]any{"mode": mode}
+	if projects != nil {
+		body["projects"] = projects
+	}
+	data, _ := json.Marshal(body)
+	request, err := http.NewRequest(http.MethodPost, e.baseURL+"/hub/v1/flows/default-youtrack/deployment", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+e.hubToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := e.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+		return fmt.Errorf("deployment %s: %d %s", mode, response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func (e *env) hasRunMode(t *testing.T, want string) bool {
+	t.Helper()
+	var body struct {
+		Runs []struct {
+			Mode string `json:"mode"`
+		} `json:"runs"`
+	}
+	request, err := http.NewRequest(http.MethodGet, e.baseURL+"/hub/v1/runs?limit=50", nil)
+	if err != nil {
+		t.Fatalf("runs request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+e.hubToken)
+	response, err := e.client.Do(request)
+	if err != nil {
+		t.Fatalf("runs: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("runs: %d", response.StatusCode)
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("runs decode: %v", err)
+	}
+	for _, run := range body.Runs {
+		if run.Mode == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *env) updateIssue(issue, description string) error {
