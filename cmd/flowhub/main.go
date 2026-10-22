@@ -31,6 +31,7 @@ import (
 
 	"github.com/yusiwen/flowhub/internal/agent"
 	agentruntime "github.com/yusiwen/flowhub/internal/agent/opencode"
+	"github.com/yusiwen/flowhub/internal/compare"
 	"github.com/yusiwen/flowhub/internal/config"
 	"github.com/yusiwen/flowhub/internal/dedupe"
 	"github.com/yusiwen/flowhub/internal/dispatch"
@@ -340,6 +341,11 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	// One capacity gate is shared by dispatch and, when it lands, the flow engine:
 	// a runtime's breadth must bound both, not each in its own world.
 	capacity := runner.NewCapacity()
+	comparisons, err := compare.Open(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("open shadow comparison store: %w", err)
+	}
+	defer func() { _ = comparisons.Close() }()
 
 	// The registry is opened once and shared: dispatch owns the write side, the
 	// shadow engine reads the same rows, and two independent caches could disagree
@@ -364,7 +370,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	// accepted before there is something to hand it to. It also implements the task
 	// service the flow engine uses for `on`; a project owned by an `on` flow is
 	// skipped here, so exactly one orchestrator runs its turns.
-	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger, capacity, tasks, modes, flowDefinition.Definition.ID)
+	dispatcher, dispatchDone, err := startDispatcher(ctx, cfg, projects, inventory, src, logger, capacity, tasks, modes, flowDefinition.Definition.ID, comparisons)
 	if err != nil {
 		return err
 	}
@@ -380,6 +386,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		TaskService:    dispatcher.TaskService(),
 		TaskSelector:   dispatcher.TaskSelector(),
 		Policy:         src.Policy(),
+		Compare:        comparisons,
 		DataDir:        cfg.DataDir,
 		QueueSize:      cfg.DispatchQueueSize,
 		Logger:         logger,
@@ -401,7 +408,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	hubAPI, err := flowapi.New(flowapi.Options{
 		Token: cfg.HubToken, Flow: flowDefinition, Definition: flowRaw,
 		Modes: modes, Runs: flowEngine.RunStore(), OnAvailable: dispatcher != nil,
-		Logger: logger,
+		Compare: comparisons, Logger: logger,
 	})
 	if err != nil {
 		return fmt.Errorf("start hub API: %w", err)
@@ -893,7 +900,7 @@ func startControlAPI(ctx context.Context, cfg config.Config, projects *projectma
 //
 // The returned channel closes when the worker has stopped, so shutdown can wait
 // for an in-flight turn instead of killing the process under it.
-func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger, capacity *runner.Capacity, tasks *registry.Registry, modes *flowmode.Store, flowID string) (*dispatch.Dispatcher, <-chan struct{}, error) {
+func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger, capacity *runner.Capacity, tasks *registry.Registry, modes *flowmode.Store, flowID string, comparisons *compare.Store) (*dispatch.Dispatcher, <-chan struct{}, error) {
 	if !cfg.Dispatch {
 		return nil, nil, nil
 	}
@@ -960,6 +967,11 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 		PauseFile:      cfg.ResolvedPauseFile(),
 		Capacity:       capacity,
 		MaxCostPerTask: cfg.TaskMaxCost,
+		Decision: func(decision compare.Decision) {
+			if comparisons != nil {
+				comparisons.ObserveDispatch(decision)
+			}
+		},
 		Skip: func(rec *store.Record) (bool, string) {
 			if modes == nil {
 				return false, ""

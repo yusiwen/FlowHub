@@ -19,6 +19,7 @@ import (
 
 	"github.com/yusiwen/flowhub/internal/agent"
 	agentruntime "github.com/yusiwen/flowhub/internal/agent/opencode"
+	"github.com/yusiwen/flowhub/internal/compare"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
@@ -1603,5 +1604,20 @@ func TestAProjectOwnedByAFlowIsSkippedBeforeQueueing(t *testing.T) {
 	}
 	if got := fake.promptCount(); got != 0 {
 		t.Fatalf("prompts = %d, want no dispatch turn", got)
+	}
+}
+
+func TestDispatchPublishesItsDecisionForTheEventID(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, _, _ := newTestDispatcher(t, fake, server)
+	var observed compare.Decision
+	dispatcher.opts.Decision = func(decision compare.Decision) { observed = decision }
+	rec := delivery("TEST-91", "issueCreated", issueCreatedBody("TEST-91"))
+	rec.EventID = "evt_test_91"
+	dispatcher.handle(context.Background(), rec)
+	if observed.EventID != "evt_test_91" || observed.Action != string(rules.ActionAnalyze) || !observed.Routable {
+		t.Fatalf("observed = %+v", observed)
 	}
 }

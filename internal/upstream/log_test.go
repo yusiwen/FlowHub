@@ -244,7 +244,7 @@ func TestAppendWritesBeforeItReturns(t *testing.T) {
 	}
 	defer func() { _ = log.Close() }()
 
-	if err := log.Append(event(now)); err != nil {
+	if _, err := log.Append(event(now)); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "events", "2026-10-21.jsonl"))
@@ -274,10 +274,10 @@ func TestAppendAbsorbsADuplicate(t *testing.T) {
 	}
 	defer func() { _ = log.Close() }()
 
-	if err := log.Append(event(now)); err != nil {
+	if _, err := log.Append(event(now)); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	if err := log.Append(event(now)); err != nil {
+	if _, err := log.Append(event(now)); err != nil {
 		t.Fatalf("duplicate: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "events", "2026-10-21.jsonl"))
@@ -308,13 +308,13 @@ func TestAFailedAppendReleasesItsDedupeKey(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(eventsDir, "2026-10-21.jsonl"), 0o700); err != nil {
 		t.Fatalf("block day file: %v", err)
 	}
-	if err := log.Append(event(now)); err == nil {
+	if _, err := log.Append(event(now)); err == nil {
 		t.Fatal("expected the append to fail while the day-file path is a directory")
 	}
 	if err := os.Remove(filepath.Join(eventsDir, "2026-10-21.jsonl")); err != nil {
 		t.Fatalf("unblock: %v", err)
 	}
-	if err := log.Append(event(now)); err != nil {
+	if _, err := log.Append(event(now)); err != nil {
 		t.Fatalf("the retry must not be absorbed as a duplicate: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(eventsDir, "2026-10-21.jsonl"))
@@ -338,7 +338,7 @@ func TestAppendAfterCloseIsRefused(t *testing.T) {
 	if err := log.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if err := log.Append(event(now)); err == nil {
+	if _, err := log.Append(event(now)); err == nil {
 		t.Fatal("append after close must fail")
 	}
 }
@@ -355,7 +355,7 @@ func TestAppendNotifiesBeforeReturning(t *testing.T) {
 	defer func() { _ = log.Close() }()
 	notified := make(chan upstream.Event, 1)
 	log.Subscribe(func(event upstream.Event) { notified <- event })
-	if err := log.Append(event(now)); err != nil {
+	if _, err := log.Append(event(now)); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	select {

@@ -126,5 +126,5 @@ type Sink interface {
 // return nil unless the event is on disk; no fsync is required, but a failed write
 // must be reported so the webhook can answer 503 instead of claiming durability.
 type DurableSink interface {
-	Append(Event) error
+	Append(Event) (Event, error)
 }

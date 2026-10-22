@@ -291,12 +291,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The event log is the durable input. It is written before the 202: an event
 	// that cannot be appended is not accepted, and a retry must be able to try
 	// again, so the idempotency key is released on failure.
-	if reason, err := h.appendEvent(decoded, request, start); err != nil {
+	event, reason, err := h.appendEvent(decoded, request, start)
+	if err != nil {
 		h.dd.Remove(dedupeKey)
 		h.log.Error("flow event was not appended",
 			"reason", reason, "issue_id", rec.IssueID, "error", err)
 		h.respond(w, rec, reason, http.StatusServiceUnavailable)
 		return
+	}
+	if event.ID != "" {
+		rec.EventID = event.ID
 	}
 	h.respond(w, rec, "", http.StatusAccepted)
 }
@@ -308,25 +312,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // The source is type-asserted instead of widening source.Source, so an adapter
 // that has not been taught the flow envelope is refused rather than silently
 // accepted when an event log is configured.
-func (h *Handler) appendEvent(decoded source.Decoded, request *source.Request, received time.Time) (string, error) {
+func (h *Handler) appendEvent(decoded source.Decoded, request *source.Request, received time.Time) (upstream.Event, string, error) {
 	if h.opts.Events == nil {
-		return "", nil
+		return upstream.Event{}, "", nil
 	}
 	if h.opts.Source == nil {
-		return ReasonEventNormalizeFailed, fmt.Errorf("no source is configured to normalize the event")
+		return upstream.Event{}, ReasonEventNormalizeFailed, fmt.Errorf("no source is configured to normalize the event")
 	}
 	normalizer, ok := h.opts.Source.(upstream.Normalizer)
 	if !ok {
-		return ReasonEventNormalizeFailed, fmt.Errorf("source %q cannot normalize a flow event", h.opts.Source.Name())
+		return upstream.Event{}, ReasonEventNormalizeFailed, fmt.Errorf("source %q cannot normalize a flow event", h.opts.Source.Name())
 	}
 	envelope, err := normalizer.Normalize(decoded, request, received)
 	if err != nil {
-		return ReasonEventNormalizeFailed, fmt.Errorf("normalize event: %w", err)
+		return upstream.Event{}, ReasonEventNormalizeFailed, fmt.Errorf("normalize event: %w", err)
 	}
-	if err := h.opts.Events.Append(envelope); err != nil {
-		return ReasonEventAppendFailed, fmt.Errorf("append event: %w", err)
+	appended, err := h.opts.Events.Append(envelope)
+	if err != nil {
+		return upstream.Event{}, ReasonEventAppendFailed, fmt.Errorf("append event: %w", err)
 	}
-	return "", nil
+	return appended, "", nil
 }
 
 // describe fills the record from what the source decoded.

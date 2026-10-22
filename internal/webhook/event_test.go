@@ -17,17 +17,17 @@ type captureEvents struct {
 }
 
 func (c *captureEvents) Record(event upstream.Event) {
-	_ = c.Append(event)
+	_, _ = c.Append(event)
 }
 
-func (c *captureEvents) Append(event upstream.Event) error {
+func (c *captureEvents) Append(event upstream.Event) (upstream.Event, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.err != nil {
-		return c.err
+		return event, c.err
 	}
 	c.events = append(c.events, event)
-	return nil
+	return event, nil
 }
 
 func (c *captureEvents) fail(err error) {

@@ -236,6 +236,28 @@ export interface HubRunSummary {
   finished_at: string | null;
   duration_ms: number;
   error: string;
+  compared?: boolean;
+  match?: boolean;
+  differences?: string[];
+}
+
+export interface FlowComparison {
+  event_id: string;
+  dispatch: {
+    event_id: string;
+    action: string;
+    reason?: string;
+    routable?: boolean;
+  };
+  flow: {
+    event_id: string;
+    action: string;
+    reason?: string;
+    routable?: boolean;
+  };
+  match: boolean;
+  differences?: string[];
+  at: string;
 }
 
 export interface HubFlowSummary {
@@ -335,4 +357,5 @@ export interface FlowRun {
 
 export interface HubRunResponse {
   run: FlowRun;
+  comparison?: FlowComparison;
 }

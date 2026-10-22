@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yusiwen/flowhub/internal/compare"
 	"github.com/yusiwen/flowhub/internal/flow/api"
 	"github.com/yusiwen/flowhub/internal/flow/builtin"
 	"github.com/yusiwen/flowhub/internal/flow/engine"
@@ -18,10 +19,11 @@ import (
 )
 
 type fixture struct {
-	handler *api.Handler
-	modes   *mode.Store
-	runs    *engine.Store
-	flowID  string
+	handler    *api.Handler
+	modes      *mode.Store
+	runs       *engine.Store
+	comparison *compare.Store
+	flowID     string
 }
 
 func newFixture(t *testing.T, token string) fixture {
@@ -44,15 +46,20 @@ func newFixtureWith(t *testing.T, token string, onAvailable bool) fixture {
 	if err != nil {
 		t.Fatalf("runs: %v", err)
 	}
+	comparison, err := compare.Open(dir)
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	t.Cleanup(func() { _ = comparison.Close() })
 	handler, err := api.New(api.Options{
 		Token: token, Flow: compiled, Definition: raw, Modes: modes, Runs: runs,
-		OnAvailable: onAvailable,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Compare: comparison, OnAvailable: onAvailable,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("api: %v", err)
 	}
-	return fixture{handler: handler, modes: modes, runs: runs, flowID: compiled.Definition.ID}
+	return fixture{handler: handler, modes: modes, runs: runs, comparison: comparison, flowID: compiled.Definition.ID}
 }
 
 func seedRun(t *testing.T, runs *engine.Store, id, state string) *engine.Run {
@@ -270,5 +277,23 @@ func TestDeploymentOnIsAcceptedWhenTheTaskServiceIsAvailable(t *testing.T) {
 	summary := flows["flows"].([]any)[0].(map[string]any)
 	if summary["mode"] != mode.On || summary["on_available"] != true {
 		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+func TestARunCarriesItsShadowComparison(t *testing.T) {
+	f := newFixture(t, "sekret")
+	run := seedRun(t, f.runs, "run_1", string(engine.StateSucceeded))
+	f.comparison.ObserveDispatch(compare.Decision{EventID: run.Event.ID, Action: "analyze", Reason: "issue created", Routable: true})
+	f.comparison.ObserveFlow(compare.Decision{EventID: run.Event.ID, Action: "analyze", Reason: "issue created", Routable: true})
+
+	summaryBody := decode(t, request(t, f.handler, "/hub/v1/runs", "sekret"))
+	summary := summaryBody["runs"].([]any)[0].(map[string]any)
+	if summary["compared"] != true || summary["match"] != true {
+		t.Fatalf("summary = %+v", summary)
+	}
+	runBody := decode(t, request(t, f.handler, "/hub/v1/runs/run_1", "sekret"))
+	comparison, ok := runBody["comparison"].(map[string]any)
+	if !ok || comparison["match"] != true {
+		t.Fatalf("run body = %+v", runBody)
 	}
 }

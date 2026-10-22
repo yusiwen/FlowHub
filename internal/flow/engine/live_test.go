@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yusiwen/flowhub/internal/compare"
 	"github.com/yusiwen/flowhub/internal/flow/builtin"
 	"github.com/yusiwen/flowhub/internal/flow/mode"
 	"github.com/yusiwen/flowhub/internal/projectmap"
@@ -258,5 +259,41 @@ func TestOnHonoursThePauseFile(t *testing.T) {
 	}
 	if service.ensure != 0 || service.turn != 0 {
 		t.Fatalf("service was called: %+v", service)
+	}
+}
+
+func TestShadowRunPublishesItsDecisionForComparison(t *testing.T) {
+	event := readEvent(t, "events/issue-created.json")
+	compiled, raw, err := builtin.Load()
+	if err != nil {
+		t.Fatalf("builtin: %v", err)
+	}
+	comparisons, err := compare.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	defer func() { _ = comparisons.Close() }()
+	engine, err := New(Options{
+		Flow: compiled, Definition: raw, Projects: fakeRouter{projects: map[string]bool{"TEST": true}},
+		Tasks: fakeTasks{}, Policy: youtrack.New(rules.Policy{}, "").Policy(),
+		DataDir: t.TempDir(), Compare: comparisons,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	run, err := engine.RunEvent(event)
+	if err != nil || run == nil {
+		t.Fatalf("run = %+v, err = %v", run, err)
+	}
+	if comparisons.Pending() != 1 {
+		t.Fatalf("pending = %d, want the shadow side", comparisons.Pending())
+	}
+	comparisons.ObserveDispatch(compare.Decision{
+		EventID: event.ID, Action: "analyze", Reason: "issue was created", Routable: true,
+	})
+	comparison, ok := comparisons.Get(event.ID)
+	if !ok || !comparison.Match {
+		t.Fatalf("comparison = %+v, ok = %v", comparison, ok)
 	}
 }

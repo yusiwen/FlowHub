@@ -101,6 +101,9 @@ type Record struct {
 	ChangedFields      []string `json:"changed_fields,omitempty"`
 	CommentIDs         []string `json:"comment_ids,omitempty"`
 	DedupeKey          string   `json:"dedupe_key,omitempty"`
+	// EventID is the neutral flow event id, assigned by the event log before the
+	// 202. It joins dispatch's decision to the flow's shadow run.
+	EventID string `json:"event_id,omitempty"`
 
 	// RawBody is the unmodified request body. The design documents require the
 	// original payload for audit and replay; the size is bounded by

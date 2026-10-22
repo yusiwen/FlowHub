@@ -1161,6 +1161,7 @@ picture.
 | `/var/lib/flowhub/events/YYYY-MM-DD.jsonl` | FlowHub | neutral flow event envelope, `0600`, 30-day retention |
 | `/var/lib/flowhub/runs/<run-id>/` | FlowHub | one shadow run: `meta.json` + `journal.jsonl` (`0600`) |
 | `/var/lib/flowhub/flows/state.json` | FlowHub/CLI/API | deployment mode per flow (`off`/`shadow`/`on`) and project scope, `0600` |
+| `/var/lib/flowhub/flow-compare.jsonl` | FlowHub | one joined dispatch-vs-shadow comparison per event, `0600` |
 | `/var/lib/flowhub/payload-YYYY-MM-DD.log` | FlowHub | human-readable per-delivery blocks |
 | `/var/lib/flowhub/flowhub.log` | FlowHub | application log, size-rotated |
 | `/var/lib/flowhub/registry.jsonl` | FlowHub | task registry (append-only) |

@@ -634,7 +634,11 @@ without the task service. There is no `PUT`/`DELETE` for the builtin flow.
 - No CORS, no SSE. The desktop polls with `after`; the main listener's write timeout
   is 10 s, so a long-lived stream does not belong here.
 - `/healthz` gains `flows` (`enabled`, `mode`, `definitions`, `runs`, `waiting`,
-  `needs_attention`, `shadow_compared`, `shadow_mismatches`) and `upstreams`.
+  `needs_attention`, `shadow_compared`, `shadow_mismatches`, `pending`) and
+  `upstreams`.
+- Run summaries carry `compared`/`match`/`differences`; a run snapshot carries the
+  joined `comparison` (dispatch and flow action/reason). Comparisons are joined by
+  the event id and persisted in `<DataDir>/flow-compare.jsonl`.
 
 ### 10.2 CLI
 

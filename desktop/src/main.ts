@@ -49,6 +49,7 @@ import {
 } from "./flows";
 import { roleOf } from "./types";
 import type {
+  FlowComparison,
   FlowRun,
   HealthReport,
   HubFlowDefinitionResponse,
@@ -234,6 +235,7 @@ let flowSummary: HubFlowSummary | null = null;
 let flowDefinition: HubFlowDefinitionResponse | null = null;
 let flowRunsValue: HubRunsResponse | null = null;
 let flowRunValue: FlowRun | null = null;
+let flowComparison: FlowComparison | null = null;
 let flowSelectedRun: string | null = null;
 let flowSelectedNode: string | null = null;
 let flowError: string | null = null;
@@ -997,6 +999,7 @@ function resetFlowState(): void {
   flowDefinition = null;
   flowRunsValue = null;
   flowRunValue = null;
+  flowComparison = null;
   flowSelectedRun = null;
   flowSelectedNode = null;
   flowError = null;
@@ -1134,6 +1137,7 @@ async function refreshSelectedRun(): Promise<void> {
       return;
     }
     flowRunValue = response.run;
+    flowComparison = response.comparison ?? null;
     if (
       flowRunValue.state === "running" ||
       flowRunValue.state === "queued" ||
@@ -1160,6 +1164,7 @@ function selectRun(id: string): void {
   flowSelectedRun = id;
   flowSelectedNode = null;
   flowRunValue = null;
+  flowComparison = null;
   stopRunTimer();
   void refreshSelectedRun();
   renderFlows();
@@ -1223,6 +1228,7 @@ function renderFlows(): void {
     flowDefinition?.definition ?? null,
     flowRunValue,
     flowSelectedNode,
+    flowComparison,
   );
   flowRunsMeta.textContent =
     flowSummary.mode === "off"

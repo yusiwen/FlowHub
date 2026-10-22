@@ -353,8 +353,11 @@ The control API serves `/control/v1/runtimes` (`GET` inventory, `POST …/invite
 The flow API is read-only and lives on the same listener as the webhook:
 `GET /hub/v1/flows`, `/hub/v1/flows/{id}`, `POST /hub/v1/flows/{id}/deployment`,
 `/hub/v1/runs?flow=&state=&limit=&cursor=`, `/hub/v1/runs/{id}` and
-`/hub/v1/runs/{id}/events?after=`. `on` answers `409` when the service was started
-without the task service (`FLOWHUB_DISPATCH=0`). Every request needs
+`/hub/v1/runs/{id}/events?after=`. Run summaries carry `compared`, `match` and
+`differences` once dispatch's decision for the same event has arrived; the run
+snapshot carries the full comparison. `/healthz.flows` reports
+`shadow_compared`, `shadow_mismatches` and `pending`. `on` answers `409` when the
+service was started without the task service (`FLOWHUB_DISPATCH=0`). Every request needs
 `Authorization: Bearer $FLOWHUB_HUB_TOKEN`; an unset token answers `503`. The
 builtin flow is **off** by default; `flowhub flow mode default-youtrack shadow`
 turns on the shadow evaluation. `on` executes the built-in pipeline through the
@@ -978,6 +981,7 @@ accepted event must not be lost.
 | `payload-YYYY-MM-DD.log` | you, reading the real wire format | One verbose block per delivery: request line, source addresses, masked headers, locks, verdict, payload keys, a per-path type schema, and the pretty-printed body |
 | `webhook-YYYY-MM-DD.jsonl` | machines | One JSON object per delivery, including the full raw body, for replay and `jq` |
 | `events/YYYY-MM-DD.jsonl` | flow engine | The neutral event envelope of every accepted delivery. **Appended synchronously before the `202`** (no fsync), `0600`, 30-day retention |
+| `flow-compare.jsonl` | flow engine | One joined dispatch-vs-shadow decision per event, with `match` and the difference list; `0600` |
 
 ```bash
 # Watch deliveries as they arrive, readable form
