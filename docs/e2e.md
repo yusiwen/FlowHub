@@ -72,6 +72,13 @@ make e2e-soak
 E2E_SOAK=100 make e2e-soak
 ```
 
+Restart recovery (stops and restarts the test FlowHub, checks mode and compare
+state survive):
+
+```bash
+make e2e-restart
+```
+
 `E2E_ISSUE` defaults to `TEST-38` for the `issueUpdated` webhook test; the turn
 test creates a fresh issue itself.
 
@@ -96,6 +103,8 @@ Do not point the production YouTrack webhook app at a test instance.
   dispatch-handled delivery again;
 - a `/opencode start` comment plan turn;
 - duplicate webhook suppression, pause, and a direct shadow soak (queue drops and
-  mismatches asserted).
+  mismatches asserted);
+- restart: the shadow mode and compare counters survive a process restart, and a
+  new update still compares.
 
-The next scenarios (permit/revoke, restart and a larger soak) are tracked in #119.
+The next scenarios (permit/revoke and a larger/longer soak) are tracked in #119.
