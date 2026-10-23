@@ -367,3 +367,49 @@ func TestAppendNotifiesBeforeReturning(t *testing.T) {
 		t.Fatal("the subscriber was not called before Append returned")
 	}
 }
+
+func TestLogSinceAndLastReplayTheDurableTail(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	log, err := upstream.NewLog(upstream.LogOptions{
+		Dir: dir, Logger: logger(), Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("new log: %v", err)
+	}
+	defer func() { _ = log.Close() }()
+
+	var written []upstream.Event
+	for i, text := range []string{"one", "two", "three"} {
+		e := event(now.Add(time.Duration(i) * time.Second))
+		e.DedupeKey = "sha256:" + text
+		e.Comment.Text = text
+		appended, err := log.Append(e)
+		if err != nil {
+			t.Fatalf("append %s: %v", text, err)
+		}
+		written = append(written, appended)
+	}
+
+	all, err := log.Since("")
+	if err != nil {
+		t.Fatalf("since empty: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("all = %d, want 3", len(all))
+	}
+	tail, err := log.Since(written[1].ID)
+	if err != nil {
+		t.Fatalf("since second: %v", err)
+	}
+	if len(tail) != 1 || tail[0].ID != written[2].ID {
+		t.Fatalf("tail = %+v, want only the third event", tail)
+	}
+	last, err := log.Last()
+	if err != nil {
+		t.Fatalf("last: %v", err)
+	}
+	if last.ID != written[2].ID {
+		t.Fatalf("last = %q, want %q", last.ID, written[2].ID)
+	}
+}

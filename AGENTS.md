@@ -313,7 +313,12 @@ documents. The rules below are load-bearing; do not relax them casually.
    key, so two trackers may share a project key without sharing a session, and a row
    written before the source seam existed is read as `youtrack` (the field is written
    the next time the task is touched). `internal/workspace/localworktree` creates the
-   checkout. The base commit is **pinned through
+   checkout. The flow engine also persists a replay cursor in
+   `<DataDir>/flow-cursor.json`: after a run is created (or an event is ignored) it
+   records the event id, and startup replays the durable log after it. A missing
+   cursor starts at the current tail; a paused delivery does not advance. This is
+   restart recovery, not a periodic catch-up loop, so a queue drop stays replayable
+   but is not retried until the next start. The base commit is **pinned through
    the origin** once per task and recorded (`base_commit`), never re-resolved: two
    hosts whose clones were fetched at different times must start a project's tasks
    from the same commit. `Prepare` produces exactly that commit (fetching it only
