@@ -100,6 +100,12 @@ zero pending comparisons, zero queue drops):
 make e2e-soak-long
 ```
 
+Burst (200 direct deliveries at 16-way concurrency; asserts no flow drop):
+
+```bash
+make e2e-burst
+```
+
 Restart recovery (stops and restarts the test FlowHub, checks mode and compare
 state survive):
 
@@ -150,6 +156,7 @@ the Make targets are only wrappers around the suite.
 | duplicate webhook | `TestDuplicateWebhookIsIdempotent` | `make e2e` |
 | pause | `TestPauseDoesNotDispatch` | `make e2e` |
 | shadow soak / queue drops | `TestShadowSoak` | `make e2e-soak` (`E2E_SOAK=100`), `make e2e-soak-long` (500) |
+| concurrent burst / queue drops | `TestBurstSoak` | `make e2e-burst` |
 | restart mode + compare state | `TestRestartKeepsComparisonState` | `make e2e-restart` |
 | permit/revoke | `TestPermitAndRevoke` | `make e2e-permit` |
 | SIGKILL + restart recovery | `TestCrashRecovery` | `make e2e-crash` |
