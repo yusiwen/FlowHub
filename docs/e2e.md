@@ -188,6 +188,15 @@ task service, and `on` without it (409):
 make e2e-api
 ```
 
+Rebind and capacity (fake runtime): a task bound to repo A refuses a mapping to repo B
+without preparing a new worktree; a runtime with one slot runs two distinct tasks one
+at a time:
+
+```bash
+make e2e-rebind
+make e2e-capacity
+```
+
 Restart hardening (fake runtime): SIGINT while an `on` execute prompt is held, then
 restart; and a cursor pointing at an event missing from the log must refuse startup:
 
@@ -261,6 +270,8 @@ the Make targets are only wrappers around the suite.
 | SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
 | ingress rejects + append 503 + dedupe release | `TestIngressRejectionsAndAppendFailure` | `make e2e-ingress` |
 | attachment download allow/deny + other known kinds | `TestAttachmentsAndOtherEventKinds` | `make e2e-attachments` |
+| repository rebind refusal | `TestRepositoryRebindRefused` | `make e2e-rebind` |
+| cross-task capacity saturation | `TestCrossTaskCapacitySaturation` | `make e2e-capacity` |
 | graceful restart during an active `on` run | `TestActiveOnGracefulRestart` | `make e2e-restart-hardening` |
 | aged-out replay cursor refuses startup | `TestAgedCursorRefusesStartup` | `make e2e-restart-hardening` |
 | `/hub/v1` auth, invalid deployment, disabled API, on without tasks | `TestAPIAuthAndInvalidDeployment` | `make e2e-api` |
@@ -306,9 +317,9 @@ closed audit that produced this list.
 
 | Area | Missing E2E |
 | --- | --- |
-| routing/auth | repository rebind refusal |
+| routing/auth | none known after the rebind test |
 | turn failure | none known after the 500/timeout/startup tests; author deny and unmapped project are in the routing row |
-| same-task concurrency | capacity saturation across tasks |
+| same-task concurrency | none known after the capacity test |
 | crash | none known after analysis/execute/on run tests |
 | attachments/other kinds | none known after the allow/deny + other-kind test |
 | limits | none known after the cost/max-turns test |
