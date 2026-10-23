@@ -113,6 +113,14 @@ the task must fail, never `awaiting_input`:
 make e2e-silent
 ```
 
+Runtime failure paths (fake runtime): startup unavailable, a delivery with no
+healthy runtime, a prompt that returns 500, and a 1s request timeout under the 5m
+turn deadline:
+
+```bash
+make e2e-opencode-failures
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -175,6 +183,10 @@ the Make targets are only wrappers around the suite.
 | restart mode + compare state | `TestRestartKeepsComparisonState` | `make e2e-restart` |
 | permit/revoke | `TestPermitAndRevoke` | `make e2e-permit` |
 | silent turn -> nudge -> answered, then both silent -> failed | `TestSilentTurnNudgeAndFailure` | `make e2e-silent` |
+| opencode unavailable at startup | `TestOpencodeUnavailableAtStartup` | `make e2e-opencode-failures` |
+| no healthy runtime before a delivery -> ignored, no task row | `TestOpencodeUnavailableBeforeDelivery` | `make e2e-opencode-failures` |
+| prompt returns 500 during a turn -> failed, not `awaiting_input` | `TestOpencodePromptFailure` | `make e2e-opencode-failures` |
+| one-request timeout under a 5m turn deadline | `TestOpencodeRequestTimeout` | `make e2e-opencode-failures` |
 | SIGKILL + restart recovery | `TestCrashRecovery` | `make e2e-crash` |
 | live permit/revoke (dispatch) | `TestPermitAndRevoke` (live) | `make e2e-live-permit` |
 | live permit/revoke (`on`) | `TestOnLivePermitAndRevoke` | `make e2e-live-on-permit` |
@@ -208,7 +220,7 @@ closed audit that produced this list.
 | ingress rejection | wrong URL key/token/IP, body cap, content type, malformed JSON, unknown event, replay window |
 | durable append failure | `503` and dedupe-key release |
 | routing/auth | unmapped project, author allowlist deny, repository rebind refusal |
-| turn failure | opencode down, request timeout |
+| turn failure | none known after the 500/timeout/startup tests; author deny and unmapped project are in the routing row |
 | same-task concurrency | second delivery waits, one session, capacity saturation |
 | crash | SIGKILL during execute and during an `on` run (the current crash test kills analysis) |
 | attachments/other kinds | download exception, deleted/attachment events |
