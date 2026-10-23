@@ -957,8 +957,25 @@ func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery ev
 	lease.Lock()
 	defer lease.Unlock()
 	phase := agent.PhaseAnalysis
-	if decision.Action == rules.ActionExecute {
+	runningState := registry.StateAnalyzing
+	switch decision.Action {
+	case rules.ActionPlan:
+		runningState = registry.StatePlanning
+	case rules.ActionExecute:
 		phase = agent.PhaseExecution
+		runningState = registry.StateExecuting
+	}
+	// Persist the running state before the prompt. Recovery only inspects
+	// analyzing/planning/executing rows, so a SIGKILL during a plan or execute turn
+	// used to leave awaiting_input behind and the restart treated it as finished.
+	if task.State != runningState {
+		if updated, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
+			t.State = runningState
+		}); err != nil {
+			d.log.Warn("could not record the running task state", "issue", rec.IssueID, "state", runningState, "error", err)
+		} else {
+			task = updated
+		}
 	}
 
 	// The tool policy is data owned by the source: which tools may run unattended,

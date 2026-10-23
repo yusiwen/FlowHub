@@ -24,6 +24,7 @@ type fakeOpencode struct {
 	nextID      int
 	delay       time.Duration
 	hold        chan struct{}
+	holdAt      int
 	failPrompt  bool
 	inFlight    int
 	maxInFlight int
@@ -49,6 +50,14 @@ func (f *fakeOpencode) setDelay(delay time.Duration) {
 func (f *fakeOpencode) setHold(hold chan struct{}) {
 	f.mu.Lock()
 	f.hold = hold
+	f.mu.Unlock()
+}
+
+// setHoldAt holds only the given 1-based prompt for this session; zero keeps the
+// old behaviour of holding every prompt.
+func (f *fakeOpencode) setHoldAt(prompt int) {
+	f.mu.Lock()
+	f.holdAt = prompt
 	f.mu.Unlock()
 }
 
@@ -128,7 +137,8 @@ func (f *fakeOpencode) prompt(w http.ResponseWriter, id string, r *http.Request)
 	}
 	f.mu.Lock()
 	f.prompts[id] = append(f.prompts[id], text)
-	delay, hold := f.delay, f.hold
+	delay, hold, holdAt := f.delay, f.hold, f.holdAt
+	promptNumber := len(f.prompts[id])
 	f.inFlight++
 	if f.inFlight > f.maxInFlight {
 		f.maxInFlight = f.inFlight
@@ -137,7 +147,7 @@ func (f *fakeOpencode) prompt(w http.ResponseWriter, id string, r *http.Request)
 	if delay > 0 {
 		time.Sleep(delay)
 	}
-	if hold != nil {
+	if hold != nil && (holdAt == 0 || promptNumber == holdAt) {
 		<-hold
 	}
 	f.mu.Lock()

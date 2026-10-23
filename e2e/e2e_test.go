@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -1099,6 +1099,107 @@ func (e *env) setProjectAuthors(t *testing.T, authors []string) {
 	}
 	if err := os.WriteFile(e.configPath, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+func TestCrashDuringExecute(t *testing.T) {
+	if os.Getenv("E2E_CRASH_EXECUTE") != "1" {
+		t.Skip("set E2E_CRASH_EXECUTE=1 to SIGKILL during execution")
+	}
+	if suite.live {
+		t.Skip("crash-during-execute uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	hold := make(chan struct{})
+	fake.setHold(hold)
+	fake.setHoldAt(3)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+
+	waitPrompts := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if fake.promptCount() >= want {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("fake runtime saw %d prompts, want %d", fake.promptCount(), want)
+	}
+	summary := "FlowHub E2E crash execute " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Crash-during-execute E2E.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	deliver := func(payload []byte) {
+		t.Helper()
+		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+	}
+
+	// 1. Analysis.
+	deliver(issueCreatedPayload(key, summary, "Crash-during-execute E2E.", suite.ytProject))
+	waitPrompts(1)
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Turns == 1 && row.Plan == "none" && row.Session != ""
+	}, 30*time.Second)
+
+	// 2. Plan.
+	comment, err := suite.addComment(key, "/opencode start")
+	if err != nil {
+		t.Fatalf("plan comment: %v", err)
+	}
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	waitPrompts(2)
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Turns == 2 && row.Plan == "draft"
+	}, 30*time.Second)
+
+	// 3. Execute, held inside the prompt, then SIGKILL the receiver.
+	comment, err = suite.addComment(key, "/opencode start")
+	if err != nil {
+		t.Fatalf("execute comment: %v", err)
+	}
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	waitPrompts(3)
+	before := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "executing"
+	}, 30*time.Second)
+	suite.kill()
+	fake.release()
+	time.Sleep(300 * time.Millisecond)
+	suite.start()
+
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "failed" && strings.Contains(row.LastError, "interrupted by a restart")
+	}, 20*time.Second)
+	if row.Worktree != before.Worktree || row.Worktree == "" {
+		t.Fatalf("worktree changed across crash: before=%q after=%q", before.Worktree, row.Worktree)
+	}
+	if row.Session != before.Session || row.Session == "" {
+		t.Fatalf("session changed across crash: before=%q after=%q", before.Session, row.Session)
+	}
+	if row.Turns != before.Turns {
+		t.Fatalf("turns changed across crash: before=%d after=%d", before.Turns, row.Turns)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if got := fake.promptCount(); got != 3 {
+		t.Fatalf("prompts after restart = %d, want 3 (no replayed turn)", got)
+	}
+	if fake.sessionCount() != 1 {
+		t.Fatalf("sessions after restart = %d, want one", fake.sessionCount())
 	}
 }
 
