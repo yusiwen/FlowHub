@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -1168,6 +1168,9 @@ func TestCrashDuringExecute(t *testing.T) {
 	}, 30*time.Second)
 
 	// 3. Execute, held inside the prompt, then SIGKILL the receiver.
+	// Comment identity is issue + second + actor + text: wait one second so the
+	// execute comment is a distinct event, not a duplicate of the plan comment.
+	time.Sleep(1100 * time.Millisecond)
 	comment, err = suite.addComment(key, "/opencode start")
 	if err != nil {
 		t.Fatalf("execute comment: %v", err)
@@ -1200,6 +1203,171 @@ func TestCrashDuringExecute(t *testing.T) {
 	}
 	if fake.sessionCount() != 1 {
 		t.Fatalf("sessions after restart = %d, want one", fake.sessionCount())
+	}
+}
+
+type runRow struct {
+	ID     string `json:"id"`
+	State  string `json:"state"`
+	Mode   string `json:"mode"`
+	Task   string `json:"task"`
+	Action string `json:"action"`
+}
+
+func (e *env) runRows(t *testing.T) []runRow {
+	t.Helper()
+	var body struct {
+		Runs []runRow `json:"runs"`
+	}
+	request, err := http.NewRequest(http.MethodGet, e.baseURL+"/hub/v1/runs?limit=100", nil)
+	if err != nil {
+		t.Fatalf("runs request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+e.hubToken)
+	response, err := e.client.Do(request)
+	if err != nil {
+		t.Fatalf("runs: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("runs: %d", response.StatusCode)
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("runs decode: %v", err)
+	}
+	return body.Runs
+}
+
+func (e *env) waitForRunState(t *testing.T, task, state string, timeout time.Duration) runRow {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, run := range e.runRows(t) {
+			if run.Task == task && run.State == state {
+				return run
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("no %s run for task %s within %s", state, task, timeout)
+	return runRow{}
+}
+
+func TestCrashDuringOnRun(t *testing.T) {
+	if os.Getenv("E2E_CRASH_ON") != "1" {
+		t.Skip("set E2E_CRASH_ON=1 to SIGKILL during an on run")
+	}
+	if suite.live {
+		t.Skip("crash-during-on uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	hold := make(chan struct{})
+	fake.setHold(hold)
+	fake.setHoldAt(3)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("on", []string{suite.ytProject}); err != nil {
+		t.Fatalf("set on: %v", err)
+	}
+
+	waitPrompts := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if fake.promptCount() >= want {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("fake runtime saw %d prompts, want %d", fake.promptCount(), want)
+	}
+	summary := "FlowHub E2E crash on " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Crash-during-on E2E.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	deliver := func(payload []byte) {
+		t.Helper()
+		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+	}
+
+	deliver(issueCreatedPayload(key, summary, "Crash-during-on E2E.", suite.ytProject))
+	waitPrompts(1)
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Turns == 1 && row.Plan == "none" && row.Session != ""
+	}, 30*time.Second)
+
+	comment, err := suite.addComment(key, "/opencode start")
+	if err != nil {
+		t.Fatalf("plan comment: %v", err)
+	}
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	waitPrompts(2)
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Turns == 2 && row.Plan == "draft"
+	}, 30*time.Second)
+
+	// Comment identity is issue + second + actor + text: wait one second so the
+	// execute comment is a distinct event, not a duplicate of the plan comment.
+	time.Sleep(1100 * time.Millisecond)
+	comment, err = suite.addComment(key, "/opencode start")
+	if err != nil {
+		t.Fatalf("execute comment: %v", err)
+	}
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	waitPrompts(3)
+	before := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "executing"
+	}, 30*time.Second)
+	suite.kill()
+	fake.release()
+	time.Sleep(300 * time.Millisecond)
+	suite.start()
+
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "failed" && strings.Contains(row.LastError, "interrupted by a restart")
+	}, 20*time.Second)
+	if row.Worktree != before.Worktree || row.Worktree == "" {
+		t.Fatalf("worktree changed across on crash: before=%q after=%q", before.Worktree, row.Worktree)
+	}
+	if row.Session != before.Session || row.Session == "" {
+		t.Fatalf("session changed across on crash: before=%q after=%q", before.Session, row.Session)
+	}
+	if row.Turns != before.Turns {
+		t.Fatalf("turns changed across on crash: before=%d after=%d", before.Turns, row.Turns)
+	}
+	run := suite.waitForRunState(t, key, "needs_attention", 20*time.Second)
+	if run.Mode != "on" {
+		t.Fatalf("interrupted run mode = %q, want on", run.Mode)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if got := fake.promptCount(); got != 3 {
+		t.Fatalf("prompts after on restart = %d, want 3 (no replay)", got)
+	}
+
+	// Recovery must leave the engine usable for a new event.
+	follow := "FlowHub E2E on after crash " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	followKey, _, err := suite.createIssue(follow, "On-after-crash E2E.")
+	if err != nil {
+		t.Fatalf("create follow-up issue: %v", err)
+	}
+	deliver(issueCreatedPayload(followKey, follow, "On-after-crash E2E.", suite.ytProject))
+	waitPrompts(4)
+	suite.waitForRegistry(t, followKey, func(row taskRow) bool {
+		return row.Session != "" && row.Turns == 1
+	}, 30*time.Second)
+	suite.waitForRunState(t, followKey, "succeeded", 20*time.Second)
+	if fake.sessionCount() != 2 {
+		t.Fatalf("sessions = %d, want one per task", fake.sessionCount())
 	}
 }
 
