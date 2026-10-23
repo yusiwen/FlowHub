@@ -18,13 +18,15 @@ import (
 // reply only when the mode says so; a silent first turn exercises the dispatcher's
 // one nudge, and an always-silent turn must become failed, never awaiting_input.
 type fakeOpencode struct {
-	mu         sync.Mutex
-	mode       string // "nudge" posts on prompt 2+, "silent" never posts
-	prompts    map[string][]string
-	nextID     int
-	delay      time.Duration
-	hold       chan struct{}
-	failPrompt bool
+	mu          sync.Mutex
+	mode        string // "nudge" posts on prompt 2+, "silent" never posts
+	prompts     map[string][]string
+	nextID      int
+	delay       time.Duration
+	hold        chan struct{}
+	failPrompt  bool
+	inFlight    int
+	maxInFlight int
 }
 
 func newFakeOpencode(t *testing.T) *fakeOpencode {
@@ -127,6 +129,10 @@ func (f *fakeOpencode) prompt(w http.ResponseWriter, id string, r *http.Request)
 	f.mu.Lock()
 	f.prompts[id] = append(f.prompts[id], text)
 	delay, hold := f.delay, f.hold
+	f.inFlight++
+	if f.inFlight > f.maxInFlight {
+		f.maxInFlight = f.inFlight
+	}
 	f.mu.Unlock()
 	if delay > 0 {
 		time.Sleep(delay)
@@ -136,6 +142,7 @@ func (f *fakeOpencode) prompt(w http.ResponseWriter, id string, r *http.Request)
 	}
 	f.mu.Lock()
 	fail := f.failPrompt
+	f.inFlight--
 	f.mu.Unlock()
 	if fail {
 		http.Error(w, "fake prompt failure", http.StatusInternalServerError)
@@ -155,7 +162,7 @@ func (f *fakeOpencode) messages(w http.ResponseWriter, id string) {
 			"info": map[string]any{"id": fmt.Sprintf("u-%s-%d", id, i), "role": "user", "time": map[string]any{"created": i}},
 		})
 		parts := []any{map[string]any{"type": "text", "text": "analysis done"}}
-		reply := mode == "nudge" && i >= 1
+		reply := mode == "every" || (mode == "nudge" && i >= 1)
 		if reply {
 			parts = append(parts, map[string]any{
 				"type": "tool", "tool": "youtrack_add_issue_comment",
@@ -172,6 +179,18 @@ func (f *fakeOpencode) messages(w http.ResponseWriter, id string) {
 		})
 	}
 	writeFakeJSON(w, out)
+}
+
+func (f *fakeOpencode) maxConcurrentPrompts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxInFlight
+}
+
+func (f *fakeOpencode) sessionCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nextID
 }
 
 func (f *fakeOpencode) promptCount() int {
