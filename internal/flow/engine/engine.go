@@ -52,6 +52,12 @@ type Options struct {
 	QueueSize  int
 	Logger     *slog.Logger
 	Now        func() time.Time
+	// ReplaySource reads the durable log after a cursor. It is what makes the
+	// queue's drops recoverable while the process is still running; nil disables
+	// periodic catch-up.
+	ReplaySource func(after string) ([]upstream.Event, error)
+	// ReplayInterval bounds how long a dropped event can wait; zero means 5s.
+	ReplayInterval time.Duration
 	// PauseFile is the dispatch kill switch; an `on` flow must honour it too.
 	PauseFile string
 	// MaxCostPerTask stops an `on` turn whose task has already spent this much.
@@ -84,6 +90,7 @@ type Engine struct {
 	mu     sync.Mutex
 	closed bool
 	seen   map[string]bool
+	queued map[string]bool
 
 	cursorMu sync.Mutex
 	cursor   string
@@ -111,6 +118,9 @@ func New(opts Options) (*Engine, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.ReplayInterval <= 0 {
+		opts.ReplayInterval = 5 * time.Second
+	}
 	store, err := NewStore(opts.DataDir)
 	if err != nil {
 		return nil, err
@@ -123,13 +133,14 @@ func New(opts Options) (*Engine, error) {
 		opts.Logger.Warn("flow runs interrupted by the restart were marked needs_attention", "runs", recovered)
 	}
 	engine := &Engine{
-		opts:  opts,
-		log:   opts.Logger,
-		store: store,
-		now:   opts.Now,
-		queue: make(chan upstream.Event, opts.QueueSize),
-		done:  make(chan struct{}),
-		seen:  map[string]bool{},
+		opts:   opts,
+		log:    opts.Logger,
+		store:  store,
+		now:    opts.Now,
+		queue:  make(chan upstream.Event, opts.QueueSize),
+		done:   make(chan struct{}),
+		seen:   map[string]bool{},
+		queued: map[string]bool{},
 	}
 	if err := engine.loadCursor(); err != nil {
 		return nil, err
@@ -157,6 +168,13 @@ func (e *Engine) Start(ctx context.Context) {
 			}
 		}
 	}()
+	if e.opts.ReplaySource != nil {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			e.catchUp(ctx)
+		}()
+	}
 }
 
 // Submit enqueues an event without blocking. A full queue drops and counts, like
@@ -172,8 +190,14 @@ func (e *Engine) Submit(event upstream.Event) {
 		e.dropped.Add(1)
 		return
 	}
+	if event.ID != "" && e.queued[event.ID] {
+		return
+	}
 	select {
 	case e.queue <- event:
+		if event.ID != "" {
+			e.queued[event.ID] = true
+		}
 	default:
 		e.dropped.Add(1)
 	}
@@ -191,9 +215,16 @@ func (e *Engine) Replay(events []upstream.Event) {
 				e.mu.Unlock()
 				return
 			}
+			if event.ID != "" && e.queued[event.ID] {
+				e.mu.Unlock()
+				break
+			}
 			select {
 			case e.queue <- event:
 				e.submitted.Add(1)
+				if event.ID != "" {
+					e.queued[event.ID] = true
+				}
 				e.mu.Unlock()
 			default:
 				// Do not hold mu while waiting: the worker takes it for its seen
@@ -209,6 +240,39 @@ func (e *Engine) Replay(events []upstream.Event) {
 			break
 		}
 	}
+}
+
+func (e *Engine) catchUp(ctx context.Context) {
+	ticker := time.NewTicker(e.opts.ReplayInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cursor := e.Cursor()
+			if cursor == "" {
+				continue
+			}
+			events, err := e.opts.ReplaySource(cursor)
+			if err != nil {
+				e.log.Warn("periodic flow catch-up failed", "error", err)
+				continue
+			}
+			if len(events) > 0 {
+				e.Replay(events)
+			}
+		}
+	}
+}
+
+func (e *Engine) finish(event upstream.Event) {
+	if event.ID == "" {
+		return
+	}
+	e.mu.Lock()
+	delete(e.queued, event.ID)
+	e.mu.Unlock()
 }
 
 func (e *Engine) Close() error {
@@ -273,6 +337,7 @@ func (e *Engine) RunEvent(event upstream.Event) (*Run, error) {
 // context so an `on` turn is cancelled on shutdown.
 func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (run *Run, err error) {
 	defer func() {
+		e.finish(event)
 		if err == nil && !e.paused() {
 			e.advance(event)
 		}

@@ -868,7 +868,7 @@ func (e *env) postWebhookRaw(payload []byte) (int, error) {
 
 func TestReplayCursor(t *testing.T) {
 	if os.Getenv("E2E_REPLAY") != "1" {
-		t.Skip("set E2E_REPLAY=1 to append events while stopped and verify replay")
+		t.Skip("set E2E_REPLAY=1 to verify periodic catch-up and startup replay")
 	}
 	if suite.live {
 		t.Skip("replay is checked in direct mode")
@@ -886,24 +886,52 @@ func TestReplayCursor(t *testing.T) {
 	suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.Runs >= 1 }, 20*time.Second)
 	time.Sleep(200 * time.Millisecond)
 
-	// Append events to the durable log while the process is stopped. They are
-	// exactly the shape the webhook writes, but no HTTP delivery is involved.
+	// 1. Append events while the process is still running. Only the periodic
+	// catch-up can see these; no HTTP delivery wakes the engine.
+	const liveCount = 3
+	appendReplayEvents(t, "live", liveCount)
+	suite.waitForFlowHealth(t, func(f flowHealth) bool {
+		return f.Runs >= 1+liveCount
+	}, 30*time.Second)
+	if got := suite.flowHealth(t).Runs; got != 1+liveCount {
+		t.Fatalf("periodic catch-up produced %v runs, want %d", got, 1+liveCount)
+	}
+
+	// 2. Append events while the process is stopped. Only startup replay can see
+	// these.
 	suite.stop()
+	const restartCount = 5
+	appendReplayEvents(t, "restart", restartCount)
+	suite.start()
+	// The engine's runs counter is per process: after the restart it counts the
+	// replayed events, not the events that belonged to the previous process.
+	suite.waitForFlowHealth(t, func(f flowHealth) bool {
+		return f.Runs >= restartCount
+	}, 30*time.Second)
+	if got := suite.flowHealth(t).Runs; got != restartCount {
+		t.Fatalf("startup replay produced %v runs, want %d", got, restartCount)
+	}
+}
+
+// appendReplayEvents writes valid events straight to the durable log, bypassing
+// the webhook. This is what lets the test separate periodic catch-up (running)
+// from startup replay (stopped).
+func appendReplayEvents(t *testing.T, phase string, count int) {
+	t.Helper()
 	now := time.Now().UTC()
 	path := filepath.Join(suite.dataDir, "events", now.Format("2006-01-02")+".jsonl")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatalf("open event log: %v", err)
 	}
-	const replayCount = 5
-	for i := 0; i < replayCount; i++ {
+	for i := 0; i < count; i++ {
 		at := now.Add(time.Duration(i) * time.Second)
 		event := upstream.Event{
 			ID: upstream.NewID(at), Schema: upstream.Schema, Upstream: "youtrack", Kind: upstream.KindIssueUpdated,
 			OccurredAt: at, ReceivedAt: at,
-			Subject:   upstream.Subject{Type: "issue", Project: suite.ytProject, Key: suite.ytIssue, Title: "replay"},
+			Subject:   upstream.Subject{Type: "issue", Project: suite.ytProject, Key: suite.ytIssue, Title: "replay " + phase},
 			Actor:     upstream.Actor{Login: "yusiwen"},
-			DedupeKey: fmt.Sprintf("replay-%d-%d", now.UnixNano(), i),
+			DedupeKey: fmt.Sprintf("replay-%s-%d-%d", phase, now.UnixNano(), i),
 			Origin:    "upstream:youtrack",
 		}
 		data, err := json.Marshal(event)
@@ -919,15 +947,7 @@ func TestReplayCursor(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatalf("close event log: %v", err)
 	}
-
-	suite.start()
-	// The engine's runs counter is per process: after the restart it counts the
-	// replayed events, not the seed run that belonged to the previous process.
-	suite.waitForFlowHealth(t, func(f flowHealth) bool {
-		return f.Runs >= replayCount
-	}, 30*time.Second)
 }
-
 func (e *env) addComment(issue, text string) (string, error) {
 	body := map[string]any{"text": text}
 	var response struct {

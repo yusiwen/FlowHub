@@ -397,6 +397,8 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		// than dispatch's worker queue; the event log remains the durable source,
 		// and replay is still an M2-4 item. 4096 is a bound, not a guarantee.
 		QueueSize:      max(cfg.DispatchQueueSize, 4096),
+		ReplaySource:   events.Since,
+		ReplayInterval: 5 * time.Second,
 		Logger:         logger,
 		PauseFile:      cfg.ResolvedPauseFile(),
 		MaxCostPerTask: cfg.TaskMaxCost,

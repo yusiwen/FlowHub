@@ -159,7 +159,8 @@ e2e-burst: build
 		E2E_BURST_CONCURRENCY=$${E2E_BURST_CONCURRENCY:-16} \
 		go test -tags=e2e ./e2e -count=1 -run TestBurstSoak -v
 
-# Opt-in: append valid events while stopped, restart, assert the flow replays them.
+# Opt-in: append valid events while running and while stopped; assert periodic
+# catch-up and startup replay produce the missing runs.
 e2e-replay: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 E2E_REPLAY=1 go test -tags=e2e ./e2e -count=1 -run TestReplayCursor -v
