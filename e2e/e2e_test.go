@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -1901,6 +1901,104 @@ func (e *env) addProject(t *testing.T, project string) {
 	}
 	if err := os.WriteFile(e.configPath, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+func (e *env) apiRequest(t *testing.T, method, path, token string, body []byte) (int, string) {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	request, err := http.NewRequest(method, e.baseURL+path, reader)
+	if err != nil {
+		t.Fatalf("api request: %v", err)
+	}
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	response, err := e.client.Do(request)
+	if err != nil {
+		t.Fatalf("api: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	reply, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+	return response.StatusCode, strings.TrimSpace(string(reply))
+}
+
+func TestAPIAuthAndInvalidDeployment(t *testing.T) {
+	if os.Getenv("E2E_API") != "1" {
+		t.Skip("set E2E_API=1 to run /hub/v1 auth/deployment checks")
+	}
+	if suite.live {
+		t.Skip("API checks use the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	base := "/hub/v1/flows/default-youtrack"
+
+	if status, _ := suite.apiRequest(t, http.MethodGet, "/hub/v1/ping", "", nil); status != http.StatusUnauthorized {
+		t.Fatalf("no token status = %d, want 401", status)
+	}
+	if status, _ := suite.apiRequest(t, http.MethodGet, "/hub/v1/ping", "wrong", nil); status != http.StatusUnauthorized {
+		t.Fatalf("wrong token status = %d, want 401", status)
+	}
+	if status, _ := suite.apiRequest(t, http.MethodGet, "/hub/v1/flows", suite.hubToken, nil); status != http.StatusOK {
+		t.Fatalf("valid token status = %d, want 200", status)
+	}
+
+	cases := []struct {
+		name string
+		path string
+		body string
+		want int
+	}{
+		{"bogus mode", base + "/deployment", `{"mode":"bogus"}`, http.StatusBadRequest},
+		{"bad project", base + "/deployment", `{"mode":"shadow","projects":["bad key"]}`, http.StatusBadRequest},
+		{"unknown field", base + "/deployment", `{"mode":"shadow","extra":1}`, http.StatusBadRequest},
+		{"unknown flow", "/hub/v1/flows/unknown/deployment", `{"mode":"shadow"}`, http.StatusNotFound},
+		{"no auth deployment", base + "/deployment", `{"mode":"shadow"}`, http.StatusUnauthorized},
+		{"on with task service", base + "/deployment", `{"mode":"on","projects":["TEST"]}`, http.StatusOK},
+	}
+	for _, tc := range cases {
+		token := suite.hubToken
+		if tc.name == "no auth deployment" {
+			token = ""
+		}
+		status, body := suite.apiRequest(t, http.MethodPost, tc.path, token, []byte(tc.body))
+		if status != tc.want {
+			t.Fatalf("%s: status = %d, want %d (%s)", tc.name, status, tc.want, body)
+		}
+	}
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("restore off: %v", err)
+	}
+
+	// Disabled API: no FLOWHUB_HUB_TOKEN means every endpoint is 503.
+	originalToken := suite.hubToken
+	suite.hubToken = ""
+	suite.stop()
+	suite.start()
+	if status, _ := suite.apiRequest(t, http.MethodGet, "/hub/v1/flows", "", nil); status != http.StatusServiceUnavailable {
+		t.Fatalf("disabled API status = %d, want 503", status)
+	}
+	suite.stop()
+	suite.hubToken = originalToken
+
+	// on cannot be stored when the process has no task service.
+	suite.extraEnv = []string{"FLOWHUB_DISPATCH=0"}
+	suite.start()
+	if status, body := suite.apiRequest(t, http.MethodPost, base+"/deployment", suite.hubToken, []byte(`{"mode":"on"}`)); status != http.StatusConflict {
+		t.Fatalf("on without task service status = %d, want 409 (%s)", status, body)
 	}
 }
 
