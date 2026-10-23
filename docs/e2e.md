@@ -121,6 +121,13 @@ turn deadline:
 make e2e-opencode-failures
 ```
 
+Policy (fake runtime): an author outside the project allowlist creates no task or
+session; an allowlisted reporter still works; an unmapped project is refused:
+
+```bash
+make e2e-policy
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -183,6 +190,8 @@ the Make targets are only wrappers around the suite.
 | restart mode + compare state | `TestRestartKeepsComparisonState` | `make e2e-restart` |
 | permit/revoke | `TestPermitAndRevoke` | `make e2e-permit` |
 | silent turn -> nudge -> answered, then both silent -> failed | `TestSilentTurnNudgeAndFailure` | `make e2e-silent` |
+| author allowlist deny/allowed | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
+| unmapped project creates no task | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
 | opencode unavailable at startup | `TestOpencodeUnavailableAtStartup` | `make e2e-opencode-failures` |
 | no healthy runtime before a delivery -> ignored, no task row | `TestOpencodeUnavailableBeforeDelivery` | `make e2e-opencode-failures` |
 | prompt returns 500 during a turn -> failed, not `awaiting_input` | `TestOpencodePromptFailure` | `make e2e-opencode-failures` |
@@ -219,7 +228,7 @@ closed audit that produced this list.
 | --- | --- |
 | ingress rejection | wrong URL key/token/IP, body cap, content type, malformed JSON, unknown event, replay window |
 | durable append failure | `503` and dedupe-key release |
-| routing/auth | unmapped project, author allowlist deny, repository rebind refusal |
+| routing/auth | repository rebind refusal |
 | turn failure | none known after the 500/timeout/startup tests; author deny and unmapped project are in the routing row |
 | same-task concurrency | second delivery waits, one session, capacity saturation |
 | crash | SIGKILL during execute and during an `on` run (the current crash test kills analysis) |
