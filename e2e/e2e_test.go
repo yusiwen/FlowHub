@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" || os.Getenv("E2E_ON_RESTART") == "1" || os.Getenv("E2E_AGED_CURSOR") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" || os.Getenv("E2E_ON_RESTART") == "1" || os.Getenv("E2E_AGED_CURSOR") == "1" || os.Getenv("E2E_REBIND") == "1" || os.Getenv("E2E_CAPACITY") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -1354,6 +1354,205 @@ func (e *env) setProjectAuthors(t *testing.T, authors []string) {
 	}
 	if err := os.WriteFile(e.configPath, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+func (e *env) setProjectRepo(t *testing.T, repo, worktrees string) {
+	t.Helper()
+	if err := os.MkdirAll(worktrees, 0o700); err != nil {
+		t.Fatalf("worktrees for %s: %v", repo, err)
+	}
+	data, err := os.ReadFile(e.configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	projects, _ := raw["projects"].([]any)
+	found := false
+	for _, item := range projects {
+		entry, ok := item.(map[string]any)
+		if !ok || entry["project"] != e.ytProject {
+			continue
+		}
+		repoEntry, _ := entry["repo"].(map[string]any)
+		repoEntry["path"] = repo
+		entry["worktrees"] = worktrees
+		found = true
+	}
+	if !found {
+		t.Fatalf("project %q not in config", e.ytProject)
+	}
+	data, err = json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	if err := os.WriteFile(e.configPath, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+func (e *env) setRuntimeMaxConcurrent(t *testing.T, max int) {
+	t.Helper()
+	data, err := os.ReadFile(e.configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	runtimes, _ := raw["runtimes"].(map[string]any)
+	for _, value := range runtimes {
+		if runtime, ok := value.(map[string]any); ok {
+			runtime["max_concurrent"] = max
+		}
+	}
+	data, err = json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	if err := os.WriteFile(e.configPath, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+func TestRepositoryRebindRefused(t *testing.T) {
+	if os.Getenv("E2E_REBIND") != "1" {
+		t.Skip("set E2E_REBIND=1 to bind a task to one repo and then move the mapping")
+	}
+	if suite.live {
+		t.Skip("repository rebind uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+
+	key := "TEST-REBIND-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	t.Cleanup(func() { suite.removeTestWorktree(key) })
+	summary := "FlowHub E2E rebind " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	deliver := func() {
+		t.Helper()
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Rebind E2E.", suite.ytProject)); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+	}
+	deliver()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && fake.promptCount() < 1 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() != 1 {
+		t.Fatalf("prompts = %d, want 1", fake.promptCount())
+	}
+	bound := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Turns == 1 && row.Worktree != "" && row.Session != ""
+	}, 30*time.Second)
+	if bound.Worktree == "" {
+		t.Fatal("first turn did not bind a worktree")
+	}
+
+	rebindRepo := filepath.Join(suite.dir, "rebind-repo")
+	cmd := exec.Command("git", "clone", "--quiet", suite.repo, rebindRepo)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone second repo: %v: %s", err, output)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(rebindRepo) })
+	rebindWorktrees := filepath.Join(suite.dir, "rebind-worktrees")
+	suite.stop()
+	suite.setProjectRepo(t, rebindRepo, rebindWorktrees)
+	suite.start()
+
+	deliver()
+	failed := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "failed" && strings.Contains(row.LastError, "bound to")
+	}, 20*time.Second)
+	if !strings.Contains(failed.LastError, rebindRepo) {
+		t.Fatalf("failure does not name the new repo: %q", failed.LastError)
+	}
+	time.Sleep(time.Second)
+	if got := fake.promptCount(); got != 1 {
+		t.Fatalf("prompts after rebind = %d, want 1", got)
+	}
+	if _, err := os.Stat(filepath.Join(rebindWorktrees, key)); !os.IsNotExist(err) {
+		t.Fatalf("a worktree was created under the new repo: %v", err)
+	}
+}
+
+func TestCrossTaskCapacitySaturation(t *testing.T) {
+	if os.Getenv("E2E_CAPACITY") != "1" {
+		t.Skip("set E2E_CAPACITY=1 to saturate a runtime with two distinct tasks")
+	}
+	if suite.live {
+		t.Skip("capacity saturation uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	hold := make(chan struct{})
+	fake.setHold(hold)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.setRuntimeMaxConcurrent(t, 1)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	keys := []string{"TEST-CAP-A-" + suffix, "TEST-CAP-B-" + suffix}
+	for _, key := range keys {
+		key := key
+		t.Cleanup(func() { suite.removeTestWorktree(key) })
+		summary := "FlowHub E2E capacity " + key
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Capacity E2E.", suite.ytProject)); status != http.StatusAccepted {
+			t.Fatalf("webhook for %s = %d", key, status)
+		}
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && fake.promptCount() < 1 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() != 1 {
+		t.Fatalf("prompts before release = %d, want 1", fake.promptCount())
+	}
+	time.Sleep(500 * time.Millisecond)
+	if fake.promptCount() != 1 {
+		t.Fatalf("a second task started while the runtime had one slot: prompts=%d", fake.promptCount())
+	}
+	if got := fake.maxConcurrentPrompts(); got != 1 {
+		t.Fatalf("max concurrent prompts = %d, want 1", got)
+	}
+
+	fake.release()
+	deadline = time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && fake.promptCount() < 2 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() != 2 {
+		t.Fatalf("prompts after release = %d, want 2", fake.promptCount())
+	}
+	for _, key := range keys {
+		row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+			return row.Turns == 1 && row.State == "awaiting_input"
+		}, 30*time.Second)
+		if row.Session == "" || row.Worktree == "" {
+			t.Fatalf("task %s has no worktree/session: %+v", key, row)
+		}
+	}
+	if got := fake.maxConcurrentPrompts(); got != 1 {
+		t.Fatalf("max concurrent prompts after release = %d, want 1", got)
 	}
 }
 
