@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -1768,6 +1768,112 @@ func TestAuthorAllowlistAndUnmappedProject(t *testing.T) {
 	}
 }
 
+func (e *env) setSourceMaxTurns(t *testing.T, maxTurns int) {
+	t.Helper()
+	data, err := os.ReadFile(e.configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	sources, _ := raw["sources"].(map[string]any)
+	youtrack, _ := sources["youtrack"].(map[string]any)
+	policy, _ := youtrack["policy"].(map[string]any)
+	if policy == nil {
+		policy = map[string]any{}
+		youtrack["policy"] = policy
+	}
+	policy["max_turns"] = maxTurns
+	data, err = json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	if err := os.WriteFile(e.configPath, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+func runLimitPhase(t *testing.T, envValue string, maxTurns int) taskRow {
+	t.Helper()
+	suite.stop()
+	suite.extraEnv = []string{envValue}
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.setSourceMaxTurns(t, maxTurns)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+
+	summary := "FlowHub E2E limit " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Limit E2E.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	deliver := func(payload []byte) {
+		t.Helper()
+		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+	}
+	deliver(issueCreatedPayload(key, summary, "Limit E2E.", suite.ytProject))
+	suite.waitForRegistry(t, key, func(row taskRow) bool { return row.Turns == 1 }, 20*time.Second)
+	comment, err := suite.addComment(key, "/opencode start")
+	if err != nil {
+		t.Fatalf("plan comment: %v", err)
+	}
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Turns == 2 && row.Plan == "draft"
+	}, 20*time.Second)
+
+	// A third trigger must be ignored by the limit before any prompt.
+	time.Sleep(1100 * time.Millisecond)
+	comment, err = suite.addComment(key, "/opencode start")
+	if err != nil {
+		t.Fatalf("execute comment: %v", err)
+	}
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	time.Sleep(500 * time.Millisecond)
+	if got := fake.promptCount(); got != 2 {
+		t.Fatalf("prompts after the limit = %d, want 2", got)
+	}
+	after := suite.waitForRegistry(t, key, func(row taskRow) bool { return row.Turns == 2 }, 5*time.Second)
+	if after.State == "executing" {
+		t.Fatalf("limit ignored delivery still entered execution: %+v", after)
+	}
+	return row
+}
+
+func TestCostCapStopsATask(t *testing.T) {
+	if os.Getenv("E2E_LIMITS") != "1" {
+		t.Skip("set E2E_LIMITS=1 to run cost/turn limit checks")
+	}
+	if suite.live {
+		t.Skip("limit checks use the fake runtime in direct mode")
+	}
+	row := runLimitPhase(t, "FLOWHUB_TASK_MAX_COST=0.0015", 8)
+	if row.Cost < 0.0015 {
+		t.Fatalf("task cost = %v, want the two turns above the cap", row.Cost)
+	}
+}
+
+func TestMaxTurnsStopsATask(t *testing.T) {
+	if os.Getenv("E2E_LIMITS") != "1" {
+		t.Skip("set E2E_LIMITS=1 to run cost/turn limit checks")
+	}
+	if suite.live {
+		t.Skip("limit checks use the fake runtime in direct mode")
+	}
+	runLimitPhase(t, "FLOWHUB_MAX_TURNS=2", 2)
+}
+
 func TestOpencodeUnavailableAtStartup(t *testing.T) {
 	if os.Getenv("E2E_DOWN") != "1" {
 		t.Skip("set E2E_DOWN=1 to run runtime failure paths")
@@ -2131,14 +2237,15 @@ func runPermit(t *testing.T, on bool) {
 }
 
 type taskRow struct {
-	TaskKey    string `json:"task_key"`
-	State      string `json:"state"`
-	Worktree   string `json:"worktree"`
-	Session    string `json:"session_id"`
-	Plan       string `json:"plan_state"`
-	LastAction string `json:"last_action"`
-	LastError  string `json:"last_error"`
-	Turns      int    `json:"turns"`
+	TaskKey    string  `json:"task_key"`
+	State      string  `json:"state"`
+	Worktree   string  `json:"worktree"`
+	Session    string  `json:"session_id"`
+	Plan       string  `json:"plan_state"`
+	LastAction string  `json:"last_action"`
+	LastError  string  `json:"last_error"`
+	Cost       float64 `json:"cost"`
+	Turns      int     `json:"turns"`
 	Refusals   []struct {
 		Command string `json:"command"`
 	} `json:"refusals"`
