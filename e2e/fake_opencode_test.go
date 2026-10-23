@@ -28,11 +28,17 @@ type fakeOpencode struct {
 	failPrompt  bool
 	inFlight    int
 	maxInFlight int
+
+	permissionCommand string
+	permissionPending bool
+	permissionSession string
+	promptTotal       int
+	permissionReplies map[int]string
 }
 
 func newFakeOpencode(t *testing.T) *fakeOpencode {
 	t.Helper()
-	return &fakeOpencode{mode: "silent", prompts: map[string][]string{}}
+	return &fakeOpencode{mode: "silent", prompts: map[string][]string{}, permissionReplies: map[int]string{}}
 }
 
 func (f *fakeOpencode) setMode(mode string) {
@@ -72,6 +78,19 @@ func (f *fakeOpencode) release() {
 			close(hold)
 		}
 	}
+}
+
+func (f *fakeOpencode) setPermissionCommand(command string) {
+	f.mu.Lock()
+	f.permissionCommand = command
+	f.permissionPending = false
+	f.mu.Unlock()
+}
+
+func (f *fakeOpencode) permissionReplyFor(prompt int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.permissionReplies[prompt]
 }
 
 func (f *fakeOpencode) setFailPrompt(fail bool) {
@@ -119,7 +138,28 @@ func (f *fakeOpencode) start() *httptest.Server {
 		writeFakeJSON(w, status)
 	})
 	mux.HandleFunc("/permission", func(w http.ResponseWriter, _ *http.Request) {
-		writeFakeJSON(w, []any{})
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.permissionCommand == "" || !f.permissionPending {
+			writeFakeJSON(w, []any{})
+			return
+		}
+		writeFakeJSON(w, []any{map[string]any{
+			"id": "per_1", "sessionID": f.permissionSession, "permission": "bash",
+			"patterns": []string{f.permissionCommand},
+			"metadata": map[string]any{"command": f.permissionCommand},
+		}})
+	})
+	mux.HandleFunc("/permission/per_1/reply", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Reply string `json:"reply"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.permissionReplies[f.promptTotal] = body.Reply
+		f.permissionPending = false
+		f.mu.Unlock()
+		writeFakeJSON(w, true)
 	})
 	return httptest.NewServer(mux)
 }
@@ -137,8 +177,13 @@ func (f *fakeOpencode) prompt(w http.ResponseWriter, id string, r *http.Request)
 	}
 	f.mu.Lock()
 	f.prompts[id] = append(f.prompts[id], text)
+	f.promptTotal++
 	delay, hold, holdAt := f.delay, f.hold, f.holdAt
 	promptNumber := len(f.prompts[id])
+	if f.permissionCommand != "" {
+		f.permissionPending = true
+		f.permissionSession = id
+	}
 	f.inFlight++
 	if f.inFlight > f.maxInFlight {
 		f.maxInFlight = f.inFlight
@@ -201,6 +246,16 @@ func (f *fakeOpencode) sessionCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.nextID
+}
+
+func (f *fakeOpencode) allPrompts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var all []string
+	for _, prompts := range f.prompts {
+		all = append(all, prompts...)
+	}
+	return all
 }
 
 func (f *fakeOpencode) promptCount() int {
