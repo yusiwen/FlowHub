@@ -146,13 +146,15 @@ the Make targets are only wrappers around the suite.
 | restart mode + compare state | `TestRestartKeepsComparisonState` | `make e2e-restart` |
 | permit/revoke | `TestPermitAndRevoke` | `make e2e-permit` |
 | SIGKILL + restart recovery | `TestCrashRecovery` | `make e2e-crash` |
-| live permit/revoke | `TestPermitAndRevoke` (live) | `make e2e-live-permit` |
+| live permit/revoke (dispatch) | `TestPermitAndRevoke` (live) | `make e2e-live-permit` |
+| live permit/revoke (`on`) | `TestOnLivePermitAndRevoke` | `make e2e-live-on-permit` |
 | cleanup test issues/temp dirs | `TestCleanupTestResources` | `make e2e-clean` |
 
 `make e2e-all` runs every non-permit opt-in scenario in direct mode in one process.
 `make e2e-live-journey` runs the full live journey with dispatch;
 `make e2e-live-on-journey` runs the same journey with the flow in `on` mode.
-`make e2e-live-permit` runs the permit/revoke test against live webhooks.
+`make e2e-live-permit` runs the permit/revoke test against live webhooks with
+dispatch; `make e2e-live-on-permit` runs it through the flow in `on` mode.
 `make e2e-clean` deletes only issues with this suite's summary prefixes and removes
 its temp dirs; it never deletes `E2E_ISSUE`.
 `make e2e-permit` is separate because it installs a project prompt file before
