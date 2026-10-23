@@ -26,7 +26,6 @@ import (
 
 	"github.com/yusiwen/flowhub/internal/agent"
 	"github.com/yusiwen/flowhub/internal/compare"
-	"github.com/yusiwen/flowhub/internal/event"
 	"github.com/yusiwen/flowhub/internal/projectmap"
 	"github.com/yusiwen/flowhub/internal/registry"
 	"github.com/yusiwen/flowhub/internal/rules"
@@ -34,6 +33,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/runtimes"
 	"github.com/yusiwen/flowhub/internal/source"
 	"github.com/yusiwen/flowhub/internal/store"
+	tasksvc "github.com/yusiwen/flowhub/internal/tasks"
 	"github.com/yusiwen/flowhub/internal/workspace"
 )
 
@@ -126,11 +126,6 @@ type Dispatcher struct {
 	// delivery and every prompt is judged by the same rules.
 	policy rules.Policy
 
-	// workspaces caches one provider per checkout base directory and serializes
-	// preparation per repository; the flow engine shares this instance. runtimes
-	// caches one adapter per host name and is rebuilt when that host's address
-	// changes, because an operator may re-enrol it while this process runs.
-	workspaces *runner.Workspaces
 	// cacheMu guards runtimes, which is rebuilt when a host's address changes.
 	cacheMu  sync.Mutex
 	runtimes map[string]cachedRuntime
@@ -161,13 +156,9 @@ type Dispatcher struct {
 	// /healthz read the same counters, and the flow engine shares the gate.
 	capacity *runner.Capacity
 
-	// taskMu guards taskLocks, the per-task lease shared with the flow engine's
-	// task service. The scheduler already keeps one dispatch turn per task, but a
-	// deployment switch can put a flow turn and a dispatch turn for the same task
-	// in flight at once; the lease is what makes "one session, one turn" survive
-	// the switch.
-	taskMu    sync.Mutex
-	taskLocks map[string]*sync.Mutex
+	// taskExec is the extracted task lifecycle (M3-1). Dispatch still routes and
+	// schedules, but ensure/turn/grant/revoke no longer live here.
+	taskExec *tasksvc.Executor
 }
 
 // New builds a dispatcher. It does not start working until Run is called.
@@ -209,19 +200,33 @@ func New(opts Options) (*Dispatcher, error) {
 		return nil, errors.New("dispatch: the event source supplied no trigger policy")
 	}
 
-	return &Dispatcher{
+	d := &Dispatcher{
 		opts:       opts,
 		policy:     ruleset,
 		log:        opts.Log,
-		workspaces: runner.NewWorkspaces(opts.NewWorkspace),
 		runtimes:   map[string]cachedRuntime{},
 		capacity:   capacity,
 		queue:      make(chan *store.Record, opts.QueueSize),
 		schedulers: map[string]*runtimeScheduler{},
 		routes:     map[taskID]runtimeBinding{},
 		lastError:  map[string]string{},
-		taskLocks:  map[string]*sync.Mutex{},
-	}, nil
+	}
+	exec, err := tasksvc.New(tasksvc.Options{
+		Registry:     opts.Registry,
+		Source:       opts.Source,
+		Policy:       ruleset,
+		Log:          opts.Log,
+		WorktreeBase: opts.WorktreeBase,
+		NewWorkspace: opts.NewWorkspace,
+		Capacity:     capacity,
+		RuntimeError: d.setRuntimeError,
+		RuntimeOK:    d.clearRuntimeError,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dispatch: task service: %w", err)
+	}
+	d.taskExec = exec
+	return d, nil
 }
 
 // Dispatch queues a delivery. It never blocks: the webhook request path is
@@ -384,30 +389,6 @@ func (d *Dispatcher) observeDecision(rec *store.Record, decision rules.Decision,
 	})
 }
 
-func (d *Dispatcher) taskLock(rec *store.Record) *sync.Mutex {
-	key := d.opts.Source.Name() + "\x00" + rec.IssueID
-	d.taskMu.Lock()
-	defer d.taskMu.Unlock()
-	if lock, ok := d.taskLocks[key]; ok {
-		return lock
-	}
-	lock := &sync.Mutex{}
-	d.taskLocks[key] = lock
-	return lock
-}
-
-func (d *Dispatcher) enterTurn(ctx context.Context, runtime string) func() {
-	if runtime == "" {
-		return func() {}
-	}
-	release, err := d.capacity.Acquire(ctx, runtime)
-	if err != nil {
-		return func() {}
-	}
-	return release
-}
-
-// inFlightFor reports how many turns are running on a runtime right now.
 func (d *Dispatcher) inFlightFor(runtime string) int {
 	return d.capacity.InFlight(runtime)
 }
@@ -743,7 +724,9 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		// actor check, before anything is prepared — so revoking cannot be blocked by
 		// the worktree or the binding.
 		effective = decision
-		d.revokeGrant(rec, task)
+		if err := d.taskExec.Revoke(ctx, tasksvc.RevokeRequest{Record: rec, Task: task}); err != nil {
+			d.log.Error("cannot revoke the authorisation", "issue", rec.IssueID, "error", err)
+		}
 		return
 	}
 
@@ -758,11 +741,12 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		return
 	}
 
-	agentName := runtimeAgent(match.Entry, binding, d.opts.Agent)
-	task, err = d.ensureTask(ctx, rec, match.Entry, task, known, binding, agentName)
+	host := d.flowHost(match.Entry, binding)
+	task, err = d.taskExec.Ensure(ctx, tasksvc.EnsureRequest{
+		Record: rec, Delivery: delivery, Entry: match.Entry, Host: host,
+	})
 	if err != nil {
 		effective = rules.Decision{Action: rules.ActionIgnore, Reason: "the task could not be prepared"}
-		d.failPreparation(rec, binding, err)
 		return
 	}
 
@@ -771,7 +755,15 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 		// turn that carries on: the human's comment is what unblocks the task, so it
 		// must not need a second trigger.
 		effective = decision
-		decision, task = d.grantPermit(rec, task, decision)
+		granted, err := d.taskExec.Grant(ctx, tasksvc.GrantRequest{
+			Record: rec, Task: task, Entry: match.Entry, Trigger: string(decision.Trigger),
+		})
+		if err != nil {
+			d.log.Error("cannot record the authorisation", "issue", rec.IssueID, "error", err)
+			return
+		}
+		task = granted.Task
+		decision.Action = granted.Action
 		if decision.Action == rules.ActionIgnore {
 			effective = decision
 			return
@@ -779,104 +771,62 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 	} else {
 		effective = decision
 	}
-	d.runTurn(ctx, rec, delivery, task, match, decision, binding)
+	if _, err := d.taskExec.Turn(ctx, tasksvc.TurnRequest{
+		Record: rec, Delivery: delivery, Task: task, Entry: match.Entry, Host: host,
+		Action: decision.Action, Trigger: decision.Trigger, RequireReply: true,
+		Basis: decision.Reason,
+	}); err != nil {
+		d.log.Error("task turn failed", "issue", rec.IssueID, "error", err)
+	}
 }
 
 // ensureTask creates the registry row and the worktree if they do not exist yet,
 // and refuses to continue when the mapping changed under a running task.
-func (d *Dispatcher) ensureTask(ctx context.Context, rec *store.Record, entry *projectmap.Entry, task registry.Task, known bool, binding runtimeBinding, agentName string) (registry.Task, error) {
-	lease := d.taskLock(rec)
-	lease.Lock()
-	defer lease.Unlock()
-	if known && task.Repo != "" && task.Repo != entry.Repo.Path {
-		return registry.Task{}, fmt.Errorf("task %s is bound to %s but the mapping now points at %s; refusing to reuse the session",
-			rec.IssueID, task.Repo, entry.Repo.Path)
-	}
 
-	if !known {
-		created, _, err := d.opts.Registry.Ensure(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
-			t.Repo = entry.Repo.Path
-			t.Runtime = binding.Name
-			t.Agent = agentName
-			t.State = registry.StateAnalyzing
-			t.Plan = registry.PlanNone
-		})
-		if err != nil {
-			return registry.Task{}, err
-		}
-		task = created
+func sameTool(got, want string) bool {
+	norm := func(value string) string {
+		value = strings.ToLower(strings.TrimSpace(value))
+		value = strings.ReplaceAll(value, ".", "_")
+		value = strings.ReplaceAll(value, "-", "_")
+		return value
 	}
+	return norm(got) == norm(want)
+}
 
-	// An existing row written before runtimes were recorded still gets its
-	// binding, so the removal check has something to compare.
-	if task.Runtime == "" {
-		if task, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
-			t.Runtime = binding.Name
-		}); err == nil {
-			task.Runtime = binding.Name
+func anyToolCompleted(calls []agent.ToolCall, replyTools []string) bool {
+	for _, call := range calls {
+		if call.Status != "completed" {
+			continue
+		}
+		for _, want := range replyTools {
+			if sameTool(call.Name, want) {
+				return true
+			}
 		}
 	}
-	if task.Worktree != "" {
-		return task, nil
-	}
-	if entry.Repo.DefaultBranch == "" {
-		return registry.Task{}, fmt.Errorf("project %s has no default_branch configured, so no worktree can be based on it", entry.Label())
-	}
-	base := strings.TrimSpace(entry.Worktrees)
-	if base == "" {
-		base = strings.TrimSpace(d.opts.WorktreeBase)
-	}
-	if base == "" {
-		return registry.Task{}, fmt.Errorf("project %s declares no worktrees directory and no fallback is configured", entry.Label())
-	}
-	spaces, err := d.workspaceFor(base)
-	if err != nil {
-		return registry.Task{}, err
-	}
-	req := workspace.Request{
-		TaskKey:       rec.IssueID,
-		Repo:          entry.Repo.Path,
-		Remote:        entry.Repo.Remote,
-		DefaultBranch: entry.Repo.DefaultBranch,
-		BaseRef:       entry.Repo.DefaultBranch,
-		BaseCommit:    strings.TrimSpace(task.BaseCommit),
-	}
+	return false
+}
 
-	// The baseline is resolved once, when the task is created, and never again: a
-	// long-running task's patches stay reviewable against a fixed commit even if the
-	// origin moves. Resolving it through the provider is what makes two hosts with
-	// clones fetched at different times agree on where the task starts.
-	if req.BaseCommit == "" {
-		resolved, err := spaces.Resolve(ctx, req)
-		if err != nil {
-			return registry.Task{}, err
-		}
-		req.BaseCommit = resolved.Commit
-		d.log.Info("task baseline resolved",
-			"issue", rec.IssueID, "commit", shortCommit(resolved.Commit), "ref", resolved.Ref,
-			"source", resolved.Source, "repo", entry.Repo.Path)
-		if resolved.Source == "local" {
-			// Said out loud, because "local" is not a shared truth: it is the answer
-			// on this host only, and a second host would resolve its own.
-			d.log.Warn("the repository has no origin remote, so the baseline is this clone's local ref; two hosts would not agree on it",
-				"issue", rec.IssueID, "repo", entry.Repo.Path)
-		}
-	}
+func silentFinish(result agent.Result, err error, replied bool) bool {
+	return err == nil && result.Finished && !result.TimedOut && !replied && result.SessionID != ""
+}
 
-	lock := d.prepareLock(entry.Repo.Path)
-	lock.Lock()
-	prepared, err := spaces.Prepare(ctx, req)
-	lock.Unlock()
-	if err != nil {
-		return registry.Task{}, err
+// MinNudgeDeadline keeps a short task deadline from making the follow-up turn so
+// short that it cannot post the comment.
+const MinNudgeDeadline = 2 * time.Minute
+
+func nudgeDeadline(ordinary time.Duration) time.Duration {
+	if ordinary <= 0 {
+		return MinNudgeDeadline
 	}
-	return d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
-		t.Worktree = prepared.Path
-		t.Repo = prepared.Repo
-		if t.BaseCommit == "" {
-			t.BaseCommit = req.BaseCommit
-		}
-	})
+	bound := ordinary / 3
+	if bound < MinNudgeDeadline {
+		bound = MinNudgeDeadline
+	}
+	if bound > ordinary {
+		bound = ordinary
+	}
+	return bound
 }
 
 // runtimeAgent resolves which agent *profile* runs a turn: the routing entry may
@@ -920,567 +870,4 @@ func authorAllowed(allowed []string, actor string) bool {
 		}
 	}
 	return false
-}
-
-// workspaceFor returns the workspace provider for a checkout base directory,
-// creating it on first use. The base comes from the routing entry, because it has to
-// sit outside the repository that entry points at.
-func (d *Dispatcher) workspaceFor(base string) (workspace.Workspace, error) {
-	return d.workspaces.For(base)
-}
-
-// prepareLock returns the mutex that serializes workspace preparation for one
-// repository. Preparation is the one step that touches a shared resource — the
-// clone's own git bookkeeping — so it is the one step that cannot run twice at once
-// in the same repository, whatever the runtime. The turns themselves stay parallel.
-func (d *Dispatcher) prepareLock(repo string) *sync.Mutex {
-	return d.workspaces.Lock(repo)
-}
-
-// turnOutcome is the part of a turn the flow engine needs to expose as a step
-// output. It is internal; the task service adapter maps it to tasks.TurnResult.
-type turnOutcome struct {
-	SessionID string
-	Text      string
-	Finished  bool
-	TimedOut  bool
-	Replied   bool
-	Cost      float64
-	Tokens    agent.Tokens
-	Refusals  []registry.Refusal
-	Action    rules.Action
-}
-
-// runTurn delivers one prompt and records what came back.
-func (d *Dispatcher) runTurn(ctx context.Context, rec *store.Record, delivery event.Event, task registry.Task, match projectmap.Match, decision rules.Decision, binding runtimeBinding) turnOutcome {
-	lease := d.taskLock(rec)
-	lease.Lock()
-	defer lease.Unlock()
-	phase := agent.PhaseAnalysis
-	runningState := registry.StateAnalyzing
-	switch decision.Action {
-	case rules.ActionPlan:
-		runningState = registry.StatePlanning
-	case rules.ActionExecute:
-		phase = agent.PhaseExecution
-		runningState = registry.StateExecuting
-	}
-	// Persist the running state before the prompt. Recovery only inspects
-	// analyzing/planning/executing rows, so a SIGKILL during a plan or execute turn
-	// used to leave awaiting_input behind and the restart treated it as finished.
-	if task.State != runningState {
-		if updated, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
-			t.State = runningState
-		}); err != nil {
-			d.log.Warn("could not record the running task state", "issue", rec.IssueID, "state", runningState, "error", err)
-		} else {
-			task = updated
-		}
-	}
-
-	// The tool policy is data owned by the source: which tools may run unattended,
-	// which call counts as the reply, and where a download may land. How any of that
-	// becomes a permission request is the runtime's business, and the shell policy
-	// stays inside the runtime, because a source must not be able to widen it.
-	tools := d.opts.Source.Tools()
-
-	// The context is built once and reused by the follow-up turn: same issue, same
-	// worktree, same basis. Only what the prompt *says* differs.
-	promptCtx := rules.PromptContext{
-		// Whatever a human has authorised for this task travels with every turn it
-		// runs, not only the permit turn: the authorisation lasts until the task ends
-		// or is revoked, and a later turn that hits the same refusal must not need the
-		// human to say it again.
-		Permitted: grantedCommands(task),
-		Worktree:  task.Worktree,
-		// The prompt and the arbiter read one value: telling the agent to write
-		// somewhere the runtime would reject is worse than saying nothing.
-		AttachmentsDir: tools.Download.Prefix,
-		Repository:     match.Entry.Repo.Path,
-		Author:         rec.PrimaryActor,
-		// The sign-off states what the agent was reacting to; it comes from the
-		// decision, so the reply cannot invent a reason for itself.
-		Basis: d.policy.Basis(decision, delivery),
-		// The routing entry's own instructions, read from its prompt_file when the
-		// configuration was loaded.
-		Instructions: match.Entry.PromptExtra,
-	}
-	prompt := d.opts.Source.Prompt(decision.Action, &delivery, promptCtx)
-	if prompt == "" {
-		d.log.Error("no prompt was built for the action", "action", decision.Action, "issue", rec.IssueID)
-		return turnOutcome{Action: decision.Action}
-	}
-
-	// The routing entry owns the agent when it names one: which agent runs is a
-	// permission decision (that agent's own rules and tools), so it belongs next
-	// to the repository, not only in the environment.
-	agentName := runtimeAgent(match.Entry, binding, d.opts.Agent)
-
-	// The model is pinned for the same reason the agent is. The enrolment check
-	// verified the model the installed profile pins, but the agent server resolves
-	// an agent name against a list it cached when it started: a server running since
-	// before the profile was installed answers with the old model id, so without
-	// pinning, the check passes and every turn dies on a model its provider dropped.
-	// That happened on 2026-09-25. The routing entry still wins when it names one.
-	// Same order as the agent, for the same reason: the model a host reported for a
-	// profile is the one the capability check verified against the provider's
-	// catalogue, so the file's pin applies only where there is no attestation.
-	model := strings.TrimSpace(match.Entry.Model)
-	if model == "" {
-		model = binding.modelFor(agentName)
-	}
-	if model == "" {
-		model = binding.declaredModel()
-	}
-
-	defer d.enterTurn(ctx, binding.Name)()
-
-	// Announce the turn before it starts. Overlap is a property of the log rather than
-	// something to infer from two completion lines, and it is the line that shows a
-	// runtime is using the breadth it was configured with.
-	d.log.Info("turn started",
-		"issue", rec.IssueID, "action", decision.Action, "phase", phase,
-		"runtime", binding.Name, "agent", agentName, "model", model,
-		"session", task.SessionID, "max_concurrent", d.breadthFor(binding))
-
-	deadline := binding.deadline(d.opts.Deadline)
-	host := runner.Host{
-		Name:          binding.Name,
-		Runtime:       binding.Runtime,
-		Agent:         agentName,
-		Model:         model,
-		Deadline:      deadline,
-		MaxConcurrent: d.breadthFor(binding),
-	}
-	turn := runner.Turn{
-		Directory:    task.Worktree,
-		Prompt:       prompt,
-		Title:        rec.IssueID,
-		SessionID:    task.SessionID,
-		Phase:        phase,
-		AllowedTools: tools.Allowed,
-		Downloads: agent.Downloads{
-			Hosts:  tools.Download.Hosts,
-			Prefix: tools.Download.Prefix,
-		},
-		// The runtime turns these into an exception to its own allowlist, after its
-		// deny list and its phase rule: a human's authorisation can make an
-		// unrecognised command runnable, never a forbidden one.
-		Granted:  grantedCommands(task),
-		Metadata: map[string]any{"task_key": rec.IssueID, "action": string(decision.Action)},
-		Deadline: deadline,
-	}
-
-	result, err := host.Run(ctx, turn)
-
-	// The contract is one comment per turn, and a turn that posts none has told the
-	// maintainer nothing at all. Left alone that is invisible from the outside: the
-	// issue stays silent while the registry records a reply that does not exist
-	// (issue #27), and the next delivery reads that row as "a plan was posted".
-	//
-	// So the dispatcher asks once more, in the *same* session, with a prompt whose
-	// only job is the comment. One ask, not a retry loop: a model that cannot comply
-	// twice is failing, and the state below says so.
-	replied := anyToolCompleted(result.Tools, tools.Reply)
-	if silentFinish(result, err, replied) {
-		d.log.Warn("the turn finished without posting a comment; asking once more",
-			"issue", rec.IssueID, "session", result.SessionID,
-			"reply_tools", strings.Join(tools.Reply, "/"))
-		promptCtx.Nudge = true
-		if nudgePrompt := d.opts.Source.Prompt(decision.Action, &delivery, promptCtx); nudgePrompt != "" {
-			nudge := turn
-			nudge.Prompt = nudgePrompt
-			nudge.SessionID = result.SessionID
-			// The follow-up may only post a comment, and one delivery must not be able
-			// to hold a worker for two full turn budgets.
-			nudge.Deadline = nudgeDeadline(deadline)
-			nudged, nudgeErr := host.Run(ctx, nudge)
-			d.log.Info("follow-up turn finished",
-				"issue", rec.IssueID, "session", nudged.SessionID,
-				"finished", nudged.Finished, "timed_out", nudged.TimedOut,
-				"replied", anyToolCompleted(nudged.Tools, tools.Reply),
-				"cost", nudged.Cost, "tokens", nudged.Tokens.Total,
-				"elapsed", nudged.Elapsed.Round(time.Millisecond))
-			result = mergeTurns(result, nudged, nudgeErr)
-			err = nudgeErr
-			replied = anyToolCompleted(result.Tools, tools.Reply)
-		}
-	}
-
-	// Record the turn even when it failed: the audit is the only place the
-	// operator can see what happened.
-	attrs := []any{
-		"issue", rec.IssueID, "action", decision.Action, "phase", phase, "runtime", binding.Name,
-		"session", result.SessionID, "finished", result.Finished, "timed_out", result.TimedOut,
-		"replied", replied, "cost", result.Cost, "tokens", result.Tokens.Total,
-		"elapsed", result.Elapsed.Round(time.Millisecond), "permissions", len(result.Permissions),
-	}
-	switch {
-	case err != nil:
-		d.log.Error("turn failed", append(attrs, "error", err)...)
-		d.setRuntimeError(binding.Name, err.Error())
-	case !result.Finished:
-		d.log.Warn("turn did not finish", attrs...)
-		d.setRuntimeError(binding.Name, "the last turn did not finish")
-	default:
-		d.log.Info("turn finished", attrs...)
-		d.clearRuntimeError(binding.Name)
-	}
-	for _, answered := range result.Permissions {
-		d.log.Info("permission decision",
-			"issue", rec.IssueID, "permission", answered.Permission,
-			"command", answered.Command, "reply", answered.Reply, "reason", answered.Reason)
-	}
-	if result.Finished && !replied {
-		d.log.Error("the turn finished without posting a comment; the issue has no reply",
-			"issue", rec.IssueID, "session", result.SessionID,
-			"hint", "check the "+strings.Join(tools.Reply, "/")+" call and the MCP server")
-	}
-
-	// A finished turn that posted nothing asserts nothing. `awaiting_input` means
-	// "analysis is posted and a human must answer", and a plan state of `draft` means
-	// "a plan exists" — neither is true when the issue has no comment at all. Writing
-	// them anyway is how a task whose agent said nothing came to be read, on the next
-	// delivery, as "a plan is waiting for approval" and went straight to an execution
-	// turn with edit rights (issue #27). Fail instead, so the row matches the issue.
-	state := registry.StateAwaitingInput
-	switch {
-	case err != nil || (!result.Finished && !result.TimedOut):
-		state = registry.StateFailed
-	case result.TimedOut:
-		// A timeout is not a failure: the session may still be running.
-		state = registry.StateExecuting
-	case !replied:
-		state = registry.StateFailed
-	case decision.Action == rules.ActionExecute:
-		state = registry.StateDone
-	}
-	plan := task.Plan
-	if replied && decision.Action == rules.ActionPlan {
-		// Only a planning turn creates a plan. An analysis turn must leave the plan
-		// empty: marking it draft made the next `/opencode start` jump straight to
-		// edit rights without a plan (found by the live journey E2E).
-		plan = registry.PlanDraft
-	}
-
-	outcome := turnOutcome{
-		SessionID: result.SessionID,
-		Text:      result.Text,
-		Finished:  result.Finished,
-		TimedOut:  result.TimedOut,
-		Replied:   replied,
-		Cost:      result.Cost,
-		Tokens:    result.Tokens,
-		Refusals:  refusedCommands(result.Permissions),
-		Action:    decision.Action,
-	}
-	if _, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
-		if result.SessionID != "" {
-			t.SessionID = result.SessionID
-		}
-		if task.Worktree != "" {
-			t.Worktree = task.Worktree
-		}
-		t.Repo = match.Entry.Repo.Path
-		t.State = state
-		t.Plan = plan
-		// The row carries the reason as well as the state: "failed" with no answer to
-		// "failed at what?" sends the operator to a rotating log, and /healthz only keeps
-		// each host's most recent error.
-		if state == registry.StateFailed {
-			t.LastError = failureText(err, result)
-		} else {
-			t.LastError = ""
-		}
-		// The phase a permit continues in, and the commands a bare permit would
-		// authorise next: both are facts about the turn that just ran.
-		t.LastAction = string(decision.Action)
-		t.Refusals = refusedCommands(result.Permissions)
-		if state == registry.StateDone {
-			// The authorised commands were for the work this task has now finished, so
-			// keeping them would silently widen whatever this task does next.
-			t.Grant = nil
-		}
-		t.Turns++
-		t.Cost += result.Cost
-		// Only a turn that produced text replaces the recorded reply. A turn that
-		// ends without a final message — a tool-only loop, a crash — must not erase
-		// the last thing the agent said: that text is what recognises our own comment
-		// coming back as a webhook when the marker is lost.
-		if strings.TrimSpace(result.Text) != "" {
-			t.LastReply = result.Text
-		}
-	}); err != nil {
-		d.log.Error("cannot record the turn in the registry", "issue", rec.IssueID, "error", err)
-	}
-	return outcome
-}
-
-// anyToolCompleted reports whether the turn called one of the source's reply
-// tools successfully, which is what "the issue got an answer" means. The list is
-// the source's; the loop is the dispatcher's.
-// sameTool compares a source's tool name with the name the server reported. On
-// v2 the MCP surface spells a name `youtrack.add_issue_comment`, while the source
-// contract and the prompt use `youtrack_add_issue_comment`; treating those as two
-// tools made a posted comment look like silence (found by the real E2E).
-func sameTool(got, want string) bool {
-	if got == want {
-		return true
-	}
-	normalize := func(name string) string {
-		name = strings.TrimSpace(name)
-		name = strings.ReplaceAll(name, ".", "_")
-		name = strings.ReplaceAll(name, "-", "_")
-		return name
-	}
-	return normalize(got) == normalize(want)
-}
-
-func anyToolCompleted(calls []agent.ToolCall, replyTools []string) bool {
-	for _, call := range calls {
-		if call.Status != "completed" {
-			continue
-		}
-		for _, reply := range replyTools {
-			if sameTool(call.Name, reply) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// silentFinish reports whether a turn ended cleanly and posted no reply — the state
-// that must never be recorded as an answer (issue #27).
-//
-// A turn that errored, never finished, or timed out is excluded: those have their own
-// states, and re-prompting a session whose prompt the server rejected would only fail
-// again. A result with no session id is excluded too, because there is nothing to
-// continue.
-func silentFinish(result agent.Result, err error, replied bool) bool {
-	return err == nil && result.Finished && !result.TimedOut && !replied && result.SessionID != ""
-}
-
-// MinNudgeDeadline keeps a short task deadline from making the follow-up turn so
-// tight that it cannot post a comment.
-const MinNudgeDeadline = 2 * time.Minute
-
-// nudgeDeadline bounds the follow-up turn: a fraction of the ordinary budget, because
-// that turn may only post a comment. Without it one delivery could hold a worker for
-// two full turn budgets.
-//
-// The floor is a floor on the *fraction*, not a raise: a deployment whose ordinary
-// turn budget is shorter than MinNudgeDeadline keeps its own (shorter) bound, because
-// the follow-up must never get more time than a real turn.
-func nudgeDeadline(ordinary time.Duration) time.Duration {
-	if ordinary <= 0 {
-		return MinNudgeDeadline
-	}
-	bound := ordinary / 3
-	if bound < MinNudgeDeadline {
-		bound = MinNudgeDeadline
-	}
-	if bound > ordinary {
-		bound = ordinary
-	}
-	return bound
-}
-
-// mergeTurns folds the follow-up turn into the first one, so the audit and the
-// registry record one delivery: the costs add up and every permission decision from
-// both turns is kept. The second turn decides the outcome — it is the one that either
-// posted the comment or did not.
-func mergeTurns(first, second agent.Result, err error) agent.Result {
-	merged := first
-	merged.SessionID = second.SessionID
-	merged.Finished = second.Finished
-	merged.TimedOut = second.TimedOut
-	merged.ErrorText = second.ErrorText
-	merged.Elapsed = first.Elapsed + second.Elapsed
-	merged.Cost = first.Cost + second.Cost
-	merged.Tokens = addTokens(first.Tokens, second.Tokens)
-	// A follow-up that produced no text must not erase what the first turn said: that
-	// text is what recognises our own comment coming back when the marker is lost.
-	if strings.TrimSpace(second.Text) != "" {
-		merged.Text = second.Text
-	}
-	merged.Tools = append(append([]agent.ToolCall(nil), first.Tools...), second.Tools...)
-	merged.Permissions = append(append([]agent.PermissionDecision(nil), first.Permissions...), second.Permissions...)
-	if err != nil && merged.ErrorText == "" {
-		merged.ErrorText = err.Error()
-	}
-	return merged
-}
-
-func addTokens(first, second agent.Tokens) agent.Tokens {
-	sum := first
-	sum.Input += second.Input
-	sum.Output += second.Output
-	sum.Reasoning += second.Reasoning
-	sum.Total += second.Total
-	sum.CacheRead += second.CacheRead
-	sum.CacheWrite += second.CacheWrite
-	return sum
-}
-
-// failPreparation records a task whose worktree could not be prepared.
-//
-// A row left at `analyzing` asserts that the read-only analysis turn is running, when in
-// fact no session exists and no comment will ever be posted: the operator's `jq` over the
-// registry, and the state the next delivery reads, both describe work that is not
-// happening (issue #34). The state is `failed` rather than terminal because the next
-// delivery for the same task retries the preparation — a missing worktree is still
-// missing, so `ensureTask` runs again.
-func (d *Dispatcher) failPreparation(rec *store.Record, binding runtimeBinding, cause error) {
-	d.log.Error("cannot prepare the task",
-		"issue", rec.IssueID, "runtime", binding.Name, "error", cause,
-		"hint", "the task is recorded failed; the next delivery for it retries the preparation")
-	// The per-host view names the task, so a repository problem cannot be mistaken for a
-	// host that is down.
-	d.setRuntimeError(binding.Name, fmt.Sprintf("preparing %s: %v", rec.IssueID, cause))
-	if _, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
-		t.State = registry.StateFailed
-		t.LastError = cause.Error()
-	}); err != nil {
-		if !errors.Is(err, registry.ErrTaskNotFound) {
-			d.log.Error("cannot record the preparation failure", "issue", rec.IssueID, "error", err)
-			return
-		}
-		// The delivery failed before any row existed — a repository that moved under a
-		// bound task, a routing entry with no default branch. There is nothing to attach
-		// the failure to; the log line above is the whole record, and saying so is better
-		// than an update error nobody can act on.
-		d.log.Warn("no task row exists for the delivery that failed preparation, so only the log records it",
-			"issue", rec.IssueID)
-	}
-}
-
-// failureText is what a failed task row records as the reason. The turn's error is the
-// most precise source, then the runtime's own last error, then a description of the state
-// — a turn that finished having posted nothing is a failure with no error value at all
-// (rule 16).
-func failureText(err error, result agent.Result) string {
-	switch {
-	case err != nil:
-		return err.Error()
-	case strings.TrimSpace(result.ErrorText) != "":
-		return result.ErrorText
-	case result.Finished:
-		return "the turn finished without posting a comment"
-	default:
-		return "the turn did not finish"
-	}
-}
-
-// grantedCommands is the human's authorisation for this task, or nil.
-func grantedCommands(task registry.Task) []string {
-	if task.Grant == nil || len(task.Grant.Commands) == 0 {
-		return nil
-	}
-	return append([]string(nil), task.Grant.Commands...)
-}
-
-// refusedCommands extracts the commands a turn was refused for, in order and without
-// duplicates. This set is what a bare `/opencode permit` authorises, so it has to be
-// exactly what the human read in the agent's comment: no inference, no patterns.
-func refusedCommands(decisions []agent.PermissionDecision) []registry.Refusal {
-	var refusals []registry.Refusal
-	seen := map[string]bool{}
-	for _, decision := range decisions {
-		command := strings.TrimSpace(decision.Command)
-		if decision.Reply != agent.DecisionReject || command == "" || seen[command] {
-			continue
-		}
-		seen[command] = true
-		refusals = append(refusals, registry.Refusal{Command: command, Reason: decision.Reason})
-	}
-	return refusals
-}
-
-// grantPermit records the human's authorisation and turns the permit comment into the
-// turn that carries on from where the refusals stopped the agent.
-//
-// The authorised set accumulates: a second permit adds what the newest turn was
-// refused for instead of replacing the first, because the authorisation lasts until
-// the task ends and dropping an earlier command would refuse the agent something a
-// human already approved.
-func (d *Dispatcher) grantPermit(rec *store.Record, task registry.Task, decision rules.Decision) (rules.Decision, registry.Task) {
-	commands := grantedCommands(task)
-	known := make(map[string]bool, len(commands))
-	for _, command := range commands {
-		known[command] = true
-	}
-	var added []string
-	for _, refusal := range task.Refusals {
-		if command := strings.TrimSpace(refusal.Command); command != "" && !known[command] {
-			known[command] = true
-			commands = append(commands, command)
-			added = append(added, command)
-		}
-	}
-	if len(added) == 0 {
-		// Every refusal was already authorised. Nothing to record, and the turn still
-		// runs: the human asked for the work to continue, which is a legitimate thing
-		// to ask for twice.
-		d.log.Info("a permit added no new command; every refusal was already authorised",
-			"issue", rec.IssueID, "by", rec.PrimaryActor)
-	} else {
-		d.log.Warn("a human authorised refused commands; the task continues",
-			"issue", rec.IssueID, "by", rec.PrimaryActor,
-			"added", strings.Join(added, " && "),
-			"authorised_total", len(commands))
-	}
-	if updated, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
-		t.Grant = &registry.Grant{Commands: commands, By: rec.PrimaryActor, At: time.Now().UTC()}
-	}); err != nil {
-		d.log.Error("cannot record the authorisation", "issue", rec.IssueID, "error", err)
-		task.Grant = &registry.Grant{Commands: commands, By: rec.PrimaryActor, At: time.Now().UTC()}
-	} else {
-		task = updated
-	}
-
-	// Continue in the phase the refusals stopped, which is the only phase that can do
-	// the work the human just unblocked. A row written before the action was recorded
-	// has nothing to continue, and a read-only turn is the safe guess.
-	action := rules.Action(strings.TrimSpace(task.LastAction))
-	switch action {
-	case rules.ActionAnalyze, rules.ActionPlan, rules.ActionExecute:
-	default:
-		d.log.Warn("the task has no recorded action to continue; permitting a read-only turn instead",
-			"issue", rec.IssueID, "recorded", task.LastAction)
-		action = rules.ActionAnalyze
-	}
-	return rules.Decision{
-		Action: action, Trigger: decision.Trigger,
-		Reason: decision.Reason + "; continuing the task with the authorised commands",
-	}, task
-}
-
-// revokeGrant clears the authorisation a human gave, so the next turn is judged by the
-// policy alone again.
-func (d *Dispatcher) revokeGrant(rec *store.Record, task registry.Task) {
-	if task.Grant == nil || len(task.Grant.Commands) == 0 {
-		d.log.Info("a revoke arrived but no command was authorised for this task",
-			"issue", rec.IssueID, "by", rec.PrimaryActor)
-		return
-	}
-	if _, err := d.opts.Registry.Update(d.opts.Source.Name(), rec.IssueID, func(t *registry.Task) {
-		t.Grant = nil
-	}); err != nil {
-		d.log.Error("cannot revoke the authorisation", "issue", rec.IssueID, "error", err)
-		return
-	}
-	d.log.Warn("a human revoked the authorised commands; the policy applies again",
-		"issue", rec.IssueID, "by", rec.PrimaryActor,
-		"revoked", strings.Join(task.Grant.Commands, " && "))
-}
-
-// shortCommit renders a commit id for a log line: long enough to be unambiguous in
-// a small repository, short enough that the interesting fields stay visible.
-func shortCommit(commit string) string {
-	commit = strings.TrimSpace(commit)
-	if len(commit) <= 12 {
-		return commit
-	}
-	return commit[:12]
 }

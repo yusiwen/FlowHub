@@ -2,8 +2,8 @@
 //
 // It owns the four operations that must not be reimplemented by the flow engine:
 // ensure (routing/registry/workspace/session), one turn (prompt, runtime, reply
-// contract, registry), grant and revoke. Dispatch implements it today; the flow
-// engine consumes the interface, so enabling `on` does not duplicate the
+// contract, registry), grant and revoke. Executor implements it; dispatch and the
+// flow engine consume the same instance, so enabling `on` does not duplicate the
 // invariants that keep a task on one worktree, one session and one runtime.
 package tasks
 
@@ -50,6 +50,7 @@ type TurnRequest struct {
 	Entry        *projectmap.Entry
 	Host         Host
 	Action       rules.Action
+	Trigger      rules.Trigger
 	RequireReply bool
 	// Basis is the human-readable trigger reason the reply sign-off states. It
 	// comes from the flow's evaluate step, never from the model.
@@ -92,8 +93,8 @@ type RevokeRequest struct {
 	Task   registry.Task
 }
 
-// Service is implemented by dispatch today and by the extracted task service in
-// M3-1. The flow engine imports this package, never dispatch.
+// Service is implemented by Executor. The flow engine imports this package,
+// never dispatch.
 type Service interface {
 	Ensure(ctx context.Context, request EnsureRequest) (registry.Task, error)
 	Turn(ctx context.Context, request TurnRequest) (TurnResult, error)
@@ -103,7 +104,7 @@ type Service interface {
 
 // Selector chooses the runtime binding for a new task. It is separate from the
 // service because dispatch's routing policy (inventory, eligibility, spread,
-// capacity) stays where it is until M3-1.
+// capacity) stays in dispatch.
 type Selector interface {
 	Select(ctx context.Context, record *store.Record, entry *projectmap.Entry) (Host, error)
 }
