@@ -251,9 +251,10 @@ func (e *Engine) catchUp(ctx context.Context) {
 			return
 		case <-ticker.C:
 			cursor := e.Cursor()
-			if cursor == "" {
-				continue
-			}
+			// An empty cursor is a real state: the service started with an empty log
+			// and the first event arrived while paused. Since("") is the whole log, so
+			// catch-up can still recover it; main initializes a non-empty tail before
+			// serving when history exists.
 			events, err := e.opts.ReplaySource(cursor)
 			if err != nil {
 				e.log.Warn("periodic flow catch-up failed", "error", err)
