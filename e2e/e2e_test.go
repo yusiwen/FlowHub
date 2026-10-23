@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" || os.Getenv("E2E_ON_RESTART") == "1" || os.Getenv("E2E_AGED_CURSOR") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -211,7 +211,7 @@ func (e *env) startExpectFailure(t *testing.T, timeout time.Duration) string {
 	case <-time.After(timeout):
 		_ = cmd.Process.Kill()
 		<-done
-		t.Fatalf("FlowHub did not refuse the unavailable runtime within %s", timeout)
+		t.Fatalf("FlowHub did not refuse the unavailable runtime within %s:\n%s", timeout, out.String())
 		return ""
 	}
 }
@@ -1999,6 +1999,119 @@ func TestAPIAuthAndInvalidDeployment(t *testing.T) {
 	suite.start()
 	if status, body := suite.apiRequest(t, http.MethodPost, base+"/deployment", suite.hubToken, []byte(`{"mode":"on"}`)); status != http.StatusConflict {
 		t.Fatalf("on without task service status = %d, want 409 (%s)", status, body)
+	}
+}
+
+func TestActiveOnGracefulRestart(t *testing.T) {
+	if os.Getenv("E2E_ON_RESTART") != "1" {
+		t.Skip("set E2E_ON_RESTART=1 to restart during an active on run")
+	}
+	if suite.live {
+		t.Skip("restart hardening uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	hold := make(chan struct{})
+	fake.setHold(hold)
+	fake.setHoldAt(3)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("on", []string{suite.ytProject}); err != nil {
+		t.Fatalf("set on: %v", err)
+	}
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	key := "TEST-ON-RESTART-" + suffix
+	t.Cleanup(func() { suite.removeTestWorktree(key) })
+	summary := "FlowHub E2E on restart " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	deliver := func(payload []byte) {
+		t.Helper()
+		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+	}
+	waitPrompts := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if fake.promptCount() >= want {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("prompts = %d, want %d", fake.promptCount(), want)
+	}
+	deliver(issueCreatedPayload(key, summary, "On restart E2E.", suite.ytProject))
+	waitPrompts(1)
+	suite.waitForRegistry(t, key, func(row taskRow) bool { return row.Turns == 1 }, 30*time.Second)
+	comment := "plan-" + suffix
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	waitPrompts(2)
+	suite.waitForRegistry(t, key, func(row taskRow) bool { return row.Turns == 2 && row.Plan == "draft" }, 30*time.Second)
+	time.Sleep(1100 * time.Millisecond)
+	comment = "execute-" + suffix
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	waitPrompts(3)
+	before := suite.waitForRegistry(t, key, func(row taskRow) bool { return row.State == "executing" }, 30*time.Second)
+	// Graceful restart while the execute prompt is held: SIGINT lets the engine
+	// cancel the turn and unwind, unlike the SIGKILL test.
+	suite.stop()
+	fake.release()
+	time.Sleep(300 * time.Millisecond)
+	suite.start()
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "failed"
+	}, 20*time.Second)
+	if !strings.Contains(strings.ToLower(row.LastError), "interrupt") {
+		t.Fatalf("graceful shutdown failure reason = %q", row.LastError)
+	}
+	if row.Worktree != before.Worktree || row.Session != before.Session {
+		t.Fatalf("worktree/session changed: before=%+v after=%+v", before, row)
+	}
+	// The execute turn was attempted and then interrupted, so it is counted once;
+	// it must not be replayed as a fourth turn.
+	if row.Turns != before.Turns+1 {
+		t.Fatalf("turns = %d, want one interrupted attempt after %d", row.Turns, before.Turns)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if got := fake.promptCount(); got != 3 {
+		t.Fatalf("prompts after graceful restart = %d, want 3", got)
+	}
+	for _, run := range suite.runRows(t) {
+		if run.Task == key && run.State == "running" {
+			t.Fatalf("run still running after restart: %+v", run)
+		}
+	}
+}
+
+func TestAgedCursorRefusesStartup(t *testing.T) {
+	if os.Getenv("E2E_AGED_CURSOR") != "1" {
+		t.Skip("set E2E_AGED_CURSOR=1 to check an aged-out replay cursor")
+	}
+	if suite.live {
+		t.Skip("cursor checks use the direct receiver")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	suite.stop()
+	cursor := filepath.Join(suite.dataDir, "flow-cursor.json")
+	if err := os.WriteFile(cursor, []byte(`{"event_id":"evt_missing_from_the_log","updated_at":"2026-01-01T00:00:00Z"}`), 0o600); err != nil {
+		t.Fatalf("cursor: %v", err)
+	}
+	out := suite.startExpectFailure(t, 20*time.Second)
+	t.Logf("aged-cursor startup output:\n%s", out)
+	if !strings.Contains(strings.ToLower(out), "cursor") || !strings.Contains(strings.ToLower(out), "not found") {
+		t.Fatalf("startup did not report the aged cursor:\n%s", out)
 	}
 }
 

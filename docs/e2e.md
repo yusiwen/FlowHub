@@ -188,6 +188,13 @@ task service, and `on` without it (409):
 make e2e-api
 ```
 
+Restart hardening (fake runtime): SIGINT while an `on` execute prompt is held, then
+restart; and a cursor pointing at an event missing from the log must refuse startup:
+
+```bash
+make e2e-restart-hardening
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -254,6 +261,8 @@ the Make targets are only wrappers around the suite.
 | SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
 | ingress rejects + append 503 + dedupe release | `TestIngressRejectionsAndAppendFailure` | `make e2e-ingress` |
 | attachment download allow/deny + other known kinds | `TestAttachmentsAndOtherEventKinds` | `make e2e-attachments` |
+| graceful restart during an active `on` run | `TestActiveOnGracefulRestart` | `make e2e-restart-hardening` |
+| aged-out replay cursor refuses startup | `TestAgedCursorRefusesStartup` | `make e2e-restart-hardening` |
 | `/hub/v1` auth, invalid deployment, disabled API, on without tasks | `TestAPIAuthAndInvalidDeployment` | `make e2e-api` |
 | flow pause, then catch-up after unpause | `TestFlowPauseAndCatchUp` | `make e2e-flow-control` |
 | project-scoped `on` (TEST flow, OTHER dispatch) | `TestProjectScopedMode` | `make e2e-flow-control` |
@@ -305,7 +314,7 @@ closed audit that produced this list.
 | limits | none known after the cost/max-turns test |
 | flow control | none known after pause/project-scope tests |
 | API | run cancel is not implemented |
-| restart | active `on` run across restart; aged-out cursor |
+| restart | none known after graceful active-on restart + aged-cursor tests |
 | pilot | waived by ADR 0014; post-cutover observation is not automated |
 
 The current coverage table above is the complement: what **is** checked by a real
