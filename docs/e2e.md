@@ -166,6 +166,13 @@ deleted events are recorded without creating a task:
 make e2e-attachments
 ```
 
+Limits (fake runtime): after two turns, `FLOWHUB_TASK_MAX_COST=0.0015` and
+`FLOWHUB_MAX_TURNS=2` each stop a third trigger before any prompt:
+
+```bash
+make e2e-limits
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -232,6 +239,8 @@ the Make targets are only wrappers around the suite.
 | SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
 | ingress rejects + append 503 + dedupe release | `TestIngressRejectionsAndAppendFailure` | `make e2e-ingress` |
 | attachment download allow/deny + other known kinds | `TestAttachmentsAndOtherEventKinds` | `make e2e-attachments` |
+| cost cap stops before a third prompt | `TestCostCapStopsATask` | `make e2e-limits` |
+| max turns stops before a third prompt | `TestMaxTurnsStopsATask` | `make e2e-limits` |
 | same-task second delivery waits; one session, no overlap | `TestSameTaskSecondDeliveryWaits` | `make e2e-serialization` |
 | author allowlist deny/allowed | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
 | unmapped project creates no task | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
@@ -274,7 +283,7 @@ closed audit that produced this list.
 | same-task concurrency | capacity saturation across tasks |
 | crash | none known after analysis/execute/on run tests |
 | attachments/other kinds | none known after the allow/deny + other-kind test |
-| limits | cost cap, max turns |
+| limits | none known after the cost/max-turns test |
 | flow control | flow pause with queued events; per-project mode across two projects |
 | API | `/hub/v1` auth/503, invalid deployment, `on` without task service; run cancel is not implemented |
 | restart | active `on` run across restart; aged-out cursor |
