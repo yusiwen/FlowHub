@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -548,6 +549,7 @@ type flowHealth struct {
 	Runs             float64
 	Submitted        float64
 	Pending          float64
+	Dropped          float64
 	ShadowCompared   float64
 	ShadowMismatches float64
 }
@@ -560,6 +562,7 @@ func (e *env) flowHealth(t *testing.T) flowHealth {
 			Runs             float64 `json:"runs"`
 			Submitted        float64 `json:"submitted"`
 			Pending          float64 `json:"pending"`
+			Dropped          float64 `json:"dropped"`
 			ShadowCompared   float64 `json:"shadow_compared"`
 			ShadowMismatches float64 `json:"shadow_mismatches"`
 		} `json:"flows"`
@@ -567,7 +570,7 @@ func (e *env) flowHealth(t *testing.T) flowHealth {
 	if err := e.getJSON(t, "/healthz", &body); err != nil {
 		t.Fatalf("health: %v", err)
 	}
-	return flowHealth{Mode: body.Flows.Mode, Runs: body.Flows.Runs, Submitted: body.Flows.Submitted, Pending: body.Flows.Pending,
+	return flowHealth{Mode: body.Flows.Mode, Runs: body.Flows.Runs, Submitted: body.Flows.Submitted, Pending: body.Flows.Pending, Dropped: body.Flows.Dropped,
 		ShadowCompared: body.Flows.ShadowCompared, ShadowMismatches: body.Flows.ShadowMismatches}
 }
 
@@ -770,6 +773,93 @@ func TestShadowSoak(t *testing.T) {
 	if dropped := suite.flowDropped(t); dropped != 0 {
 		t.Fatalf("flow queue dropped %v events", dropped)
 	}
+}
+
+func TestBurstSoak(t *testing.T) {
+	if os.Getenv("E2E_BURST") != "1" {
+		t.Skip("set E2E_BURST=1 to run a burst")
+	}
+	if suite.live {
+		t.Skip("burst posts directly; the live app would duplicate every event")
+	}
+	count := 200
+	if raw := os.Getenv("E2E_BURST_COUNT"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			count = parsed
+		}
+	}
+	concurrency := 16
+	if raw := os.Getenv("E2E_BURST_CONCURRENCY"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			concurrency = parsed
+		}
+	}
+	if err := suite.setMode("shadow", nil); err != nil {
+		t.Fatalf("set shadow: %v", err)
+	}
+	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	before := suite.flowHealth(t)
+	beforeEvents := eventLineCount(t, suite.dataDir)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	sem := make(chan struct{}, concurrency)
+	for i := 0; i < count; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			description := fmt.Sprintf("FlowHub burst %d %s", i, time.Now().UTC().Format(time.RFC3339Nano))
+			payload := issueUpdatedPayload(suite.ytIssue, description, time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), suite.ytProject)
+			status, err := suite.postWebhookRaw(payload)
+			if err != nil || status != http.StatusAccepted {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("delivery %d: status=%d err=%v", i, status, err)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		t.Fatalf("burst delivery failed: %v", firstErr)
+	}
+	suite.waitForFlowHealth(t, func(f flowHealth) bool {
+		return f.Runs >= before.Runs+float64(count)
+	}, 2*time.Minute)
+	health := suite.flowHealth(t)
+	if health.Dropped > before.Dropped {
+		t.Fatalf("burst dropped %v flow events", health.Dropped-before.Dropped)
+	}
+	if health.ShadowMismatches != 0 {
+		t.Fatalf("burst mismatches = %v", health.ShadowMismatches)
+	}
+	// Dispatch still has its own smaller queue, so some shadow comparisons can
+	// remain pending when a burst outruns it; the flow must not lose an event.
+	t.Logf("burst: runs=%v compared=%v pending=%v dropped=%v", health.Runs, health.ShadowCompared, health.Pending, health.Dropped)
+	if got := eventLineCount(t, suite.dataDir); got != beforeEvents+count {
+		t.Fatalf("event lines = %d, want %d after %d deliveries", got, beforeEvents+count, count)
+	}
+}
+
+func (e *env) postWebhookRaw(payload []byte) (int, error) {
+	request, err := http.NewRequest(http.MethodPost, e.baseURL+"/hooks/youtrack/"+e.hookKey, bytes.NewReader(payload))
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-YouTrack-Token", e.hookToken)
+	response, err := e.client.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	_, _ = io.Copy(io.Discard, response.Body)
+	return response.StatusCode, nil
 }
 
 func (e *env) addComment(issue, text string) (string, error) {

@@ -384,16 +384,19 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	// so and this process has the task service. It consumes the durable event log;
 	// dispatch is the live consumer only for projects the flow does not own.
 	flowEngine, err := flowengine.New(flowengine.Options{
-		Flow:           flowDefinition,
-		Definition:     flowRaw,
-		Projects:       projects,
-		Tasks:          tasks,
-		TaskService:    dispatcher.TaskService(),
-		TaskSelector:   dispatcher.TaskSelector(),
-		Policy:         src.Policy(),
-		Compare:        comparisons,
-		DataDir:        cfg.DataDir,
-		QueueSize:      cfg.DispatchQueueSize,
+		Flow:         flowDefinition,
+		Definition:   flowRaw,
+		Projects:     projects,
+		Tasks:        tasks,
+		TaskService:  dispatcher.TaskService(),
+		TaskSelector: dispatcher.TaskSelector(),
+		Policy:       src.Policy(),
+		Compare:      comparisons,
+		DataDir:      cfg.DataDir,
+		// The flow worker has its own queue. It must absorb a webhook burst larger
+		// than dispatch's worker queue; the event log remains the durable source,
+		// and replay is still an M2-4 item. 4096 is a bound, not a guarantee.
+		QueueSize:      max(cfg.DispatchQueueSize, 4096),
 		Logger:         logger,
 		PauseFile:      cfg.ResolvedPauseFile(),
 		MaxCostPerTask: cfg.TaskMaxCost,
