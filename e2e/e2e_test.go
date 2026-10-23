@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -484,6 +484,10 @@ func (e *env) openCodeSessionsIn(t *testing.T, directory string) int {
 }
 
 func issueCreatedPayload(key, summary, description, project string) []byte {
+	return issueCreatedPayloadBy(key, summary, description, project, "yusiwen")
+}
+
+func issueCreatedPayloadBy(key, summary, description, project, reporter string) []byte {
 	payload := map[string]any{
 		"event":       "issueCreated",
 		"timestamp":   time.Now().UTC().Format("2006-01-02T15:04:05Z"),
@@ -492,7 +496,7 @@ func issueCreatedPayload(key, summary, description, project string) []byte {
 		"project":     map[string]any{"key": project, "name": project, "shortName": project},
 		"description": description,
 		"created":     time.Now().UnixMilli(),
-		"reporter":    map[string]any{"login": "yusiwen", "fullName": "Siwen Yu"},
+		"reporter":    map[string]any{"login": reporter, "fullName": reporter},
 	}
 	data, _ := json.Marshal(payload)
 	return data
@@ -1064,6 +1068,105 @@ func (e *env) pointAtRuntime(t *testing.T, baseURL string) {
 	e.ocBase = baseURL
 	if err := writeTestConfig(e.configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject, "", e.ocBase); err != nil {
 		t.Fatalf("rewrite config for runtime %s: %v", baseURL, err)
+	}
+}
+
+func (e *env) setProjectAuthors(t *testing.T, authors []string) {
+	t.Helper()
+	data, err := os.ReadFile(e.configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	projects, _ := raw["projects"].([]any)
+	found := false
+	for _, item := range projects {
+		entry, ok := item.(map[string]any)
+		if ok && entry["project"] == e.ytProject {
+			entry["authors"] = authors
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("project %q not in config", e.ytProject)
+	}
+	data, err = json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	if err := os.WriteFile(e.configPath, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+func TestAuthorAllowlistAndUnmappedProject(t *testing.T) {
+	if os.Getenv("E2E_POLICY") != "1" {
+		t.Skip("set E2E_POLICY=1 to run author/unmapped-project policy checks")
+	}
+	if suite.live {
+		t.Skip("policy checks use the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.setProjectAuthors(t, []string{"allowed-user"})
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+
+	// A reporter outside the project allowlist must not create a task or a session.
+	denied := "FlowHub E2E author denied " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	deniedKey, _, err := suite.createIssue(denied, "Author-deny E2E.")
+	if err != nil {
+		t.Fatalf("create denied issue: %v", err)
+	}
+	if status := suite.postWebhook(t, issueCreatedPayload(deniedKey, denied, "Author-deny E2E.", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("denied webhook status = %d", status)
+	}
+	time.Sleep(700 * time.Millisecond)
+	if row, ok := suite.lastTaskRow(deniedKey); ok {
+		t.Fatalf("denied author created a task row: %+v", row)
+	}
+	if got := fake.promptCount(); got != 0 {
+		t.Fatalf("denied author caused %d prompt(s)", got)
+	}
+
+	// The same project with an allowlisted reporter must still work.
+	allowed := "FlowHub E2E author allowed " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	allowedKey, _, err := suite.createIssue(allowed, "Author-allowed E2E.")
+	if err != nil {
+		t.Fatalf("create allowed issue: %v", err)
+	}
+	if status := suite.postWebhook(t, issueCreatedPayloadBy(allowedKey, allowed, "Author-allowed E2E.", suite.ytProject, "allowed-user")); status != http.StatusAccepted {
+		t.Fatalf("allowed webhook status = %d", status)
+	}
+	suite.waitForRegistry(t, allowedKey, func(row taskRow) bool {
+		return row.Worktree != ""
+	}, 20*time.Second)
+	if got := fake.promptCount(); got == 0 {
+		t.Fatal("allowlisted reporter did not reach the runtime")
+	}
+
+	// An unmapped project must be refused before any task is created.
+	beforePrompts := fake.promptCount()
+	unmapped := "FlowHub E2E unmapped " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	if status := suite.postWebhook(t, issueCreatedPayload("OTHER-1", unmapped, "Unmapped E2E.", "OTHER")); status != http.StatusAccepted {
+		t.Fatalf("unmapped webhook status = %d", status)
+	}
+	time.Sleep(700 * time.Millisecond)
+	if row, ok := suite.lastTaskRow("OTHER-1"); ok {
+		t.Fatalf("unmapped project created a task row: %+v", row)
+	}
+	if got := fake.promptCount(); got != beforePrompts {
+		t.Fatalf("unmapped project caused %d prompt(s)", got-beforePrompts)
 	}
 }
 
