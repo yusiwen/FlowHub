@@ -181,6 +181,13 @@ flow run while OTHER is still dispatched:
 make e2e-flow-control
 ```
 
+API (fake runtime): 401/503 auth, invalid deployment/unknown flow, `on` with the
+task service, and `on` without it (409):
+
+```bash
+make e2e-api
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -247,6 +254,7 @@ the Make targets are only wrappers around the suite.
 | SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
 | ingress rejects + append 503 + dedupe release | `TestIngressRejectionsAndAppendFailure` | `make e2e-ingress` |
 | attachment download allow/deny + other known kinds | `TestAttachmentsAndOtherEventKinds` | `make e2e-attachments` |
+| `/hub/v1` auth, invalid deployment, disabled API, on without tasks | `TestAPIAuthAndInvalidDeployment` | `make e2e-api` |
 | flow pause, then catch-up after unpause | `TestFlowPauseAndCatchUp` | `make e2e-flow-control` |
 | project-scoped `on` (TEST flow, OTHER dispatch) | `TestProjectScopedMode` | `make e2e-flow-control` |
 | cost cap stops before a third prompt | `TestCostCapStopsATask` | `make e2e-limits` |
@@ -295,7 +303,7 @@ closed audit that produced this list.
 | attachments/other kinds | none known after the allow/deny + other-kind test |
 | limits | none known after the cost/max-turns test |
 | flow control | none known after pause/project-scope tests |
-| API | `/hub/v1` auth/503, invalid deployment, `on` without task service; run cancel is not implemented |
+| API | run cancel is not implemented |
 | restart | active `on` run across restart; aged-out cursor |
 | pilot | 1 week / 100 real events, 100% parity, rollback |
 
