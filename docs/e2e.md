@@ -150,6 +150,14 @@ to prove the flow is still usable:
 make e2e-crash-on
 ```
 
+Ingress and durable append (direct receiver): wrong key/token/IP, bad content type,
+malformed JSON, unknown event, replay window, oversized body, and a `503` from an
+unwritable events directory followed by a successful retry (dedupe key released):
+
+```bash
+make e2e-ingress
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -214,6 +222,7 @@ the Make targets are only wrappers around the suite.
 | silent turn -> nudge -> answered, then both silent -> failed | `TestSilentTurnNudgeAndFailure` | `make e2e-silent` |
 | SIGKILL during execute; failed, same worktree/session, no replay | `TestCrashDuringExecute` | `make e2e-crash-execute` |
 | SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
+| ingress rejects + append 503 + dedupe release | `TestIngressRejectionsAndAppendFailure` | `make e2e-ingress` |
 | same-task second delivery waits; one session, no overlap | `TestSameTaskSecondDeliveryWaits` | `make e2e-serialization` |
 | author allowlist deny/allowed | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
 | unmapped project creates no task | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
@@ -251,8 +260,6 @@ closed audit that produced this list.
 
 | Area | Missing E2E |
 | --- | --- |
-| ingress rejection | wrong URL key/token/IP, body cap, content type, malformed JSON, unknown event, replay window |
-| durable append failure | `503` and dedupe-key release |
 | routing/auth | repository rebind refusal |
 | turn failure | none known after the 500/timeout/startup tests; author deny and unmapped project are in the routing row |
 | same-task concurrency | capacity saturation across tasks |

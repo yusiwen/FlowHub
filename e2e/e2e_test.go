@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -994,6 +994,141 @@ func appendReplayEvents(t *testing.T, phase string, count int) {
 		t.Fatalf("close event log: %v", err)
 	}
 }
+func (e *env) postWebhookRequest(t *testing.T, path, token, contentType string, body []byte) (int, string) {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, e.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	if contentType != "" {
+		request.Header.Set("Content-Type", contentType)
+	}
+	request.Header.Set("X-YouTrack-Token", token)
+	response, err := e.client.Do(request)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	reply, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+	return response.StatusCode, strings.TrimSpace(string(reply))
+}
+
+func issueUpdatedPayloadAt(key, description, timestamp, project string) []byte {
+	payload := map[string]any{
+		"event":       "issueUpdated",
+		"timestamp":   timestamp,
+		"id":          key,
+		"summary":     "FlowHub E2E ingress",
+		"project":     map[string]any{"key": project, "name": project, "shortName": project},
+		"description": description,
+		"updatedBy":   map[string]any{"login": "yusiwen", "fullName": "Siwen Yu"},
+		"changedFields": []map[string]any{{
+			"name": "description", "value": description,
+		}},
+	}
+	data, _ := json.Marshal(payload)
+	return data
+}
+
+func TestIngressRejectionsAndAppendFailure(t *testing.T) {
+	if os.Getenv("E2E_INGRESS") != "1" {
+		t.Skip("set E2E_INGRESS=1 to run ingress rejection and append-failure checks")
+	}
+	if suite.live {
+		t.Skip("ingress failures use the direct receiver")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+
+	count := func() int { return eventLineCount(t, suite.dataDir) }
+	deliver := func(payload []byte) int {
+		t.Helper()
+		status, _ := suite.postWebhookRequest(t, "/hooks/youtrack/"+suite.hookKey, suite.hookToken, "application/json", payload)
+		return status
+	}
+	baseline := count()
+	validPayload := issueUpdatedPayload(suite.ytIssue, "FlowHub ingress baseline "+time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)
+	if status := deliver(validPayload); status != http.StatusAccepted {
+		t.Fatalf("baseline status = %d", status)
+	}
+	if got := count(); got != baseline+1 {
+		t.Fatalf("baseline event count = %d, want %d", got, baseline+1)
+	}
+
+	cases := []struct {
+		name        string
+		path        string
+		token       string
+		contentType string
+		body        []byte
+		want        int
+	}{
+		{"wrong URL key", "/hooks/youtrack/not-the-key", suite.hookToken, "application/json", validPayload, http.StatusAccepted},
+		{"wrong token", "/hooks/youtrack/" + suite.hookKey, "wrong-token", "application/json", validPayload, http.StatusAccepted},
+		{"bad content type", "/hooks/youtrack/" + suite.hookKey, suite.hookToken, "text/plain", validPayload, http.StatusAccepted},
+		{"malformed JSON", "/hooks/youtrack/" + suite.hookKey, suite.hookToken, "application/json", []byte("{"), http.StatusAccepted},
+		{"unknown event", "/hooks/youtrack/" + suite.hookKey, suite.hookToken, "application/json", []byte(`{"event":"notARealEvent"}`), http.StatusAccepted},
+		{"replay window", "/hooks/youtrack/" + suite.hookKey, suite.hookToken, "application/json", issueUpdatedPayloadAt(suite.ytIssue, "old", "2020-01-01T00:00:00Z", suite.ytProject), http.StatusAccepted},
+		{"oversized body", "/hooks/youtrack/" + suite.hookKey, suite.hookToken, "application/json", bytes.Repeat([]byte("x"), 300*1024), http.StatusRequestEntityTooLarge},
+	}
+	for _, tc := range cases {
+		before := count()
+		status, _ := suite.postWebhookRequest(t, tc.path, tc.token, tc.contentType, tc.body)
+		if status != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.name, status, tc.want)
+		}
+		if got := count(); got != before {
+			t.Errorf("%s: event count changed %d -> %d", tc.name, before, got)
+		}
+	}
+
+	// Make today's event file unwritable after stopping: the next process opens it
+	// for append and gets EACCES. (A read-only directory alone is not enough: the
+	// file already exists and its own mode permits the owner to open it.)
+	suite.stop()
+	dayPath := filepath.Join(suite.dataDir, "events", time.Now().UTC().Format("2006-01-02")+".jsonl")
+	if err := os.Chmod(dayPath, 0o400); err != nil {
+		t.Fatalf("chmod event file: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dayPath, 0o600) })
+	suite.start()
+	failedPayload := issueUpdatedPayload(suite.ytIssue, "FlowHub ingress append failure "+time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)
+	before := count()
+	if status := deliver(failedPayload); status != http.StatusServiceUnavailable {
+		t.Fatalf("append failure status = %d, want 503", status)
+	}
+	if got := count(); got != before {
+		t.Fatalf("failed append changed event count %d -> %d", before, got)
+	}
+	if err := os.Chmod(dayPath, 0o600); err != nil {
+		t.Fatalf("restore event file: %v", err)
+	}
+	if status := deliver(failedPayload); status != http.StatusAccepted {
+		t.Fatalf("retry after append failure status = %d, want 202 (dedupe key was released)", status)
+	}
+	if got := count(); got != before+1 {
+		t.Fatalf("retry event count = %d, want %d", got, before+1)
+	}
+
+	// A source outside the allowlist is rejected before the event append.
+	suite.stop()
+	suite.extraEnv = []string{"FLOWHUB_ALLOWED_SOURCES=192.0.2.1"}
+	suite.start()
+	before = count()
+	if status := deliver(validPayload); status != http.StatusAccepted {
+		t.Fatalf("denied-source status = %d", status)
+	}
+	if got := count(); got != before {
+		t.Fatalf("denied source appended an event: %d -> %d", before, got)
+	}
+}
+
 func TestSilentTurnNudgeAndFailure(t *testing.T) {
 	if os.Getenv("E2E_SILENT") != "1" {
 		t.Skip("set E2E_SILENT=1 to run the silent-turn nudge/failure path")
