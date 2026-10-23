@@ -1,6 +1,6 @@
 # ADR 0014: E2E-based validation replaces the one-week pilot
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-23
 - Issues: #92 (epic), #119 (E2E harness)
 - Qualifies: ADR-0013, decision 9 and the cutover gate in `docs/flow-model.md`
