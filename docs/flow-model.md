@@ -2,8 +2,9 @@
 
 Status: normative for the builtin flow (M0). The implementation lands in M1; this
 document is the contract its tests are written against. The decision record is
-[ADR 0013](adr/0013-flow-orchestration.md); the epic is #92; the deferred surface is
-#91.
+[ADR 0013](adr/0013-flow-orchestration.md), qualified by
+[ADR 0014](adr/0014-e2e-based-validation-and-pilot-waiver.md); the epic is #92; the
+deferred surface is #91.
 
 The model exists to answer one question before any code moves: **can the current
 YouTrack → opencode pipeline be expressed as a flow without a special case in the
@@ -757,19 +758,26 @@ to M4.
 | --- | --- | --- |
 | M0 | This model, ADR, fixture; no code | parity table has no gaps |
 | M1 | upstream/event log, runner, engine, shadow, API, read-only page | shadow runs on real events; zero agent calls |
-| M2 | event durability, per-project deployment, shadow diff, pilot | 1 week / 100 events parity; pilot 1 week |
-| M3 | intake cutover, dispatch thin adapter, deletion | no dispatch turn; `make test`/`smoke` |
+| M2 | event durability, per-project deployment, shadow diff, E2E validation | E2E suite repeated; accelerated 1000-event soak; no wall-clock pilot (ADR 0014) |
+| M3 | intake cutover, dispatch thin adapter, deletion, post-cutover observation | no dispatch turn; ordinary-use logs reviewed; `make test`/`smoke` |
 | M4 | custom flows, editor, reserved nodes | #91 |
 
-Cutover gate, in full:
+Cutover gate, in full (ADR 0014 waives the one-week pilot):
 
-- shadow for at least one week and at least 100 real events, with 100% decision
-  parity (`action`, ignore reason, routing) and every difference explained;
-- one test project on `on` for at least one week: no lost events, no duplicate turns,
-  task/session continuity, comment behaviour unchanged;
+- E2E-based validation: the full suite repeated at least three times, an
+  accelerated 1000-event soak, repeated live dispatch/`on` journeys, crash during
+  execute/on and a rollback drill;
+- 100% decision parity where the comparison is available (`action`, ignore reason,
+  routing); every difference explained in #92;
+- after cutover, ordinary use on the test project is observed from `audit.jsonl`,
+  `flow-compare.jsonl`, `/healthz.flows`, the registry and comments: no lost events,
+  no duplicate turns, task/session continuity, comment behaviour unchanged;
 - rollback is the project's deployment state back to `dispatch`, with the flow's run
   records kept;
 - then all projects.
+
+The formal one-week pilot and the 100-real-event calendar gate are explicitly
+waived by ADR 0014; the project does not claim those gates were met.
 
 "Dispatch dies" means the package and its hard-coded pipeline die. The registry, the
 workspace provider, the runtime adapters, the permission arbiter and the grant model
@@ -803,6 +811,8 @@ not a rewrite.
 ## 16. References
 
 - [ADR 0013](adr/0013-flow-orchestration.md) — the decision record.
+- [ADR 0014](adr/0014-e2e-based-validation-and-pilot-waiver.md) — E2E-based
+  validation and the operator's pilot waiver.
 - Epic #92 — delivery plan and status.
 - #91 — deferred surface.
 - `testdata/flows/default-youtrack.json` — the builtin flow.

@@ -283,14 +283,15 @@ its temp dirs; it never deletes `E2E_ISSUE`.
 `make e2e-permit` is separate because it installs a project prompt file before
 the process starts, which would affect the other turns.
 
-Not automated in the harness: YouTrack webhook app configuration, the test
-project/repo/runtime setup, and the real 1-week pilot.
+Not automated in the harness: YouTrack webhook app configuration and the test
+project/repo/runtime setup. The formal 1-week pilot is waived by ADR 0014;
+ordinary-use logs are reviewed after cutover instead.
 
 ## Known gaps
 
 These are not E2E yet. Most have unit coverage in `internal/webhook`,
 `internal/dispatch` or `internal/agent/opencode`; a unit test is not a real
-process/API test. The E2E programme and its pre-pilot order are tracked in #119;
+process/API test. The E2E programme and its pre-cutover order are tracked in #119;
 this section is the durable gap snapshot, not a separate tracker. #144 is the
 closed audit that produced this list.
 
@@ -305,7 +306,7 @@ closed audit that produced this list.
 | flow control | none known after pause/project-scope tests |
 | API | run cancel is not implemented |
 | restart | active `on` run across restart; aged-out cursor |
-| pilot | 1 week / 100 real events, 100% parity, rollback |
+| pilot | waived by ADR 0014; post-cutover observation is not automated |
 
 The current coverage table above is the complement: what **is** checked by a real
 process, real HTTP/webhook and (for the live rows) real YouTrack/opencode.
