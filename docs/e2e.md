@@ -106,6 +106,13 @@ Burst (200 direct deliveries at 16-way concurrency; asserts no flow drop):
 make e2e-burst
 ```
 
+Silent turn (fake runtime): first turn silent + nudge; then both turns silent and
+the task must fail, never `awaiting_input`:
+
+```bash
+make e2e-silent
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -167,6 +174,7 @@ the Make targets are only wrappers around the suite.
 | durable-log replay cursor | `TestReplayCursor` | `make e2e-replay` |
 | restart mode + compare state | `TestRestartKeepsComparisonState` | `make e2e-restart` |
 | permit/revoke | `TestPermitAndRevoke` | `make e2e-permit` |
+| silent turn -> nudge -> answered, then both silent -> failed | `TestSilentTurnNudgeAndFailure` | `make e2e-silent` |
 | SIGKILL + restart recovery | `TestCrashRecovery` | `make e2e-crash` |
 | live permit/revoke (dispatch) | `TestPermitAndRevoke` (live) | `make e2e-live-permit` |
 | live permit/revoke (`on`) | `TestOnLivePermitAndRevoke` | `make e2e-live-on-permit` |
@@ -200,7 +208,7 @@ closed audit that produced this list.
 | ingress rejection | wrong URL key/token/IP, body cap, content type, malformed JSON, unknown event, replay window |
 | durable append failure | `503` and dedupe-key release |
 | routing/auth | unmapped project, author allowlist deny, repository rebind refusal |
-| turn failure | opencode down, request timeout, silent turn + nudge, no-comment failure |
+| turn failure | opencode down, request timeout |
 | same-task concurrency | second delivery waits, one session, capacity saturation |
 | crash | SIGKILL during execute and during an `on` run (the current crash test kills analysis) |
 | attachments/other kinds | download exception, deleted/attachment events |

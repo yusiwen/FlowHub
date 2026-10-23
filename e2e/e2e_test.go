@@ -127,7 +127,7 @@ func setup() *env {
 			fatalf("e2e: permit prompt: %v", err)
 		}
 	}
-	if err := writeTestConfig(configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject, promptFile); err != nil {
+	if err := writeTestConfig(configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject, promptFile, e.ocBase); err != nil {
 		fatalf("e2e: write config: %v", err)
 	}
 	e.configPath = configPath
@@ -140,6 +140,11 @@ func setup() *env {
 	}
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
+	}
+	if os.Getenv("E2E_SILENT") == "1" {
+		// The silent-turn test starts its own fake runtime; starting the real
+		// receiver first would make a runtime failure-path test depend on opencode.
+		return e
 	}
 	e.start()
 	return e
@@ -160,6 +165,7 @@ func (e *env) start() {
 		"FLOWHUB_TOKEN="+e.hookToken,
 		"FLOWHUB_HUB_TOKEN="+e.hubToken,
 		"FLOWHUB_DISPATCH=1",
+		"FLOWHUB_OPENCODE_URL="+e.ocBase,
 		"FLOWHUB_ALLOWED_SOURCES=127.0.0.1,10.1.0.1",
 		"FLOWHUB_PAUSE_FILE="+filepath.Join(e.dir, "DISPATCH_OFF"),
 		"FLOWHUB_LOG_FILE=none",
@@ -949,6 +955,75 @@ func appendReplayEvents(t *testing.T, phase string, count int) {
 		t.Fatalf("close event log: %v", err)
 	}
 }
+func TestSilentTurnNudgeAndFailure(t *testing.T) {
+	if os.Getenv("E2E_SILENT") != "1" {
+		t.Skip("set E2E_SILENT=1 to run the silent-turn nudge/failure path")
+	}
+	if suite.live {
+		t.Skip("silent turns run against the fake runtime in direct mode")
+	}
+	suite.stop()
+	fake := newFakeOpencode(t)
+	fake.setMode("nudge")
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.ocBase = server.URL
+	if err := writeTestConfig(suite.configPath, suite.repo, filepath.Join(suite.dir, "worktrees"), suite.ytProject, "", suite.ocBase); err != nil {
+		t.Fatalf("rewrite config for fake runtime: %v", err)
+	}
+	suite.start()
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+
+	waitPrompts := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if fake.promptCount() >= want {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("fake runtime saw %d prompts, want %d", fake.promptCount(), want)
+	}
+	createAndDeliver := func(summary string) string {
+		t.Helper()
+		key, _, err := suite.createIssue(summary, "Silent-turn E2E.")
+		if err != nil {
+			t.Fatalf("create issue: %v", err)
+		}
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Silent-turn E2E.", suite.ytProject)); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+		return key
+	}
+
+	// First turn silent, nudge posts the comment: the task is answered.
+	nudgeKey := createAndDeliver("FlowHub E2E silent nudge " + time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+	waitPrompts(2)
+	row := suite.waitForRegistry(t, nudgeKey, func(row taskRow) bool {
+		return row.State == "awaiting_input"
+	}, 2*time.Minute)
+	if row.Plan != "none" {
+		t.Fatalf("nudged analysis plan = %q, want none", row.Plan)
+	}
+
+	// Both turns silent: the task must be failed, never awaiting_input.
+	fake.setMode("silent")
+	failKey := createAndDeliver("FlowHub E2E silent failure " + time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+	waitPrompts(4)
+	failed := suite.waitForRegistry(t, failKey, func(row taskRow) bool {
+		return row.State == "failed"
+	}, 2*time.Minute)
+	if !strings.Contains(failed.LastError, "without posting a comment") {
+		t.Fatalf("failure reason = %q, want the no-comment reason", failed.LastError)
+	}
+	if failed.State == "awaiting_input" {
+		t.Fatal("a silent task was recorded awaiting_input")
+	}
+}
+
 func (e *env) addComment(issue, text string) (string, error) {
 	body := map[string]any{"text": text}
 	var response struct {
@@ -1579,7 +1654,7 @@ func issueUpdatedPayload(issue, description, timestamp, project string) []byte {
 	return data
 }
 
-func writeTestConfig(path, repo, worktrees, project, promptFile string) error {
+func writeTestConfig(path, repo, worktrees, project, promptFile, ocBase string) error {
 	home, _ := os.UserHomeDir()
 	data, err := os.ReadFile(filepath.Join(home, ".config", "flowhub", "config.json"))
 	if err != nil {
@@ -1588,6 +1663,15 @@ func writeTestConfig(path, repo, worktrees, project, promptFile string) error {
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
+	}
+	// The runtime declaration owns the URL; FLOWHUB_OPENCODE_URL alone is only the
+	// fallback name's default, so a test runtime must be written here too.
+	if runtimes, ok := raw["runtimes"].(map[string]any); ok {
+		for _, value := range runtimes {
+			if runtime, ok := value.(map[string]any); ok {
+				runtime["url"] = ocBase
+			}
+		}
 	}
 	projects, _ := raw["projects"].([]any)
 	var kept []any
