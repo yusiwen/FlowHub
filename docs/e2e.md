@@ -142,6 +142,14 @@ and assert failed recovery, same worktree/session, no replayed turn:
 make e2e-crash-execute
 ```
 
+Crash during an `on` run (fake runtime): SIGKILL while the execute prompt is held,
+restart, assert `needs_attention` + failed task + no replay, then create a new issue
+to prove the flow is still usable:
+
+```bash
+make e2e-crash-on
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -205,6 +213,7 @@ the Make targets are only wrappers around the suite.
 | permit/revoke | `TestPermitAndRevoke` | `make e2e-permit` |
 | silent turn -> nudge -> answered, then both silent -> failed | `TestSilentTurnNudgeAndFailure` | `make e2e-silent` |
 | SIGKILL during execute; failed, same worktree/session, no replay | `TestCrashDuringExecute` | `make e2e-crash-execute` |
+| SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
 | same-task second delivery waits; one session, no overlap | `TestSameTaskSecondDeliveryWaits` | `make e2e-serialization` |
 | author allowlist deny/allowed | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
 | unmapped project creates no task | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
@@ -247,7 +256,7 @@ closed audit that produced this list.
 | routing/auth | repository rebind refusal |
 | turn failure | none known after the 500/timeout/startup tests; author deny and unmapped project are in the routing row |
 | same-task concurrency | capacity saturation across tasks |
-| crash | SIGKILL during an `on` run |
+| crash | none known after analysis/execute/on run tests |
 | attachments/other kinds | download exception, deleted/attachment events |
 | limits | cost cap, max turns |
 | flow control | flow pause with queued events; per-project mode across two projects |
