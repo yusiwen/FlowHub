@@ -93,6 +93,13 @@ make e2e-soak
 E2E_SOAK=100 make e2e-soak
 ```
 
+Long soak (500 updates, 100 ms apart; asserts event count, completed flow runs,
+zero pending comparisons, zero queue drops):
+
+```bash
+make e2e-soak-long
+```
+
 Restart recovery (stops and restarts the test FlowHub, checks mode and compare
 state survive):
 
@@ -142,7 +149,7 @@ the Make targets are only wrappers around the suite.
 | `/opencode start` plan | `TestCommentTriggerStartsAPlan` | `make e2e-comments` |
 | duplicate webhook | `TestDuplicateWebhookIsIdempotent` | `make e2e` |
 | pause | `TestPauseDoesNotDispatch` | `make e2e` |
-| shadow soak / queue drops | `TestShadowSoak` | `make e2e-soak` (`E2E_SOAK=100`) |
+| shadow soak / queue drops | `TestShadowSoak` | `make e2e-soak` (`E2E_SOAK=100`), `make e2e-soak-long` (500) |
 | restart mode + compare state | `TestRestartKeepsComparisonState` | `make e2e-restart` |
 | permit/revoke | `TestPermitAndRevoke` | `make e2e-permit` |
 | SIGKILL + restart recovery | `TestCrashRecovery` | `make e2e-crash` |

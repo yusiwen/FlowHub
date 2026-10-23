@@ -547,6 +547,7 @@ type flowHealth struct {
 	Mode             string
 	Runs             float64
 	Submitted        float64
+	Pending          float64
 	ShadowCompared   float64
 	ShadowMismatches float64
 }
@@ -558,6 +559,7 @@ func (e *env) flowHealth(t *testing.T) flowHealth {
 			Mode             string  `json:"mode"`
 			Runs             float64 `json:"runs"`
 			Submitted        float64 `json:"submitted"`
+			Pending          float64 `json:"pending"`
 			ShadowCompared   float64 `json:"shadow_compared"`
 			ShadowMismatches float64 `json:"shadow_mismatches"`
 		} `json:"flows"`
@@ -565,7 +567,7 @@ func (e *env) flowHealth(t *testing.T) flowHealth {
 	if err := e.getJSON(t, "/healthz", &body); err != nil {
 		t.Fatalf("health: %v", err)
 	}
-	return flowHealth{Mode: body.Flows.Mode, Runs: body.Flows.Runs, Submitted: body.Flows.Submitted,
+	return flowHealth{Mode: body.Flows.Mode, Runs: body.Flows.Runs, Submitted: body.Flows.Submitted, Pending: body.Flows.Pending,
 		ShadowCompared: body.Flows.ShadowCompared, ShadowMismatches: body.Flows.ShadowMismatches}
 }
 
@@ -726,11 +728,18 @@ func TestShadowSoak(t *testing.T) {
 			count = parsed
 		}
 	}
+	delay := 50
+	if raw := os.Getenv("E2E_SOAK_DELAY_MS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			delay = parsed
+		}
+	}
 	if err := suite.setMode("shadow", nil); err != nil {
 		t.Fatalf("set shadow: %v", err)
 	}
 	t.Cleanup(func() { _ = suite.setMode("off", nil) })
 	before := suite.flowHealth(t)
+	beforeEvents := eventLineCount(t, suite.dataDir)
 	for i := 0; i < count; i++ {
 		description := fmt.Sprintf("FlowHub soak %d %s", i, time.Now().UTC().Format(time.RFC3339Nano))
 		if err := suite.updateIssue(suite.ytIssue, description); err != nil {
@@ -740,7 +749,7 @@ func TestShadowSoak(t *testing.T) {
 		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
 			t.Fatalf("webhook %d status = %d", i, status)
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(time.Duration(delay) * time.Millisecond)
 	}
 	suite.waitForFlowHealth(t, func(f flowHealth) bool {
 		return f.ShadowCompared >= before.ShadowCompared+float64(count)
@@ -748,6 +757,15 @@ func TestShadowSoak(t *testing.T) {
 	health := suite.flowHealth(t)
 	if health.ShadowMismatches != 0 {
 		t.Fatalf("soak mismatches = %v", health.ShadowMismatches)
+	}
+	if health.Pending != 0 {
+		t.Fatalf("soak left %v comparisons pending", health.Pending)
+	}
+	if health.Runs < before.Runs+float64(count) {
+		t.Fatalf("flow runs = %v, want at least %v", health.Runs, before.Runs+float64(count))
+	}
+	if got := eventLineCount(t, suite.dataDir); got != beforeEvents+count {
+		t.Fatalf("event lines = %d, want %d after %d deliveries", got, beforeEvents+count, count)
 	}
 	if dropped := suite.flowDropped(t); dropped != 0 {
 		t.Fatalf("flow queue dropped %v events", dropped)
