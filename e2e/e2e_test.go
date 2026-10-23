@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -1099,6 +1099,80 @@ func (e *env) setProjectAuthors(t *testing.T, authors []string) {
 	}
 	if err := os.WriteFile(e.configPath, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+func TestSameTaskSecondDeliveryWaits(t *testing.T) {
+	if os.Getenv("E2E_SERIALIZATION") != "1" {
+		t.Skip("set E2E_SERIALIZATION=1 to run the same-task serialization path")
+	}
+	if suite.live {
+		t.Skip("serialization uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	hold := make(chan struct{})
+	fake.setHold(hold)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+
+	summary := "FlowHub E2E serialization " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Serialization E2E.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Serialization E2E.", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("issue webhook status = %d", status)
+	}
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Worktree != ""
+	}, 20*time.Second)
+	deadline := time.Now().Add(20 * time.Second)
+	for fake.promptCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() != 1 {
+		t.Fatalf("first turn prompts = %d, want 1 (held)", fake.promptCount())
+	}
+
+	// A second delivery for the same task must wait for the first turn, not start
+	// a second session or an overlapping prompt.
+	comment, err := suite.addComment(key, "/opencode start")
+	if err != nil {
+		t.Fatalf("plan comment: %v", err)
+	}
+	if status := suite.postWebhook(t, commentAddedPayload(key, comment, "/opencode start", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("comment webhook status = %d", status)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if fake.promptCount() != 1 {
+		t.Fatalf("second delivery started a prompt while the first turn was held: %d", fake.promptCount())
+	}
+	if got := fake.maxConcurrentPrompts(); got != 1 {
+		t.Fatalf("concurrent prompts = %d, want 1", got)
+	}
+
+	fake.release()
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Turns == 2 && row.Plan == "draft" && row.Session != ""
+	}, 30*time.Second)
+	if got := fake.promptCount(); got != 2 {
+		t.Fatalf("prompts after both turns = %d, want 2", got)
+	}
+	if fake.sessionCount() != 1 {
+		t.Fatalf("sessions = %d, want one task session", fake.sessionCount())
+	}
+	if row.State != "awaiting_input" {
+		t.Fatalf("state = %q, want awaiting_input after the plan reply", row.State)
 	}
 }
 
