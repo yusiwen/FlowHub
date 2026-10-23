@@ -191,7 +191,9 @@ project/repo/runtime setup, and the real 1-week pilot.
 
 These are not E2E yet. Most have unit coverage in `internal/webhook`,
 `internal/dispatch` or `internal/agent/opencode`; a unit test is not a real
-process/API test. #144 tracks the order before a pilot.
+process/API test. The E2E programme and its pre-pilot order are tracked in #119;
+this section is the durable gap snapshot, not a separate tracker. #144 is the
+closed audit that produced this list.
 
 | Area | Missing E2E |
 | --- | --- |
