@@ -26,7 +26,7 @@ PLATFORM_LIST = \
 	linux-arm64 \
 	darwin-arm64
 
-.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-clean e2e-live e2e-live-flow e2e-live-journey e2e-live-on-journey e2e-live-on-permit e2e-live-permit e2e-all e2e-turn e2e-flow e2e-comments e2e-soak e2e-soak-long e2e-burst e2e-replay e2e-silent e2e-opencode-failures e2e-policy e2e-serialization e2e-crash-execute e2e-crash-on e2e-restart e2e-permit e2e-crash lint staticcheck \
+.PHONY: default build run secrets test test-race test-live test-repeat e2e e2e-clean e2e-live e2e-live-flow e2e-live-journey e2e-live-on-journey e2e-live-on-permit e2e-live-permit e2e-all e2e-turn e2e-flow e2e-comments e2e-soak e2e-soak-long e2e-burst e2e-replay e2e-silent e2e-opencode-failures e2e-policy e2e-serialization e2e-ingress e2e-crash-execute e2e-crash-on e2e-restart e2e-permit e2e-crash lint staticcheck \
 	fmt fmt-check smoke clean all releases \
 	desktop-install desktop-dev desktop-app desktop-build desktop-check desktop-clean
 
@@ -159,6 +159,11 @@ e2e-burst: build
 		FLOWHUB_E2E=1 E2E_BURST=1 E2E_BURST_COUNT=$${E2E_BURST_COUNT:-200} \
 		E2E_BURST_CONCURRENCY=$${E2E_BURST_CONCURRENCY:-16} \
 		go test -tags=e2e ./e2e -count=1 -run TestBurstSoak -v
+
+# Opt-in: ingress rejects and a 503 from a failing durable append, then dedupe release.
+e2e-ingress: build
+	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
+		FLOWHUB_E2E=1 E2E_INGRESS=1 go test -tags=e2e ./e2e -count=1 -run TestIngressRejectionsAndAppendFailure -v
 
 # Opt-in: SIGKILL during an on run; restart marks the run needs_attention, the task
 # failed, and leaves the engine usable for a new event.
