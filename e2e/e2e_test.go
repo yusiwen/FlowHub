@@ -46,6 +46,7 @@ type env struct {
 	binary      string
 	configPath  string
 	cmd         *exec.Cmd
+	extraEnv    []string
 	client      *http.Client
 }
 
@@ -141,9 +142,9 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" {
-		// The silent-turn test starts its own fake runtime; starting the real
-		// receiver first would make a runtime failure-path test depend on opencode.
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" {
+		// Failure-path tests start their own fake (or no) runtime; starting the real
+		// receiver first would make them depend on opencode.
 		return e
 	}
 	e.start()
@@ -154,23 +155,7 @@ func (e *env) start() {
 	if e.cmd != nil && e.cmd.Process != nil {
 		e.stop()
 	}
-	e.cmd = exec.Command(e.binary)
-	e.cmd.Dir = repoRoot()
-	e.cmd.Env = append(os.Environ(),
-		"FLOWHUB_ENV_FILE=-",
-		"FLOWHUB_ADDR="+e.addr,
-		"FLOWHUB_DATA_DIR="+filepath.Join(e.dir, "data"),
-		"FLOWHUB_CONFIG_FILE="+e.configPath,
-		"FLOWHUB_HOOK_KEY="+e.hookKey,
-		"FLOWHUB_TOKEN="+e.hookToken,
-		"FLOWHUB_HUB_TOKEN="+e.hubToken,
-		"FLOWHUB_DISPATCH=1",
-		"FLOWHUB_OPENCODE_URL="+e.ocBase,
-		"FLOWHUB_ALLOWED_SOURCES=127.0.0.1,10.1.0.1",
-		"FLOWHUB_PAUSE_FILE="+filepath.Join(e.dir, "DISPATCH_OFF"),
-		"FLOWHUB_LOG_FILE=none",
-		"FLOWHUB_TASK_DEADLINE=5m",
-	)
+	e.cmd = e.command()
 	e.cmd.Stdout = os.Stdout
 	e.cmd.Stderr = os.Stderr
 	if err := e.cmd.Start(); err != nil {
@@ -178,6 +163,56 @@ func (e *env) start() {
 	}
 	if err := e.waitHealthy(15 * time.Second); err != nil {
 		fatalf("e2e: FlowHub did not become healthy: %v", err)
+	}
+}
+
+func (e *env) command() *exec.Cmd {
+	cmd := exec.Command(e.binary)
+	cmd.Dir = repoRoot()
+	env := []string{
+		"FLOWHUB_ENV_FILE=-",
+		"FLOWHUB_ADDR=" + e.addr,
+		"FLOWHUB_DATA_DIR=" + filepath.Join(e.dir, "data"),
+		"FLOWHUB_CONFIG_FILE=" + e.configPath,
+		"FLOWHUB_HOOK_KEY=" + e.hookKey,
+		"FLOWHUB_TOKEN=" + e.hookToken,
+		"FLOWHUB_HUB_TOKEN=" + e.hubToken,
+		"FLOWHUB_DISPATCH=1",
+		"FLOWHUB_OPENCODE_URL=" + e.ocBase,
+		"FLOWHUB_ALLOWED_SOURCES=127.0.0.1,10.1.0.1",
+		"FLOWHUB_PAUSE_FILE=" + filepath.Join(e.dir, "DISPATCH_OFF"),
+		"FLOWHUB_LOG_FILE=none",
+		"FLOWHUB_TASK_DEADLINE=5m",
+	}
+	env = append(env, e.extraEnv...)
+	cmd.Env = append(os.Environ(), env...)
+	return cmd
+}
+
+// startExpectFailure proves the process refuses to start, rather than becoming
+// healthy and failing at the first task. The output is returned for the assertion.
+func (e *env) startExpectFailure(t *testing.T, timeout time.Duration) string {
+	t.Helper()
+	cmd := e.command()
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FlowHub started despite the runtime being unavailable")
+		}
+		return out.String()
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatalf("FlowHub did not refuse the unavailable runtime within %s", timeout)
+		return ""
 	}
 }
 
@@ -1021,6 +1056,164 @@ func TestSilentTurnNudgeAndFailure(t *testing.T) {
 	}
 	if failed.State == "awaiting_input" {
 		t.Fatal("a silent task was recorded awaiting_input")
+	}
+}
+
+func (e *env) pointAtRuntime(t *testing.T, baseURL string) {
+	t.Helper()
+	e.ocBase = baseURL
+	if err := writeTestConfig(e.configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject, "", e.ocBase); err != nil {
+		t.Fatalf("rewrite config for runtime %s: %v", baseURL, err)
+	}
+}
+
+func TestOpencodeUnavailableAtStartup(t *testing.T) {
+	if os.Getenv("E2E_DOWN") != "1" {
+		t.Skip("set E2E_DOWN=1 to run runtime failure paths")
+	}
+	if suite.live {
+		t.Skip("runtime failure paths use the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	suite.pointAtRuntime(t, "http://127.0.0.1:1")
+	out := suite.startExpectFailure(t, 20*time.Second)
+	if !strings.Contains(strings.ToLower(out), "opencode") {
+		t.Fatalf("startup refusal did not mention opencode:\n%s", out)
+	}
+}
+
+func TestOpencodeUnavailableBeforeDelivery(t *testing.T) {
+	if os.Getenv("E2E_DOWN") != "1" {
+		t.Skip("set E2E_DOWN=1 to run runtime failure paths")
+	}
+	if suite.live {
+		t.Skip("runtime failure paths use the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+	server.Close()
+
+	summary := "FlowHub E2E runtime down " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Runtime-down E2E.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Runtime-down E2E.", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("webhook status = %d", status)
+	}
+	// No runtime can serve the project: the delivery is ignored, not turned into a
+	// task row that claims work happened.
+	time.Sleep(700 * time.Millisecond)
+	if row, ok := suite.lastTaskRow(key); ok {
+		t.Fatalf("an unavailable runtime still created a task row: %+v", row)
+	}
+}
+
+func TestOpencodePromptFailure(t *testing.T) {
+	if os.Getenv("E2E_DOWN") != "1" {
+		t.Skip("set E2E_DOWN=1 to run runtime failure paths")
+	}
+	if suite.live {
+		t.Skip("runtime failure paths use the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	hold := make(chan struct{})
+	fake.setHold(hold)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+
+	summary := "FlowHub E2E prompt failure " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Prompt-failure E2E.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Prompt-failure E2E.", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("webhook status = %d", status)
+	}
+	suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Worktree != ""
+	}, 20*time.Second)
+	deadline := time.Now().Add(10 * time.Second)
+	for fake.promptCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() == 0 {
+		t.Fatal("fake runtime never received the prompt")
+	}
+	fake.setFailPrompt(true)
+	fake.release()
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "failed"
+	}, 20*time.Second)
+	if row.State == "awaiting_input" {
+		t.Fatal("a failed prompt was recorded awaiting_input")
+	}
+	if !strings.Contains(strings.ToLower(row.LastError), "500") &&
+		!strings.Contains(strings.ToLower(row.LastError), "internal server error") {
+		t.Fatalf("failure reason = %q, want the fake 500", row.LastError)
+	}
+}
+
+func TestOpencodeRequestTimeout(t *testing.T) {
+	if os.Getenv("E2E_DOWN") != "1" {
+		t.Skip("set E2E_DOWN=1 to run runtime failure paths")
+	}
+	if suite.live {
+		t.Skip("runtime failure paths use the fake runtime in direct mode")
+	}
+	suite.stop()
+	fake := newFakeOpencode(t)
+	fake.setDelay(5 * time.Second)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.extraEnv = []string{"FLOWHUB_OPENCODE_REQUEST_TIMEOUT=1s"}
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+
+	start := time.Now()
+	summary := "FlowHub E2E request timeout " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	key, _, err := suite.createIssue(summary, "Request-timeout E2E.")
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Request-timeout E2E.", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("webhook status = %d", status)
+	}
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.State == "failed"
+	}, 20*time.Second)
+	if row.State == "awaiting_input" {
+		t.Fatal("a timed-out turn was recorded awaiting_input")
+	}
+	if !strings.Contains(strings.ToLower(row.LastError), "deadline") &&
+		!strings.Contains(strings.ToLower(row.LastError), "timeout") {
+		t.Fatalf("failure reason = %q, want a deadline/timeout error", row.LastError)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("request timeout took %s with a 1s request bound; the turn deadline leaked in", elapsed)
 	}
 }
 

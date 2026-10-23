@@ -11,16 +11,20 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeOpencode is a minimal v1 protocol server for failure-path tests. It posts a
 // reply only when the mode says so; a silent first turn exercises the dispatcher's
 // one nudge, and an always-silent turn must become failed, never awaiting_input.
 type fakeOpencode struct {
-	mu      sync.Mutex
-	mode    string // "nudge" posts on prompt 2+, "silent" never posts
-	prompts map[string][]string
-	nextID  int
+	mu         sync.Mutex
+	mode       string // "nudge" posts on prompt 2+, "silent" never posts
+	prompts    map[string][]string
+	nextID     int
+	delay      time.Duration
+	hold       chan struct{}
+	failPrompt bool
 }
 
 func newFakeOpencode(t *testing.T) *fakeOpencode {
@@ -31,6 +35,37 @@ func newFakeOpencode(t *testing.T) *fakeOpencode {
 func (f *fakeOpencode) setMode(mode string) {
 	f.mu.Lock()
 	f.mode = mode
+	f.mu.Unlock()
+}
+
+func (f *fakeOpencode) setDelay(delay time.Duration) {
+	f.mu.Lock()
+	f.delay = delay
+	f.mu.Unlock()
+}
+
+func (f *fakeOpencode) setHold(hold chan struct{}) {
+	f.mu.Lock()
+	f.hold = hold
+	f.mu.Unlock()
+}
+
+func (f *fakeOpencode) release() {
+	f.mu.Lock()
+	hold := f.hold
+	f.mu.Unlock()
+	if hold != nil {
+		select {
+		case <-hold:
+		default:
+			close(hold)
+		}
+	}
+}
+
+func (f *fakeOpencode) setFailPrompt(fail bool) {
+	f.mu.Lock()
+	f.failPrompt = fail
 	f.mu.Unlock()
 }
 
@@ -91,7 +126,21 @@ func (f *fakeOpencode) prompt(w http.ResponseWriter, id string, r *http.Request)
 	}
 	f.mu.Lock()
 	f.prompts[id] = append(f.prompts[id], text)
+	delay, hold := f.delay, f.hold
 	f.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	if hold != nil {
+		<-hold
+	}
+	f.mu.Lock()
+	fail := f.failPrompt
+	f.mu.Unlock()
+	if fail {
+		http.Error(w, "fake prompt failure", http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
