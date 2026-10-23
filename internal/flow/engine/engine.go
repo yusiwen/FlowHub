@@ -89,6 +89,7 @@ type Engine struct {
 
 	mu     sync.Mutex
 	closed bool
+	cancel context.CancelFunc
 	seen   map[string]bool
 	queued map[string]bool
 
@@ -150,6 +151,10 @@ func New(opts Options) (*Engine, error) {
 
 // Start runs the single worker until ctx is done or Close is called.
 func (e *Engine) Start(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	e.mu.Lock()
+	e.cancel = cancel
+	e.mu.Unlock()
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -286,8 +291,12 @@ func (e *Engine) Close() error {
 		return nil
 	}
 	e.closed = true
+	cancel := e.cancel
 	close(e.queue)
 	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	e.wg.Wait()
 	close(e.done)
 	return nil
