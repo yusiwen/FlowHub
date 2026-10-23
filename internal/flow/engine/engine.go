@@ -754,7 +754,7 @@ func (e *Engine) turnLive(ctx context.Context, live *liveExecution, node *flow.C
 	}
 	result, err := e.opts.TaskService.Turn(ctx, tasksvc.TurnRequest{
 		Record: live.record, Delivery: neutralEvent(event), Task: live.task,
-		Entry: live.entry, Host: live.host, Action: action,
+		Entry: live.entry, Host: live.host, Action: action, Trigger: rules.Trigger("flow"),
 		RequireReply: config.RequireReply, Basis: live.basis,
 	})
 	if err != nil {

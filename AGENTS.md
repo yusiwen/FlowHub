@@ -126,7 +126,7 @@ internal/upstream/  The flow event seam: Event envelope, Normalizer, append-only
 internal/flow/      The flow model and compiler: strict definition, typed nodes, expression/template language, parity fixture
 internal/flow/builtin/ the embedded read-only default-youtrack flow
 internal/flow/engine/ the flow runner: trigger matching, task projection, profile evaluation, shadow or on execution, run meta/journal
-internal/tasks/    the execution seam: ensure/turn/grant/revoke, implemented by dispatch and consumed by the flow engine
+internal/tasks/    the execution seam: ensure/turn/grant/revoke, implemented by the extracted Executor and consumed by both dispatch and the flow engine
 internal/compare/  joins dispatch and shadow decisions by event id; flow-compare.jsonl, match/mismatch counters
 internal/flow/mode/ the deployment state: off/shadow/on in `<DataDir>/flows/state.json`, live-reloaded
 internal/flow/api/ the read-only `/hub/v1` surface (flows, runs, journal), bearer token in front
