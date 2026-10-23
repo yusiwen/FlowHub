@@ -158,6 +158,14 @@ unwritable events directory followed by a successful retry (dedupe key released)
 make e2e-ingress
 ```
 
+Attachments and other kinds (fake runtime): a curl to the configured attachment
+host/prefix is allowed, a curl elsewhere is rejected, and attachment/work-item/
+deleted events are recorded without creating a task:
+
+```bash
+make e2e-attachments
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -223,6 +231,7 @@ the Make targets are only wrappers around the suite.
 | SIGKILL during execute; failed, same worktree/session, no replay | `TestCrashDuringExecute` | `make e2e-crash-execute` |
 | SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
 | ingress rejects + append 503 + dedupe release | `TestIngressRejectionsAndAppendFailure` | `make e2e-ingress` |
+| attachment download allow/deny + other known kinds | `TestAttachmentsAndOtherEventKinds` | `make e2e-attachments` |
 | same-task second delivery waits; one session, no overlap | `TestSameTaskSecondDeliveryWaits` | `make e2e-serialization` |
 | author allowlist deny/allowed | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
 | unmapped project creates no task | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
@@ -264,7 +273,7 @@ closed audit that produced this list.
 | turn failure | none known after the 500/timeout/startup tests; author deny and unmapped project are in the routing row |
 | same-task concurrency | capacity saturation across tasks |
 | crash | none known after analysis/execute/on run tests |
-| attachments/other kinds | download exception, deleted/attachment events |
+| attachments/other kinds | none known after the allow/deny + other-kind test |
 | limits | cost cap, max turns |
 | flow control | flow pause with queued events; per-project mode across two projects |
 | API | `/hub/v1` auth/503, invalid deployment, `on` without task service; run cancel is not implemented |

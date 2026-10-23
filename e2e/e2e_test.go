@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -994,6 +994,126 @@ func appendReplayEvents(t *testing.T, phase string, count int) {
 		t.Fatalf("close event log: %v", err)
 	}
 }
+func attachmentCreatedPayload(key, summary, project, attachment string) []byte {
+	payload := map[string]any{
+		"event": "issueCreated", "timestamp": time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		"id": key, "summary": summary, "description": "Attachment E2E.",
+		"project":  map[string]any{"key": project, "name": project, "shortName": project},
+		"reporter": map[string]any{"login": "yusiwen", "fullName": "Siwen Yu"},
+		"attachments": []map[string]any{{
+			"name": attachment, "mimeType": "text/plain", "size": 42,
+		}},
+	}
+	data, _ := json.Marshal(payload)
+	return data
+}
+
+func otherEventPayload(kind, key, project string) []byte {
+	payload := map[string]any{
+		"event": kind, "timestamp": time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		"id": key, "summary": "Other event E2E",
+		"project": map[string]any{"key": project, "name": project, "shortName": project},
+	}
+	data, _ := json.Marshal(payload)
+	return data
+}
+
+func (e *env) removeTestWorktree(key string) {
+	path := filepath.Join(e.dir, "worktrees", key)
+	_ = exec.Command("git", "-C", e.repo, "worktree", "remove", "--force", path).Run()
+	_ = exec.Command("git", "-C", e.repo, "branch", "-D", "flowhub/"+key).Run()
+}
+
+func TestAttachmentsAndOtherEventKinds(t *testing.T) {
+	if os.Getenv("E2E_ATTACHMENTS") != "1" {
+		t.Skip("set E2E_ATTACHMENTS=1 to run attachment and other-kind checks")
+	}
+	if suite.live {
+		t.Skip("attachment checks use the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("off", nil); err != nil {
+		t.Fatalf("set off: %v", err)
+	}
+	deliver := func(payload []byte) {
+		t.Helper()
+		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+	}
+	waitPrompts := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			if fake.promptCount() >= want {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("prompts = %d, want %d", fake.promptCount(), want)
+	}
+	waitReply := func(prompt int, want string) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			if got := fake.permissionReplyFor(prompt); got == want {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("permission reply %d = %q, want %q", prompt, fake.permissionReplyFor(prompt), want)
+	}
+
+	// Known-but-other events are accepted and recorded, but must not create work.
+	beforeEvents := eventLineCount(t, suite.dataDir)
+	beforePrompts := fake.promptCount()
+	for _, tc := range []struct{ kind, key string }{
+		{"issueAttachmentAdded", "TEST-OTHER-1"},
+		{"issueAttachmentDeleted", "TEST-OTHER-2"},
+		{"issueDeleted", "TEST-OTHER-3"},
+		{"workItemAdded", "TEST-OTHER-4"},
+	} {
+		deliver(otherEventPayload(tc.kind, tc.key, suite.ytProject))
+		if row, ok := suite.lastTaskRow(tc.key); ok {
+			t.Fatalf("%s created a task row: %+v", tc.kind, row)
+		}
+	}
+	if got := eventLineCount(t, suite.dataDir); got != beforeEvents+4 {
+		t.Fatalf("other events appended %d lines, want 4", got-beforeEvents)
+	}
+	if got := fake.promptCount(); got != beforePrompts {
+		t.Fatalf("other events caused %d prompt(s)", got-beforePrompts)
+	}
+
+	// A signed attachment URL on the configured host is an allowed download.
+	t.Cleanup(func() {
+		suite.removeTestWorktree("TEST-ATTACH-1")
+		suite.removeTestWorktree("TEST-ATTACH-2")
+	})
+	fake.setPermissionCommand(`curl -sSL -o .flowhub/attachments/log.txt "https://pm.yusiwen.cn/api/files/1"`)
+	deliver(attachmentCreatedPayload("TEST-ATTACH-1", "Attachment allowed", suite.ytProject, "log.txt"))
+	waitPrompts(1)
+	waitReply(1, "once")
+	suite.waitForRegistry(t, "TEST-ATTACH-1", func(row taskRow) bool { return row.Worktree != "" }, 20*time.Second)
+	if prompts := fake.allPrompts(); len(prompts) == 0 || !strings.Contains(prompts[0], ".flowhub/attachments") {
+		t.Fatalf("attachment prompt does not name the download directory: %q", prompts)
+	}
+
+	// The same shape for a host outside the download policy must be refused.
+	fake.setPermissionCommand(`curl -sSL -o .flowhub/attachments/log.txt "https://evil.example/log.txt"`)
+	deliver(attachmentCreatedPayload("TEST-ATTACH-2", "Attachment denied", suite.ytProject, "log.txt"))
+	waitPrompts(2)
+	waitReply(2, "reject")
+}
+
 func (e *env) postWebhookRequest(t *testing.T, path, token, contentType string, body []byte) (int, string) {
 	t.Helper()
 	request, err := http.NewRequest(http.MethodPost, e.baseURL+path, bytes.NewReader(body))
