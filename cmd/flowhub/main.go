@@ -410,6 +410,29 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	events.Subscribe(flowEngine.Submit)
 	flowEngine.Start(ctx)
 	defer func() { _ = flowEngine.Close() }()
+
+	// Catch up from the durable event log. A missing cursor starts at the current
+	// tail so upgrading an existing deployment does not replay its whole history.
+	if flowEngine.Cursor() == "" {
+		last, err := events.Last()
+		if err != nil {
+			return fmt.Errorf("read event log tail: %w", err)
+		}
+		if last.ID != "" {
+			if err := flowEngine.SetCursor(last.ID); err != nil {
+				return fmt.Errorf("initialize flow replay cursor: %w", err)
+			}
+			logger.Info("flow replay cursor initialized at the event log tail", "event", last.ID)
+		}
+	}
+	pending, err := events.Since(flowEngine.Cursor())
+	if err != nil {
+		return fmt.Errorf("read events after flow cursor: %w", err)
+	}
+	if len(pending) > 0 {
+		logger.Info("replaying events from the durable log", "events", len(pending), "cursor", flowEngine.Cursor())
+		flowEngine.Replay(pending)
+	}
 	logger.Info("flow engine started",
 		"flow", flowDefinition.Definition.ID, "mode", modes.Mode(flowDefinition.Definition.ID),
 		"on_available", flowEngine.CanExecuteOn(), "runs", flowEngine.Snapshot()["dir"])

@@ -146,6 +146,24 @@ to be narrower and for the UI. An unknown kind is accepted and reaches
 - The audit (`audit.jsonl`) stays as it is during migration; the event log is
   additional, not a replacement. Both can be correlated by the delivery trace.
 
+### 3.4 Replay cursor
+
+- `<DataDir>/flow-cursor.json` holds the last event id the flow worker **accepted
+  for processing**, mode `0600`, replaced atomically.
+- The cursor advances after a run is created (before the graph executes), so a
+  crash mid-run leaves the existing run to recovery instead of replaying the event
+  into a second run. Events that are ignored, mode `off`, or a denied author also
+  advance; a paused delivery does not, so it is replayed after the pause is lifted.
+- At startup the flow reads every event after the cursor and submits it to the
+  worker. A missing cursor initializes at the current durable tail, so upgrading a
+  deployment does not replay its whole history; an event id that has aged out of the
+  30-day log is a startup error rather than a guess.
+- The queue can still drop while the process is running. The cursor is behind those
+  events, so they are replayed on the next restart; this slice does not add a
+  periodic in-process catch-up loop.
+- The E2E `TestReplayCursor` stops the process, appends valid events to the log,
+  restarts it, and asserts every event produced a run.
+
 ## 4. Upstream
 
 ### 4.1 Adapter

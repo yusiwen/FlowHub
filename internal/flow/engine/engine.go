@@ -85,6 +85,9 @@ type Engine struct {
 	closed bool
 	seen   map[string]bool
 
+	cursorMu sync.Mutex
+	cursor   string
+
 	submitted atomic.Int64
 	dropped   atomic.Int64
 	runs      atomic.Int64
@@ -119,7 +122,7 @@ func New(opts Options) (*Engine, error) {
 	if recovered > 0 {
 		opts.Logger.Warn("flow runs interrupted by the restart were marked needs_attention", "runs", recovered)
 	}
-	return &Engine{
+	engine := &Engine{
 		opts:  opts,
 		log:   opts.Logger,
 		store: store,
@@ -127,7 +130,11 @@ func New(opts Options) (*Engine, error) {
 		queue: make(chan upstream.Event, opts.QueueSize),
 		done:  make(chan struct{}),
 		seen:  map[string]bool{},
-	}, nil
+	}
+	if err := engine.loadCursor(); err != nil {
+		return nil, err
+	}
+	return engine, nil
 }
 
 // Start runs the single worker until ctx is done or Close is called.
@@ -173,6 +180,37 @@ func (e *Engine) Submit(event upstream.Event) {
 }
 
 // Close stops the worker and drains the queue. It is idempotent.
+// Replay feeds catch-up events to the worker. It blocks while the queue is full,
+// so a replay larger than the queue is not silently dropped; it is called at
+// startup before the HTTP server starts serving.
+func (e *Engine) Replay(events []upstream.Event) {
+	for _, event := range events {
+		for {
+			e.mu.Lock()
+			if e.closed {
+				e.mu.Unlock()
+				return
+			}
+			select {
+			case e.queue <- event:
+				e.submitted.Add(1)
+				e.mu.Unlock()
+			default:
+				// Do not hold mu while waiting: the worker takes it for its seen
+				// map, so holding it here would deadlock a full queue.
+				e.mu.Unlock()
+				select {
+				case <-e.done:
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+				continue
+			}
+			break
+		}
+	}
+}
+
 func (e *Engine) Close() error {
 	if e == nil {
 		return nil
@@ -233,7 +271,12 @@ func (e *Engine) RunEvent(event upstream.Event) (*Run, error) {
 
 // RunEventContext executes one event synchronously. The worker passes its own
 // context so an `on` turn is cancelled on shutdown.
-func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (*Run, error) {
+func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (run *Run, err error) {
+	defer func() {
+		if err == nil && !e.paused() {
+			e.advance(event)
+		}
+	}()
 	deployment := e.modeFor(event)
 	if deployment == mode.Off || deployment == "" {
 		return nil, nil
@@ -270,7 +313,7 @@ func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (*Ru
 	e.seen[key] = true
 	e.mu.Unlock()
 
-	run, err := e.run(ctx, event, trigger, deployment)
+	run, err = e.run(ctx, event, trigger, deployment)
 	if err != nil {
 		e.failed.Add(1)
 		return run, err
@@ -329,6 +372,10 @@ func (e *Engine) run(ctx context.Context, event upstream.Event, trigger *flow.Co
 	if err := e.store.Save(run); err != nil {
 		return run, err
 	}
+	// Advance before the graph runs: a crash in the middle leaves a run that the
+	// store recovery will mark needs_attention, not an event that gets replayed
+	// into a second run.
+	e.advance(event)
 
 	tasks, views := e.projections(event)
 	steps := map[string]map[string]any{}

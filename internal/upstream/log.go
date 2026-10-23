@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -121,6 +122,77 @@ func (l *Log) Path() string {
 		return ""
 	}
 	return filepath.Join(l.dir, l.opts.Now().UTC().Format("2006-01-02")+".jsonl")
+}
+
+// Since returns the events written after the given event id, in log order. It is
+// the catch-up path for a consumer that persisted a cursor. Event ids are not
+// necessarily sortable, so the cursor is matched exactly; a cursor that has aged
+// out is an error rather than a guess that could replay the wrong history.
+//
+// Daily files are read without taking the writer lock; a line that is still being
+// appended is skipped rather than failing the whole replay.
+func (l *Log) Since(after string) ([]Event, error) {
+	if l == nil {
+		return nil, fmt.Errorf("upstream: no event log")
+	}
+	entries, err := os.ReadDir(l.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("upstream: read %s: %w", l.dir, err)
+	}
+	var events []Event
+	found := after == ""
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		path := filepath.Join(l.dir, entry.Name())
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("upstream: open %s: %w", path, err)
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 64*1024), 1<<20)
+		for scanner.Scan() {
+			raw := strings.TrimSpace(scanner.Text())
+			if raw == "" {
+				continue
+			}
+			var event Event
+			if err := json.Unmarshal([]byte(raw), &event); err != nil || event.ID == "" {
+				continue
+			}
+			if !found {
+				if event.ID == after {
+					found = true
+				}
+				continue
+			}
+			events = append(events, event)
+		}
+		scanErr := scanner.Err()
+		_ = file.Close()
+		if scanErr != nil {
+			return nil, fmt.Errorf("upstream: scan %s: %w", path, scanErr)
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("upstream: cursor %q was not found in the event log", after)
+	}
+	return events, nil
+}
+
+// Last returns the newest readable event. An empty Event means the log has no
+// events yet; it is used to start a new consumer at the durable tail rather than
+// replaying the whole history.
+func (l *Log) Last() (Event, error) {
+	events, err := l.Since("")
+	if err != nil || len(events) == 0 {
+		return Event{}, err
+	}
+	return events[len(events)-1], nil
 }
 
 // Subscribe registers a listener for appended events. The listener runs on the
