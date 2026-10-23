@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -1872,6 +1872,156 @@ func TestMaxTurnsStopsATask(t *testing.T) {
 		t.Skip("limit checks use the fake runtime in direct mode")
 	}
 	runLimitPhase(t, "FLOWHUB_MAX_TURNS=2", 2)
+}
+
+func (e *env) addProject(t *testing.T, project string) {
+	t.Helper()
+	data, err := os.ReadFile(e.configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	worktrees := filepath.Join(e.dir, "worktrees-"+project)
+	if err := os.MkdirAll(worktrees, 0o700); err != nil {
+		t.Fatalf("worktrees: %v", err)
+	}
+	projects, _ := raw["projects"].([]any)
+	projects = append(projects, map[string]any{
+		"project": project, "source": "youtrack",
+		"repo":      map[string]any{"path": e.repo, "default_branch": "main"},
+		"worktrees": worktrees, "runtime": "local",
+	})
+	raw["projects"] = projects
+	data, err = json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	if err := os.WriteFile(e.configPath, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+func TestFlowPauseAndCatchUp(t *testing.T) {
+	if os.Getenv("E2E_FLOW_CONTROL") != "1" {
+		t.Skip("set E2E_FLOW_CONTROL=1 to run flow pause/project-scope checks")
+	}
+	if suite.live {
+		t.Skip("flow-control checks use the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("on", []string{suite.ytProject}); err != nil {
+		t.Fatalf("set on: %v", err)
+	}
+	pause := filepath.Join(suite.dir, "DISPATCH_OFF")
+	if err := os.WriteFile(pause, []byte("off"), 0o600); err != nil {
+		t.Fatalf("pause file: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(pause) })
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	key := "TEST-PAUSE-" + suffix
+	t.Cleanup(func() { suite.removeTestWorktree(key) })
+	summary := "FlowHub E2E pause " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Pause E2E.", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("webhook status = %d", status)
+	}
+	time.Sleep(700 * time.Millisecond)
+	if row, ok := suite.lastTaskRow(key); ok {
+		t.Fatalf("paused flow created a task: %+v", row)
+	}
+	if got := fake.promptCount(); got != 0 {
+		t.Fatalf("paused flow caused %d prompt(s)", got)
+	}
+
+	if err := os.Remove(pause); err != nil {
+		t.Fatalf("remove pause: %v", err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for fake.promptCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() == 0 {
+		t.Fatal("unpaused flow did not catch up the paused event")
+	}
+	suite.waitForRegistry(t, key, func(row taskRow) bool { return row.Worktree != "" }, 20*time.Second)
+	suite.waitForRunState(t, key, "succeeded", 20*time.Second)
+}
+
+func TestProjectScopedMode(t *testing.T) {
+	if os.Getenv("E2E_FLOW_CONTROL") != "1" {
+		t.Skip("set E2E_FLOW_CONTROL=1 to run flow pause/project-scope checks")
+	}
+	if suite.live {
+		t.Skip("flow-control checks use the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.addProject(t, "OTHER")
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("on", []string{suite.ytProject}); err != nil {
+		t.Fatalf("set on: %v", err)
+	}
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	testKey := "TEST-SCOPE-" + suffix
+	otherKey := "OTHER-" + suffix
+	t.Cleanup(func() {
+		suite.removeTestWorktree(testKey)
+		suite.removeTestWorktree(otherKey)
+	})
+	for _, tc := range []struct{ key, project string }{{testKey, suite.ytProject}, {otherKey, "OTHER"}} {
+		summary := "FlowHub E2E scope " + tc.project + " " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+		if status := suite.postWebhook(t, issueCreatedPayload(tc.key, summary, "Scope E2E.", tc.project)); status != http.StatusAccepted {
+			t.Fatalf("%s webhook status = %d", tc.project, status)
+		}
+	}
+	suite.waitForRegistry(t, testKey, func(row taskRow) bool { return row.Worktree != "" }, 20*time.Second)
+	other := suite.waitForRegistry(t, otherKey, func(row taskRow) bool { return row.Worktree != "" }, 20*time.Second)
+	if other.Worktree == "" {
+		t.Fatal("OTHER has no dispatch worktree")
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for fake.promptCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() != 2 {
+		t.Fatalf("prompts = %d, want one per project", fake.promptCount())
+	}
+	if fake.sessionCount() != 2 {
+		t.Fatalf("sessions = %d, want two", fake.sessionCount())
+	}
+	runs := suite.runRows(t)
+	flowRuns, otherRuns := 0, 0
+	for _, run := range runs {
+		switch run.Task {
+		case testKey:
+			flowRuns++
+		case otherKey:
+			otherRuns++
+		}
+	}
+	if flowRuns == 0 {
+		t.Fatal("TEST did not get a flow run")
+	}
+	if otherRuns != 0 {
+		t.Fatalf("OTHER got %d flow run(s) despite being outside the on scope", otherRuns)
+	}
 }
 
 func TestOpencodeUnavailableAtStartup(t *testing.T) {

@@ -173,6 +173,14 @@ Limits (fake runtime): after two turns, `FLOWHUB_TASK_MAX_COST=0.0015` and
 make e2e-limits
 ```
 
+Flow control (fake runtime): pause the flow, post an event (no run), unpause and
+assert the durable event catches up; set `on` for TEST only and prove TEST gets a
+flow run while OTHER is still dispatched:
+
+```bash
+make e2e-flow-control
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -239,6 +247,8 @@ the Make targets are only wrappers around the suite.
 | SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
 | ingress rejects + append 503 + dedupe release | `TestIngressRejectionsAndAppendFailure` | `make e2e-ingress` |
 | attachment download allow/deny + other known kinds | `TestAttachmentsAndOtherEventKinds` | `make e2e-attachments` |
+| flow pause, then catch-up after unpause | `TestFlowPauseAndCatchUp` | `make e2e-flow-control` |
+| project-scoped `on` (TEST flow, OTHER dispatch) | `TestProjectScopedMode` | `make e2e-flow-control` |
 | cost cap stops before a third prompt | `TestCostCapStopsATask` | `make e2e-limits` |
 | max turns stops before a third prompt | `TestMaxTurnsStopsATask` | `make e2e-limits` |
 | same-task second delivery waits; one session, no overlap | `TestSameTaskSecondDeliveryWaits` | `make e2e-serialization` |
@@ -284,7 +294,7 @@ closed audit that produced this list.
 | crash | none known after analysis/execute/on run tests |
 | attachments/other kinds | none known after the allow/deny + other-kind test |
 | limits | none known after the cost/max-turns test |
-| flow control | flow pause with queued events; per-project mode across two projects |
+| flow control | none known after pause/project-scope tests |
 | API | `/hub/v1` auth/503, invalid deployment, `on` without task service; run cancel is not implemented |
 | restart | active `on` run across restart; aged-out cursor |
 | pilot | 1 week / 100 real events, 100% parity, rollback |
