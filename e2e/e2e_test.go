@@ -877,13 +877,14 @@ func TestReplayCursor(t *testing.T) {
 		t.Fatalf("set shadow: %v", err)
 	}
 	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	beforeRuns := suite.flowHealth(t).Runs
 
 	// Establish a cursor with one normal delivery.
 	payload := issueUpdatedPayload(suite.ytIssue, "FlowHub replay seed "+time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format("2006-01-02T15:04:05Z"), suite.ytProject)
 	if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
 		t.Fatalf("seed webhook status = %d", status)
 	}
-	suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.Runs >= 1 }, 20*time.Second)
+	suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.Runs >= beforeRuns+1 }, 20*time.Second)
 	time.Sleep(200 * time.Millisecond)
 
 	// 1. Append events while the process is still running. Only the periodic
@@ -891,10 +892,10 @@ func TestReplayCursor(t *testing.T) {
 	const liveCount = 3
 	appendReplayEvents(t, "live", liveCount)
 	suite.waitForFlowHealth(t, func(f flowHealth) bool {
-		return f.Runs >= 1+liveCount
+		return f.Runs >= beforeRuns+1+liveCount
 	}, 30*time.Second)
-	if got := suite.flowHealth(t).Runs; got != 1+liveCount {
-		t.Fatalf("periodic catch-up produced %v runs, want %d", got, 1+liveCount)
+	if got := suite.flowHealth(t).Runs; got != beforeRuns+1+liveCount {
+		t.Fatalf("periodic catch-up produced %v runs, want %v", got, beforeRuns+1+liveCount)
 	}
 
 	// 2. Append events while the process is stopped. Only startup replay can see

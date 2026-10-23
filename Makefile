@@ -73,12 +73,13 @@ e2e: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 go test -tags=e2e ./e2e -count=1 -v
 
-# Every non-permit opt-in scenario in one direct-mode run (100-event soak).
-# The permit test is separate because it installs a prompt file for its turn.
+# Every non-live, non-permit opt-in scenario in one direct-mode run (100-event
+# soak). The permit test is separate because it installs a prompt file.
 e2e-all: build
 	@set -a; . "$(FLOWHUB_E2E_ENV)"; . "$(HOME)/.config/flowhub/.env"; set +a; \
 		FLOWHUB_E2E=1 E2E_TURN=1 E2E_FLOW=1 E2E_COMMENT=1 E2E_RESTART=1 E2E_CRASH=1 \
-		E2E_SOAK=$${E2E_SOAK:-100} go test -tags=e2e ./e2e -count=1 -v
+		E2E_SOAK=$${E2E_SOAK:-100} E2E_BURST=1 E2E_REPLAY=1 \
+		go test -tags=e2e ./e2e -count=1 -v
 
 # The full live operator journey: analyze, first start -> plan, second start ->
 # execute, then check worktree/comment/registry. Requires E2E_ADDR and no real

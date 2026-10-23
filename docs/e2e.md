@@ -172,7 +172,9 @@ the Make targets are only wrappers around the suite.
 | live permit/revoke (`on`) | `TestOnLivePermitAndRevoke` | `make e2e-live-on-permit` |
 | cleanup test issues/temp dirs | `TestCleanupTestResources` | `make e2e-clean` |
 
-`make e2e-all` runs every non-permit opt-in scenario in direct mode in one process.
+`make e2e-all` runs every non-live, non-permit opt-in scenario in direct mode in
+one process, including burst and replay/catch-up. Live journeys and the permit
+tests are separate because they need the real webhook app or install a prompt file.
 `make e2e-live-journey` runs the full live journey with dispatch;
 `make e2e-live-on-journey` runs the same journey with the flow in `on` mode.
 `make e2e-live-permit` runs the permit/revoke test against live webhooks with
@@ -183,5 +185,28 @@ its temp dirs; it never deletes `E2E_ISSUE`.
 the process starts, which would affect the other turns.
 
 Not automated in the harness: YouTrack webhook app configuration, the test
-project/repo/runtime setup, and the real 1-week pilot. The next product scenarios
-(plan -> execute, live permit, cleanup and a larger soak) are still open in #119.
+project/repo/runtime setup, and the real 1-week pilot.
+
+## Known gaps
+
+These are not E2E yet. Most have unit coverage in `internal/webhook`,
+`internal/dispatch` or `internal/agent/opencode`; a unit test is not a real
+process/API test. #144 tracks the order before a pilot.
+
+| Area | Missing E2E |
+| --- | --- |
+| ingress rejection | wrong URL key/token/IP, body cap, content type, malformed JSON, unknown event, replay window |
+| durable append failure | `503` and dedupe-key release |
+| routing/auth | unmapped project, author allowlist deny, repository rebind refusal |
+| turn failure | opencode down, request timeout, silent turn + nudge, no-comment failure |
+| same-task concurrency | second delivery waits, one session, capacity saturation |
+| crash | SIGKILL during execute and during an `on` run (the current crash test kills analysis) |
+| attachments/other kinds | download exception, deleted/attachment events |
+| limits | cost cap, max turns |
+| flow control | flow pause with queued events; per-project mode across two projects |
+| API | `/hub/v1` auth/503, invalid deployment, `on` without task service; run cancel is not implemented |
+| restart | active `on` run across restart; aged-out cursor |
+| pilot | 1 week / 100 real events, 100% parity, rollback |
+
+The current coverage table above is the complement: what **is** checked by a real
+process, real HTTP/webhook and (for the live rows) real YouTrack/opencode.
