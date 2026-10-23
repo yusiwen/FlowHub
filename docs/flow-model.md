@@ -158,11 +158,13 @@ to be narrower and for the UI. An unknown kind is accepted and reaches
   worker. A missing cursor initializes at the current durable tail, so upgrading a
   deployment does not replay its whole history; an event id that has aged out of the
   30-day log is a startup error rather than a guess.
-- The queue can still drop while the process is running. The cursor is behind those
-  events, so they are replayed on the next restart; this slice does not add a
-  periodic in-process catch-up loop.
-- The E2E `TestReplayCursor` stops the process, appends valid events to the log,
-  restarts it, and asserts every event produced a run.
+- The queue can still drop while the process is running. A periodic catch-up
+  (default 5s) reads the log after the cursor and blocks until the queue accepts the
+  missing events, so the gap is bounded rather than waiting for a restart. Startup
+  does one catch-up before serving HTTP; the periodic loop covers the running process.
+- The E2E `TestReplayCursor` appends valid events while the process is running
+  (periodic catch-up), then stops, appends more, restarts (startup replay), and
+  asserts every event produced a run.
 
 ## 4. Upstream
 

@@ -106,7 +106,8 @@ Burst (200 direct deliveries at 16-way concurrency; asserts no flow drop):
 make e2e-burst
 ```
 
-Replay (append valid events while stopped, restart, assert the flow catches up):
+Replay (append valid events while running and while stopped; assert periodic
+catch-up and startup replay):
 
 ```bash
 make e2e-replay
