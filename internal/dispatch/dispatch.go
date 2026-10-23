@@ -1,10 +1,9 @@
 // Package dispatch turns an accepted event into one unattended agent turn.
 //
-// It is the only place that joins the four halves of FlowHub: the routing table
-// (which repository), the task registry (which session), the workspace provider
-// (which directory) and the runtime (which turn). Everything here runs on a worker
-// goroutine, never on the webhook request path, because the publisher of the webhook
-// waits for our 202.
+// It owns intake, routing and scheduling. The task lifecycle (ensure, one turn,
+// grant, revoke) lives in internal/tasks and is shared with the flow engine.
+// Everything here runs on a worker goroutine, never on the webhook request path,
+// because the publisher of the webhook waits for our 202.
 //
 // It names no tracker and no agent product (ADR 0001): the event source, the runtime
 // and the workspace provider are all injected, and each one owns the policy that is
@@ -782,52 +781,6 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 
 // ensureTask creates the registry row and the worktree if they do not exist yet,
 // and refuses to continue when the mapping changed under a running task.
-
-func sameTool(got, want string) bool {
-	norm := func(value string) string {
-		value = strings.ToLower(strings.TrimSpace(value))
-		value = strings.ReplaceAll(value, ".", "_")
-		value = strings.ReplaceAll(value, "-", "_")
-		return value
-	}
-	return norm(got) == norm(want)
-}
-
-func anyToolCompleted(calls []agent.ToolCall, replyTools []string) bool {
-	for _, call := range calls {
-		if call.Status != "completed" {
-			continue
-		}
-		for _, want := range replyTools {
-			if sameTool(call.Name, want) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func silentFinish(result agent.Result, err error, replied bool) bool {
-	return err == nil && result.Finished && !result.TimedOut && !replied && result.SessionID != ""
-}
-
-// MinNudgeDeadline keeps a short task deadline from making the follow-up turn so
-// short that it cannot post the comment.
-const MinNudgeDeadline = 2 * time.Minute
-
-func nudgeDeadline(ordinary time.Duration) time.Duration {
-	if ordinary <= 0 {
-		return MinNudgeDeadline
-	}
-	bound := ordinary / 3
-	if bound < MinNudgeDeadline {
-		bound = MinNudgeDeadline
-	}
-	if bound > ordinary {
-		bound = ordinary
-	}
-	return bound
-}
 
 // runtimeAgent resolves which agent *profile* runs a turn: the routing entry may
 // name one, then the runtime's enrolled profile, then the process-wide default.
