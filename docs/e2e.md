@@ -135,6 +135,13 @@ same task, and assert it waits for one session/turn:
 make e2e-serialization
 ```
 
+Crash during execute (fake runtime): hold the third prompt, SIGKILL FlowHub, restart,
+and assert failed recovery, same worktree/session, no replayed turn:
+
+```bash
+make e2e-crash-execute
+```
+
 Replay (append valid events while running and while stopped; assert periodic
 catch-up and startup replay):
 
@@ -197,6 +204,7 @@ the Make targets are only wrappers around the suite.
 | restart mode + compare state | `TestRestartKeepsComparisonState` | `make e2e-restart` |
 | permit/revoke | `TestPermitAndRevoke` | `make e2e-permit` |
 | silent turn -> nudge -> answered, then both silent -> failed | `TestSilentTurnNudgeAndFailure` | `make e2e-silent` |
+| SIGKILL during execute; failed, same worktree/session, no replay | `TestCrashDuringExecute` | `make e2e-crash-execute` |
 | same-task second delivery waits; one session, no overlap | `TestSameTaskSecondDeliveryWaits` | `make e2e-serialization` |
 | author allowlist deny/allowed | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
 | unmapped project creates no task | `TestAuthorAllowlistAndUnmappedProject` | `make e2e-policy` |
@@ -239,7 +247,7 @@ closed audit that produced this list.
 | routing/auth | repository rebind refusal |
 | turn failure | none known after the 500/timeout/startup tests; author deny and unmapped project are in the routing row |
 | same-task concurrency | capacity saturation across tasks |
-| crash | SIGKILL during execute and during an `on` run (the current crash test kills analysis) |
+| crash | SIGKILL during an `on` run |
 | attachments/other kinds | download exception, deleted/attachment events |
 | limits | cost cap, max turns |
 | flow control | flow pause with queued events; per-project mode across two projects |

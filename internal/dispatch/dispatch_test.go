@@ -1634,3 +1634,42 @@ func TestReplyToolNamesFromV2MCPAreNormalized(t *testing.T) {
 		t.Fatal("a failed call must not count as a reply")
 	}
 }
+
+func TestAPlanTurnRecordsItsRunningStateBeforeThePrompt(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	defer fake.release()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-70", "issueCreated", issueCreatedBody("TEST-70")))
+
+	fake.mu.Lock()
+	fake.hold = make(chan struct{})
+	fake.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		dispatcher.handle(context.Background(), delivery("TEST-70", "commentAdded", commentBody("TEST-70", "/opencode start")))
+		close(done)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var task registry.Task
+	for time.Now().Before(deadline) {
+		if found, ok := reg.Get(youtrack.SourceName, "TEST-70"); ok && found.State == registry.StatePlanning {
+			task = found
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if task.State != registry.StatePlanning {
+		t.Fatalf("task state while the plan prompt is held = %q, want %q", task.State, registry.StatePlanning)
+	}
+	fake.release()
+	<-done
+
+	task, _ = reg.Get(youtrack.SourceName, "TEST-70")
+	if task.State != registry.StateAwaitingInput || task.Plan != registry.PlanDraft {
+		t.Fatalf("after plan: state/plan = %q/%q, want awaiting_input/draft", task.State, task.Plan)
+	}
+}
