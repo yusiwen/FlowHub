@@ -852,13 +852,45 @@ func TestPermitAndRevoke(t *testing.T) {
 	if os.Getenv("E2E_PERMIT") != "1" {
 		t.Skip("set E2E_PERMIT=1 to run the real permit/revoke path")
 	}
-	t.Cleanup(func() { _ = suite.setMode("off", nil) })
-	if err := suite.setMode("off", nil); err != nil {
-		t.Fatalf("set off: %v", err)
+	runPermit(t, false)
+}
+
+func TestOnLivePermitAndRevoke(t *testing.T) {
+	if os.Getenv("E2E_ON_PERMIT") != "1" {
+		t.Skip("set E2E_ON_PERMIT=1 to run permit/revoke through the on flow")
 	}
+	if !suite.live {
+		t.Skip("the on permit journey requires live webhook delivery")
+	}
+	runPermit(t, true)
+}
+
+func runPermit(t *testing.T, on bool) {
+	t.Helper()
+	if on && !suite.live {
+		t.Skip("the on permit journey requires live webhook delivery")
+	}
+	t.Cleanup(func() { _ = suite.setMode("off", nil) })
+	modeName := "off"
+	projectScope := []string(nil)
+	if on {
+		modeName = "on"
+		projectScope = []string{suite.ytProject}
+	}
+	if err := suite.setMode(modeName, projectScope); err != nil {
+		t.Fatalf("set %s: %v", modeName, err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	beforeFlow := suite.flowHealth(t)
+	beforeDispatch := suite.dispatchHandled(t)
+
 	prompt := "Inspect the repository and report every git worktree attached to it. " +
 		"Follow the project instructions for the required inspection."
-	summary := "FlowHub E2E permit " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	prefix := "FlowHub E2E permit "
+	if on {
+		prefix = "FlowHub E2E on permit "
+	}
+	summary := prefix + time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	key, _, err := suite.createIssue(summary, prompt)
 	if err != nil {
 		t.Fatalf("create issue: %v", err)
@@ -869,12 +901,17 @@ func TestPermitAndRevoke(t *testing.T) {
 		}
 		suite.waitForEvent(t, key, "issue.created", 15*time.Second)
 	}
-	suite.waitForDispatchHandled(t, 1, 6*time.Minute)
+	if on {
+		suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.Runs > beforeFlow.Runs }, 6*time.Minute)
+	} else {
+		suite.waitForDispatchHandled(t, 1, 6*time.Minute)
+	}
 	suite.waitForComment(t, key, "<!-- flowhub-auto -->", 6*time.Minute)
 	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
 		return len(row.Refusals) > 0
 	}, 6*time.Minute)
 	command := row.Refusals[0].Command
+	session := row.Session
 	t.Logf("refused command: %s", command)
 
 	turnsBefore := row.Turns
@@ -899,6 +936,12 @@ func TestPermitAndRevoke(t *testing.T) {
 		return false
 	}, 6*time.Minute)
 	suite.waitForComment(t, key, "<!-- flowhub-auto -->", 6*time.Minute)
+	if on {
+		suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.Runs >= beforeFlow.Runs+2 }, 6*time.Minute)
+	}
+	if row, ok := suite.lastTaskRow(key); ok && row.Session != "" && row.Session != session {
+		t.Fatalf("session changed across permit: before=%s after=%s", session, row.Session)
+	}
 
 	revoke, err := suite.addComment(key, "/opencode revoke")
 	if err != nil {
@@ -912,6 +955,15 @@ func TestPermitAndRevoke(t *testing.T) {
 	suite.waitForRegistry(t, key, func(row taskRow) bool {
 		return row.Grant == nil || len(row.Grant.Commands) == 0
 	}, 20*time.Second)
+	if on {
+		suite.waitForFlowHealth(t, func(f flowHealth) bool { return f.Runs >= beforeFlow.Runs+3 }, 30*time.Second)
+		if !suite.hasRunMode(t, "on") {
+			t.Fatal("no on run appeared in /hub/v1/runs")
+		}
+		if after := suite.dispatchHandled(t); after != beforeDispatch {
+			t.Fatalf("dispatch handled a delivery while the flow owned the project: before=%v after=%v", beforeDispatch, after)
+		}
+	}
 }
 
 type taskRow struct {
