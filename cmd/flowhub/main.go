@@ -441,7 +441,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	hubAPI, err := flowapi.New(flowapi.Options{
 		Token: cfg.HubToken, Flow: flowDefinition, Definition: flowRaw,
 		Modes: modes, Runs: flowEngine.RunStore(), OnAvailable: dispatcher != nil,
-		Compare: comparisons, Logger: logger,
+		Cancel: flowEngine.Cancel, Compare: comparisons, Logger: logger,
 	})
 	if err != nil {
 		return fmt.Errorf("start hub API: %w", err)

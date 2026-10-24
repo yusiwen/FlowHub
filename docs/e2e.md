@@ -188,6 +188,14 @@ task service, and `on` without it (409):
 make e2e-api
 ```
 
+Cancel (fake runtime): hold the execute prompt, `POST /hub/v1/runs/{id}/cancel`,
+assert `canceled`, `409` on a second cancel, no extra prompt, and a `run.canceled`
+journal event:
+
+```bash
+make e2e-cancel
+```
+
 Rebind and capacity (fake runtime): a task bound to repo A refuses a mapping to repo B
 without preparing a new worktree; a runtime with one slot runs two distinct tasks one
 at a time:
@@ -270,6 +278,7 @@ the Make targets are only wrappers around the suite.
 | SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
 | ingress rejects + append 503 + dedupe release | `TestIngressRejectionsAndAppendFailure` | `make e2e-ingress` |
 | attachment download allow/deny + other known kinds | `TestAttachmentsAndOtherEventKinds` | `make e2e-attachments` |
+| cancel an active `on` run | `TestCancelStopsAnActiveRun` | `make e2e-cancel` |
 | repository rebind refusal | `TestRepositoryRebindRefused` | `make e2e-rebind` |
 | cross-task capacity saturation | `TestCrossTaskCapacitySaturation` | `make e2e-capacity` |
 | graceful restart during an active `on` run | `TestActiveOnGracefulRestart` | `make e2e-restart-hardening` |
@@ -324,7 +333,7 @@ closed audit that produced this list.
 | attachments/other kinds | none known after the allow/deny + other-kind test |
 | limits | none known after the cost/max-turns test |
 | flow control | none known after pause/project-scope tests |
-| API | run cancel is not implemented |
+| API | none known after the cancel test |
 | restart | none known after graceful active-on restart + aged-cursor tests |
 | pilot | waived by ADR 0014; post-cutover observation is not automated |
 

@@ -34,6 +34,9 @@ type Options struct {
 	// OnAvailable reports whether this process has the task service wired. `on`
 	// is refused without it: skipping dispatch but not running turns would lose work.
 	OnAvailable bool
+	// Cancel stops an active run. Nil disables the endpoint with 503 rather than
+	// pretending a run was canceled.
+	Cancel func(runID string) (*engine.Run, error)
 	// Compare joins a shadow run with dispatch's decision for the same event.
 	Compare *compare.Store
 	Logger  *slog.Logger
@@ -64,6 +67,7 @@ func New(opts Options) (*Handler, error) {
 	handler.mux.HandleFunc("POST /hub/v1/flows/{id}/deployment", handler.deploy)
 	handler.mux.HandleFunc("GET /hub/v1/runs", handler.runs)
 	handler.mux.HandleFunc("GET /hub/v1/runs/{id}", handler.run)
+	handler.mux.HandleFunc("POST /hub/v1/runs/{id}/cancel", handler.cancel)
 	handler.mux.HandleFunc("GET /hub/v1/runs/{id}/events", handler.events)
 	return handler, nil
 }
@@ -280,6 +284,38 @@ func (h *Handler) run(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// cancel stops an active run. A terminal run is 409, never a silent no-op: the
+// operator asked for a state change that cannot happen. A run that is not active
+// in this process is also 409, because a different process cannot stop it.
+func (h *Handler) cancel(w http.ResponseWriter, r *http.Request) {
+	if h.opts.Cancel == nil {
+		writeError(w, http.StatusServiceUnavailable, "run cancellation is unavailable in this process")
+		return
+	}
+	run, err := h.opts.Cancel(r.PathValue("id"))
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]any{"run": run})
+	case errors.Is(err, os.ErrNotExist):
+		writeError(w, http.StatusNotFound, "unknown run")
+	case errors.Is(err, engine.ErrRunNotActive), errors.Is(err, engine.ErrRunNotCancelable):
+		state := ""
+		if run != nil {
+			state = string(run.State)
+		}
+		writeError(w, http.StatusConflict, "run is not cancelable"+stateSuffix(state))
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+func stateSuffix(state string) string {
+	if state == "" {
+		return ""
+	}
+	return " (state " + state + ")"
 }
 
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {

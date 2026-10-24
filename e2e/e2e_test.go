@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" || os.Getenv("E2E_ON_RESTART") == "1" || os.Getenv("E2E_AGED_CURSOR") == "1" || os.Getenv("E2E_REBIND") == "1" || os.Getenv("E2E_CAPACITY") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" || os.Getenv("E2E_ON_RESTART") == "1" || os.Getenv("E2E_AGED_CURSOR") == "1" || os.Getenv("E2E_REBIND") == "1" || os.Getenv("E2E_CAPACITY") == "1" || os.Getenv("E2E_CANCEL") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -2124,7 +2124,7 @@ func (e *env) apiRequest(t *testing.T, method, path, token string, body []byte) 
 		t.Fatalf("api: %v", err)
 	}
 	defer func() { _ = response.Body.Close() }()
-	reply, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+	reply, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	return response.StatusCode, strings.TrimSpace(string(reply))
 }
 
@@ -2284,6 +2284,108 @@ func TestActiveOnGracefulRestart(t *testing.T) {
 	for _, run := range suite.runRows(t) {
 		if run.Task == key && run.State == "running" {
 			t.Fatalf("run still running after restart: %+v", run)
+		}
+	}
+}
+
+func TestCancelStopsAnActiveRun(t *testing.T) {
+	if os.Getenv("E2E_CANCEL") != "1" {
+		t.Skip("set E2E_CANCEL=1 to cancel an active on run")
+	}
+	if suite.live {
+		t.Skip("cancel uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	hold := make(chan struct{})
+	fake.setHold(hold)
+	fake.setHoldAt(3)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("on", []string{suite.ytProject}); err != nil {
+		t.Fatalf("set on: %v", err)
+	}
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	key := "TEST-CANCEL-" + suffix
+	t.Cleanup(func() { suite.removeTestWorktree(key) })
+	summary := "FlowHub E2E cancel " + time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	deliver := func(payload []byte) {
+		t.Helper()
+		if status := suite.postWebhook(t, payload); status != http.StatusAccepted {
+			t.Fatalf("webhook status = %d", status)
+		}
+	}
+	waitPrompts := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if fake.promptCount() >= want {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("prompts = %d, want %d", fake.promptCount(), want)
+	}
+	deliver(issueCreatedPayload(key, summary, "Cancel E2E.", suite.ytProject))
+	waitPrompts(1)
+	suite.waitForRegistry(t, key, func(row taskRow) bool { return row.Turns == 1 }, 30*time.Second)
+	comment := "plan-" + suffix
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	waitPrompts(2)
+	suite.waitForRegistry(t, key, func(row taskRow) bool { return row.Turns == 2 && row.Plan == "draft" }, 30*time.Second)
+	time.Sleep(1100 * time.Millisecond)
+	comment = "execute-" + suffix
+	deliver(commentAddedPayload(key, comment, "/opencode start", suite.ytProject))
+	waitPrompts(3)
+	run := suite.waitForRunState(t, key, "running", 30*time.Second)
+	status, reply := suite.apiRequest(t, http.MethodPost, "/hub/v1/runs/"+run.ID+"/cancel", suite.hubToken, nil)
+	if status != http.StatusOK {
+		t.Fatalf("cancel status = %d: %s", status, reply)
+	}
+	var body struct {
+		Run struct {
+			State string `json:"state"`
+		} `json:"run"`
+	}
+	if err := json.Unmarshal([]byte(reply), &body); err != nil {
+		t.Fatalf("cancel body: %v (%s)", err, reply)
+	}
+	if body.Run.State != "canceled" {
+		t.Fatalf("cancel state = %q, want canceled", body.Run.State)
+	}
+	canceled := suite.waitForRunState(t, key, "canceled", 20*time.Second)
+	if canceled.ID != run.ID {
+		t.Fatalf("canceled run = %s, want %s", canceled.ID, run.ID)
+	}
+	status, _ = suite.apiRequest(t, http.MethodPost, "/hub/v1/runs/"+run.ID+"/cancel", suite.hubToken, nil)
+	if status != http.StatusConflict {
+		t.Fatalf("second cancel status = %d, want 409", status)
+	}
+	status, _ = suite.apiRequest(t, http.MethodPost, "/hub/v1/runs/run_does_not_exist/cancel", suite.hubToken, nil)
+	if status != http.StatusNotFound {
+		t.Fatalf("unknown cancel status = %d, want 404", status)
+	}
+	time.Sleep(time.Second)
+	if got := fake.promptCount(); got != 3 {
+		t.Fatalf("prompts after cancel = %d, want 3", got)
+	}
+	journal, err := os.ReadFile(filepath.Join(suite.dataDir, "runs", run.ID, "journal.jsonl"))
+	if err != nil {
+		t.Fatalf("read cancel journal: %v", err)
+	}
+	if !strings.Contains(string(journal), `"type":"run.canceled"`) {
+		t.Fatalf("cancel journal has no run.canceled event:\n%s", journal)
+	}
+	for _, row := range suite.runRows(t) {
+		if row.Task == key && row.State == "running" {
+			t.Fatalf("run still running after cancel: %+v", row)
 		}
 	}
 }
