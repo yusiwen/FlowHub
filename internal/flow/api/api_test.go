@@ -135,6 +135,17 @@ func TestTokenIsRequired(t *testing.T) {
 	}
 }
 
+func TestCancelWithoutHandlerReturns503(t *testing.T) {
+	f := newFixture(t, "sekret")
+	req := httptest.NewRequest(http.MethodPost, "/hub/v1/runs/run_1/cancel", nil)
+	req.Header.Set("Authorization", "Bearer sekret")
+	recorder := httptest.NewRecorder()
+	f.handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestFlowsAndDefinition(t *testing.T) {
 	f := newFixture(t, "sekret")
 	if err := f.modes.Set(f.flowID, mode.Shadow, nil, "test"); err != nil {

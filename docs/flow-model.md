@@ -647,7 +647,11 @@ All under `/hub/v1` on the main listener, all requiring
 
 M2 adds `POST /hub/v1/flows/{id}/deployment` (`off|shadow|on`, project scope) and
 `POST /hub/v1/runs/{id}/cancel`. `on` answers `409` when the service was started
-without the task service. There is no `PUT`/`DELETE` for the builtin flow.
+without the task service. A cancel stops an active run: the run becomes `canceled`,
+its running step becomes `interrupted` with `canceled by operator`, and the journal
+gets `run.canceled`; a terminal run (or a run not active in this process) answers
+`409`. A canceled turn is not retried, and the task row keeps the interruption.
+There is no `PUT`/`DELETE` for the builtin flow.
 
 - Errors are JSON: `{"error": "...", "details": [{"path": "...", "message": "..."}]}`
   with `400`/`401`/`404`/`409`/`503`. Unlike the webhook entry, the caller is a

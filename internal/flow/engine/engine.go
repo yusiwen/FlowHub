@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -100,7 +101,22 @@ type Engine struct {
 	dropped   atomic.Int64
 	runs      atomic.Int64
 	failed    atomic.Int64
+
+	// active holds the cancel function for each run this process is executing.
+	// canceled survives the run's state save so a cancellation racing the final
+	// failure path still wins and records canceled, not failed.
+	activeMu sync.Mutex
+	active   map[string]context.CancelFunc
+	canceled map[string]bool
+	cancelMu sync.Mutex
 }
+
+// Cancel refuses when the run is not active in this process. It is separate from
+// not-cancelable (a terminal run) so the API can answer 409 without guessing.
+var (
+	ErrRunNotActive     = errors.New("run is not active in this process")
+	ErrRunNotCancelable = errors.New("run is not cancelable")
+)
 
 // New validates the options, opens the run store and recovers in-flight runs.
 func New(opts Options) (*Engine, error) {
@@ -134,14 +150,16 @@ func New(opts Options) (*Engine, error) {
 		opts.Logger.Warn("flow runs interrupted by the restart were marked needs_attention", "runs", recovered)
 	}
 	engine := &Engine{
-		opts:   opts,
-		log:    opts.Logger,
-		store:  store,
-		now:    opts.Now,
-		queue:  make(chan upstream.Event, opts.QueueSize),
-		done:   make(chan struct{}),
-		seen:   map[string]bool{},
-		queued: map[string]bool{},
+		opts:     opts,
+		log:      opts.Logger,
+		store:    store,
+		now:      opts.Now,
+		queue:    make(chan upstream.Event, opts.QueueSize),
+		done:     make(chan struct{}),
+		seen:     map[string]bool{},
+		queued:   map[string]bool{},
+		active:   map[string]context.CancelFunc{},
+		canceled: map[string]bool{},
 	}
 	if err := engine.loadCursor(); err != nil {
 		return nil, err
@@ -272,6 +290,82 @@ func (e *Engine) catchUp(ctx context.Context) {
 	}
 }
 
+// Cancel stops an active run and records it canceled. The cancel function is
+// registered as soon as the run meta exists; a run that has already reached a
+// terminal state (or is no longer active here) is refused with 409.
+func (e *Engine) Cancel(runID string) (*Run, error) {
+	if e == nil || runID == "" {
+		return nil, fmt.Errorf("engine: a run id is required")
+	}
+	run, err := e.store.Load(runID)
+	if err != nil {
+		return nil, err
+	}
+	if run.State != StateRunning {
+		return run, ErrRunNotCancelable
+	}
+	e.activeMu.Lock()
+	stop, ok := e.active[runID]
+	if ok {
+		e.canceled[runID] = true
+	}
+	e.activeMu.Unlock()
+	if !ok {
+		return run, ErrRunNotActive
+	}
+	stop()
+	return e.finishCanceled(run)
+}
+
+func (e *Engine) isCanceled(runID string) bool {
+	e.activeMu.Lock()
+	defer e.activeMu.Unlock()
+	return e.canceled[runID]
+}
+
+// finishCanceled is idempotent. It marks any running step interrupted, records
+// the terminal state and journals both the cancellation and the finish. It may be
+// called by the API while the worker is still unwinding and again by the worker;
+// the second call observes canceled and does nothing.
+func (e *Engine) finishCanceled(run *Run) (*Run, error) {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	if run == nil {
+		return nil, fmt.Errorf("engine: no run to cancel")
+	}
+	if run.State == StateCanceled {
+		return run, nil
+	}
+	e.activeMu.Lock()
+	canceled := e.canceled[run.ID]
+	e.activeMu.Unlock()
+	if !canceled && run.State != StateRunning && run.State != StateWaiting {
+		return run, ErrRunNotCancelable
+	}
+	now := e.now().UTC()
+	const reason = "canceled by operator"
+	for _, step := range run.Steps {
+		if step.State == StepRunning {
+			step.State = StepInterrupted
+			step.Error = reason
+			step.FinishedAt = &now
+		}
+	}
+	run.State = StateCanceled
+	run.Error = reason
+	run.FinishedAt = &now
+	if err := e.store.Append(run.ID, "run.canceled", map[string]any{"reason": reason}); err != nil {
+		return run, err
+	}
+	if err := e.store.Append(run.ID, "run.finished", map[string]any{"state": StateCanceled, "error": reason}); err != nil {
+		return run, err
+	}
+	if err := e.store.Save(run); err != nil {
+		return run, err
+	}
+	return run, nil
+}
+
 func (e *Engine) finish(event upstream.Event) {
 	if event.ID == "" {
 		return
@@ -347,6 +441,11 @@ func (e *Engine) RunEvent(event upstream.Event) (*Run, error) {
 // context so an `on` turn is cancelled on shutdown.
 func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (run *Run, err error) {
 	defer func() {
+		if run != nil {
+			e.activeMu.Lock()
+			delete(e.canceled, run.ID)
+			e.activeMu.Unlock()
+		}
 		e.finish(event)
 		if err == nil && !e.paused() {
 			e.advance(event)
@@ -389,6 +488,13 @@ func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (run
 	e.mu.Unlock()
 
 	run, err = e.run(ctx, event, trigger, deployment)
+	if run != nil && e.isCanceled(run.ID) {
+		if _, finishErr := e.finishCanceled(run); finishErr != nil {
+			return run, finishErr
+		}
+		e.runs.Add(1)
+		return run, nil
+	}
 	if err != nil {
 		e.failed.Add(1)
 		return run, err
@@ -439,6 +545,16 @@ func (e *Engine) run(ctx context.Context, event upstream.Event, trigger *flow.Co
 	if err := e.store.Create(run); err != nil {
 		return run, err
 	}
+	runCtx, stop := context.WithCancel(ctx)
+	e.activeMu.Lock()
+	e.active[run.ID] = stop
+	e.activeMu.Unlock()
+	defer func() {
+		stop()
+		e.activeMu.Lock()
+		delete(e.active, run.ID)
+		e.activeMu.Unlock()
+	}()
 	if err := e.store.Append(run.ID, "run.started", map[string]any{
 		"flow": run.Flow, "trigger": run.Trigger, "event_id": event.ID,
 	}); err != nil {
@@ -473,8 +589,14 @@ func (e *Engine) run(ctx context.Context, event upstream.Event, trigger *flow.Co
 		if err != nil {
 			return e.failStep(run, step, err)
 		}
-		outcome, err := e.execute(ctx, node, event, context, views, live)
+		if e.isCanceled(run.ID) {
+			return e.finishCanceled(run)
+		}
+		outcome, err := e.execute(runCtx, node, event, context, views, live)
 		if err != nil {
+			if e.isCanceled(run.ID) {
+				return e.finishCanceled(run)
+			}
 			return e.failStep(run, step, err)
 		}
 		step.Output = outcome.output
