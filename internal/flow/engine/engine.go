@@ -59,6 +59,10 @@ type Options struct {
 	ReplaySource func(after string) ([]upstream.Event, error)
 	// ReplayInterval bounds how long a dropped event can wait; zero means 5s.
 	ReplayInterval time.Duration
+	// MaxConcurrent is the number of distinct tasks the scheduler may run at
+	// once. Events for one task stay serialized in arrival order. Zero means 1.
+	// The task service still enforces its per-runtime capacity.
+	MaxConcurrent int
 	// PauseFile is the dispatch kill switch; an `on` flow must honour it too.
 	PauseFile string
 	// MaxCostPerTask stops an `on` turn whose task has already spent this much.
@@ -84,9 +88,23 @@ type Engine struct {
 	store *Store
 	now   func() time.Time
 
-	queue chan upstream.Event
-	done  chan struct{}
-	wg    sync.WaitGroup
+	queue    chan upstream.Event
+	done     chan struct{}
+	taskDone chan string
+	wg       sync.WaitGroup
+	workers  sync.WaitGroup
+
+	// Scheduler state. pending holds the events for each task in arrival order;
+	// active is the set of tasks with a worker. MaxConcurrent bounds active, so a
+	// long turn cannot starve every other task.
+	schedMu      sync.Mutex
+	pending      map[string][]scheduledEvent
+	runningTasks map[string]bool
+
+	startMu    sync.Mutex
+	startSeq   uint64
+	startOrder []startEntry
+	started    map[uint64]bool
 
 	mu     sync.Mutex
 	closed bool
@@ -138,6 +156,12 @@ func New(opts Options) (*Engine, error) {
 	if opts.ReplayInterval <= 0 {
 		opts.ReplayInterval = 5 * time.Second
 	}
+	if opts.MaxConcurrent <= 0 {
+		opts.MaxConcurrent = 1
+	}
+	if opts.MaxConcurrent > 64 {
+		opts.MaxConcurrent = 64
+	}
 	store, err := NewStore(opts.DataDir)
 	if err != nil {
 		return nil, err
@@ -150,16 +174,20 @@ func New(opts Options) (*Engine, error) {
 		opts.Logger.Warn("flow runs interrupted by the restart were marked needs_attention", "runs", recovered)
 	}
 	engine := &Engine{
-		opts:     opts,
-		log:      opts.Logger,
-		store:    store,
-		now:      opts.Now,
-		queue:    make(chan upstream.Event, opts.QueueSize),
-		done:     make(chan struct{}),
-		seen:     map[string]bool{},
-		queued:   map[string]bool{},
-		active:   map[string]context.CancelFunc{},
-		canceled: map[string]bool{},
+		opts:         opts,
+		log:          opts.Logger,
+		store:        store,
+		now:          opts.Now,
+		queue:        make(chan upstream.Event, opts.QueueSize),
+		done:         make(chan struct{}),
+		taskDone:     make(chan string, opts.MaxConcurrent),
+		seen:         map[string]bool{},
+		queued:       map[string]bool{},
+		active:       map[string]context.CancelFunc{},
+		canceled:     map[string]bool{},
+		pending:      map[string][]scheduledEvent{},
+		runningTasks: map[string]bool{},
+		started:      map[uint64]bool{},
 	}
 	if err := engine.loadCursor(); err != nil {
 		return nil, err
@@ -167,7 +195,7 @@ func New(opts Options) (*Engine, error) {
 	return engine, nil
 }
 
-// Start runs the single worker until ctx is done or Close is called.
+// Start runs the scheduler until ctx is done or Close is called.
 func (e *Engine) Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	e.mu.Lock()
@@ -176,20 +204,7 @@ func (e *Engine) Start(ctx context.Context) {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case event, ok := <-e.queue:
-				if !ok {
-					return
-				}
-				if _, err := e.RunEventContext(ctx, event); err != nil {
-					e.failed.Add(1)
-					e.log.Error("flow run failed", "event", event.ID, "error", err)
-				}
-			}
-		}
+		e.schedule(ctx)
 	}()
 	if e.opts.ReplaySource != nil {
 		e.wg.Add(1)
@@ -375,6 +390,176 @@ func (e *Engine) finish(event upstream.Event) {
 	e.mu.Unlock()
 }
 
+type scheduledEvent struct {
+	seq   uint64
+	event upstream.Event
+}
+
+type startEntry struct {
+	seq uint64
+	id  string
+}
+
+// assignOrder records the scheduler's receive order. Cursor advancement uses
+// this order, not worker completion order: parallel runs finish out of order.
+func (e *Engine) assignOrder(event upstream.Event) uint64 {
+	e.startMu.Lock()
+	// A paused event is consumed without advancing the cursor. Its old order
+	// entry stays at the head so later events cannot jump over it; when catch-up
+	// replays the same event id, replace that entry rather than blocking forever.
+	if event.ID != "" {
+		kept := e.startOrder[:0]
+		for _, entry := range e.startOrder {
+			if entry.id == event.ID {
+				delete(e.started, entry.seq)
+				continue
+			}
+			kept = append(kept, entry)
+		}
+		e.startOrder = kept
+	}
+	e.startSeq++
+	seq := e.startSeq
+	e.startOrder = append(e.startOrder, startEntry{seq: seq, id: event.ID})
+	e.started[seq] = false
+	e.startMu.Unlock()
+	return seq
+}
+
+// markStarted advances the cursor over the contiguous prefix of events that
+// have reached the point where their run exists (or their event was ignored).
+// An event that has not started blocks later events from advancing it.
+func (e *Engine) markStarted(seq uint64) {
+	if seq == 0 {
+		return
+	}
+	e.startMu.Lock()
+	if e.started[seq] {
+		e.startMu.Unlock()
+		return
+	}
+	e.started[seq] = true
+	last := ""
+	for len(e.startOrder) > 0 && e.started[e.startOrder[0].seq] {
+		last = e.startOrder[0].id
+		delete(e.started, e.startOrder[0].seq)
+		e.startOrder = e.startOrder[1:]
+	}
+	e.startMu.Unlock()
+	if last != "" {
+		if err := e.SetCursor(last); err != nil {
+			e.log.Warn("could not advance the flow replay cursor", "event", last, "error", err)
+		}
+	}
+}
+
+// schedule is the only reader of e.queue. It groups events by task and starts
+// one worker per task, up to MaxConcurrent. A task's events stay in arrival
+// order; different tasks may run in parallel, bounded by the task service's
+// per-runtime capacity as well.
+func (e *Engine) schedule(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-e.queue:
+			if !ok {
+				return
+			}
+			e.scheduleEvent(ctx, event)
+		case key := <-e.taskDone:
+			e.schedMu.Lock()
+			delete(e.runningTasks, key)
+			start := e.startReadyLocked(ctx)
+			e.schedMu.Unlock()
+			e.launch(ctx, start)
+		}
+	}
+}
+
+func (e *Engine) scheduleEvent(ctx context.Context, event upstream.Event) {
+	if ctx.Err() != nil {
+		return
+	}
+	key := flowTaskKey(event)
+	order := e.assignOrder(event)
+	e.schedMu.Lock()
+	e.pending[key] = append(e.pending[key], scheduledEvent{seq: order, event: event})
+	start := e.startReadyLocked(ctx)
+	e.schedMu.Unlock()
+	e.launch(ctx, start)
+}
+
+// startReadyLocked marks pending tasks active while a slot is free. The caller
+// holds schedMu. It does not start goroutines while holding the lock.
+func (e *Engine) startReadyLocked(ctx context.Context) []string {
+	var start []string
+	if ctx.Err() != nil {
+		return start
+	}
+	for key, queue := range e.pending {
+		if len(queue) == 0 {
+			delete(e.pending, key)
+			continue
+		}
+		if e.runningTasks[key] {
+			continue
+		}
+		if len(e.runningTasks) >= e.opts.MaxConcurrent {
+			break
+		}
+		e.runningTasks[key] = true
+		start = append(start, key)
+	}
+	return start
+}
+
+func (e *Engine) launch(ctx context.Context, keys []string) {
+	for _, key := range keys {
+		e.workers.Add(1)
+		go e.runTask(ctx, key)
+	}
+}
+
+func (e *Engine) runTask(ctx context.Context, key string) {
+	defer e.workers.Done()
+	for {
+		e.schedMu.Lock()
+		queue := e.pending[key]
+		if len(queue) == 0 {
+			delete(e.pending, key)
+			e.schedMu.Unlock()
+			select {
+			case e.taskDone <- key:
+			case <-ctx.Done():
+			}
+			return
+		}
+		item := queue[0]
+		e.pending[key] = queue[1:]
+		e.schedMu.Unlock()
+
+		if _, err := e.runEventContext(ctx, item.event, item.seq); err != nil {
+			e.failed.Add(1)
+			e.log.Error("flow run failed", "event", item.event.ID, "error", err)
+		}
+		if ctx.Err() != nil {
+			e.schedMu.Lock()
+			delete(e.pending, key)
+			delete(e.runningTasks, key)
+			e.schedMu.Unlock()
+			return
+		}
+	}
+}
+
+func flowTaskKey(event upstream.Event) string {
+	if event.Subject.Key != "" {
+		return event.Upstream + "\x00" + event.Subject.Key
+	}
+	return event.ID
+}
+
 func (e *Engine) Close() error {
 	if e == nil {
 		return nil
@@ -392,6 +577,7 @@ func (e *Engine) Close() error {
 		cancel()
 	}
 	e.wg.Wait()
+	e.workers.Wait()
 	close(e.done)
 	return nil
 }
@@ -401,6 +587,10 @@ func (e *Engine) Snapshot() map[string]any {
 	if e == nil {
 		return map[string]any{"enabled": false}
 	}
+	e.schedMu.Lock()
+	activeTasks := len(e.runningTasks)
+	pendingTasks := len(e.pending)
+	e.schedMu.Unlock()
 	return map[string]any{
 		"enabled":           true,
 		"mode":              "shadow",
@@ -410,6 +600,9 @@ func (e *Engine) Snapshot() map[string]any {
 		"runs":              e.runs.Load(),
 		"failed":            e.failed.Load(),
 		"on_available":      e.CanExecuteOn(),
+		"concurrency":       e.opts.MaxConcurrent,
+		"active_tasks":      activeTasks,
+		"pending_tasks":     pendingTasks,
 		"pending":           e.pendingCompare(),
 		"shadow_compared":   e.compareCounts(),
 		"shadow_mismatches": e.compareMismatches(),
@@ -439,7 +632,11 @@ func (e *Engine) RunEvent(event upstream.Event) (*Run, error) {
 
 // RunEventContext executes one event synchronously. The worker passes its own
 // context so an `on` turn is cancelled on shutdown.
-func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (run *Run, err error) {
+func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (*Run, error) {
+	return e.runEventContext(ctx, event, 0)
+}
+
+func (e *Engine) runEventContext(ctx context.Context, event upstream.Event, order uint64) (run *Run, err error) {
 	defer func() {
 		if run != nil {
 			e.activeMu.Lock()
@@ -447,12 +644,15 @@ func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (run
 			e.activeMu.Unlock()
 		}
 		e.finish(event)
-		if err == nil && !e.paused() {
+		if order == 0 && err == nil && !e.paused() {
 			e.advance(event)
 		}
 	}()
 	deployment := e.modeFor(event)
 	if deployment == mode.Off || deployment == "" {
+		if order != 0 {
+			e.markStarted(order)
+		}
 		return nil, nil
 	}
 	if e.paused() {
@@ -466,28 +666,40 @@ func (e *Engine) RunEventContext(ctx context.Context, event upstream.Event) (run
 		if !e.authorAllowed(event) {
 			e.log.Warn("actor is not on the project's author allowlist; flow delivery ignored",
 				"issue", event.Subject.Key, "project", event.Subject.Project, "actor", event.Actor.Login)
+			if order != 0 {
+				e.markStarted(order)
+			}
 			return nil, nil
 		}
 		if task, known := e.task(event); known && e.opts.MaxCostPerTask > 0 && task.Cost >= e.opts.MaxCostPerTask {
 			e.log.Warn("task exceeded its cost budget; a human must take over",
 				"issue", event.Subject.Key, "cost", task.Cost, "budget", e.opts.MaxCostPerTask)
+			if order != 0 {
+				e.markStarted(order)
+			}
 			return nil, nil
 		}
 	}
 	trigger := e.triggerFor(event)
 	if trigger == nil {
+		if order != 0 {
+			e.markStarted(order)
+		}
 		return nil, nil
 	}
 	key := e.opts.Flow.Definition.ID + "\x00" + trigger.Trigger.ID + "\x00" + event.ID
 	e.mu.Lock()
 	if e.seen[key] {
 		e.mu.Unlock()
+		if order != 0 {
+			e.markStarted(order)
+		}
 		return nil, nil
 	}
 	e.seen[key] = true
 	e.mu.Unlock()
 
-	run, err = e.run(ctx, event, trigger, deployment)
+	run, err = e.run(ctx, event, trigger, deployment, order)
 	if run != nil && e.isCanceled(run.ID) {
 		if _, finishErr := e.finishCanceled(run); finishErr != nil {
 			return run, finishErr
@@ -521,7 +733,7 @@ type liveExecution struct {
 	basis  string
 }
 
-func (e *Engine) run(ctx context.Context, event upstream.Event, trigger *flow.CompiledTrigger, deployment string) (*Run, error) {
+func (e *Engine) run(ctx context.Context, event upstream.Event, trigger *flow.CompiledTrigger, deployment string, order uint64) (*Run, error) {
 	now := e.now().UTC()
 	revision := sha256.Sum256(e.opts.Definition)
 	run := &Run{
@@ -563,11 +775,14 @@ func (e *Engine) run(ctx context.Context, event upstream.Event, trigger *flow.Co
 	if err := e.store.Save(run); err != nil {
 		return run, err
 	}
-	// Advance before the graph runs: a crash in the middle leaves a run that the
-	// store recovery will mark needs_attention, not an event that gets replayed
-	// into a second run.
-	e.advance(event)
-
+	// The run exists before the cursor advances, so a crash mid-turn leaves a run
+	// for recovery instead of losing the event. markStarted waits for earlier
+	// scheduler-order events, which is what keeps parallel runs from skipping.
+	if order != 0 {
+		e.markStarted(order)
+	} else {
+		e.advance(event)
+	}
 	tasks, views := e.projections(event)
 	steps := map[string]map[string]any{}
 	current := e.opts.Flow.Start

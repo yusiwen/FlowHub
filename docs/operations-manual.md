@@ -666,6 +666,7 @@ what a human reviews and pushes.
 | `FLOWHUB_OPENCODE_REQUEST_TIMEOUT` | `30s` | How long **one HTTP request** may take. Not the turn budget: a host that accepts the connection and then says nothing must not hold a worker for the whole turn |
 | `FLOWHUB_TASK_MAX_COST` | `0` | Stop a task whose accumulated cost passes this many dollars. `0` disables it |
 | `FLOWHUB_DISPATCH_QUEUE` | `32` | Deliveries waiting per runtime; a full queue **drops** rather than blocking the publisher |
+| `FLOWHUB_FLOW_CONCURRENCY` | `4` | Distinct flow tasks running at once, `1`..`64`; events for one task stay serialized |
 
 Set `FLOWHUB_TASK_MAX_COST` to something small for the first weeks. A one-file
 change measures around half a cent; a runaway loop costs far more.

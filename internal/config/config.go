@@ -49,7 +49,11 @@ const (
 	DefaultOpenCodeURL   = "http://127.0.0.1:4096"
 	DefaultDispatchAgent = "devops"
 	DefaultDispatchQueue = 32
-	DefaultTaskDeadline  = 15 * time.Minute
+	// DefaultFlowConcurrency lets the flow scheduler serve several distinct
+	// tasks at once. One task's events remain serialized; the task service still
+	// applies its per-runtime capacity.
+	DefaultFlowConcurrency = 4
+	DefaultTaskDeadline    = 15 * time.Minute
 	// DefaultFirstResponse bounds how long a turn may take to produce its first
 	// assistant message. It is far below the task deadline on purpose: the failure
 	// it catches (a prompt the agent server never admits) is immediate, and a turn
@@ -209,6 +213,11 @@ type Config struct {
 	// full queue drops work instead of blocking the publisher's request.
 	DispatchQueueSize int
 
+	// FlowConcurrency bounds how many distinct flow tasks may run at once. A
+	// single task's events stay serialized; the task service still enforces its
+	// per-runtime capacity. It is 1..64.
+	FlowConcurrency int
+
 	// TaskDeadline bounds one opencode turn. A deadline is not a failure: the
 	// session keeps running and the task is marked executing.
 	TaskDeadline time.Duration
@@ -362,6 +371,9 @@ func Load() (Config, error) {
 	if cfg.DispatchQueueSize, err = envInt("FLOWHUB_DISPATCH_QUEUE", DefaultDispatchQueue); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_DISPATCH_QUEUE: %w", err)
 	}
+	if cfg.FlowConcurrency, err = envInt("FLOWHUB_FLOW_CONCURRENCY", DefaultFlowConcurrency); err != nil {
+		return Config{}, fmt.Errorf("FLOWHUB_FLOW_CONCURRENCY: %w", err)
+	}
 	if cfg.MaxTurns, err = envInt("FLOWHUB_MAX_TURNS", DefaultMaxTurns); err != nil {
 		return Config{}, fmt.Errorf("FLOWHUB_MAX_TURNS: %w", err)
 	}
@@ -479,6 +491,9 @@ func (c Config) validate() error {
 	}
 	if c.DispatchQueueSize <= 0 {
 		return fmt.Errorf("FLOWHUB_DISPATCH_QUEUE must be positive, got %d", c.DispatchQueueSize)
+	}
+	if c.FlowConcurrency < 1 || c.FlowConcurrency > 64 {
+		return fmt.Errorf("FLOWHUB_FLOW_CONCURRENCY must be between 1 and 64, got %d", c.FlowConcurrency)
 	}
 	if c.TaskDeadline <= 0 {
 		return fmt.Errorf("FLOWHUB_TASK_DEADLINE must be positive, got %s", c.TaskDeadline)
@@ -764,6 +779,7 @@ func (c Config) Report() string {
 	fmt.Fprintf(&b, "opencode_auth:      %s\n", authReport(c))
 	fmt.Fprintf(&b, "dispatch_agent:     %s\n", c.DispatchAgent)
 	fmt.Fprintf(&b, "dispatch_queue:     %d\n", c.DispatchQueueSize)
+	fmt.Fprintf(&b, "flow_concurrency:   %d\n", c.FlowConcurrency)
 	fmt.Fprintf(&b, "task_deadline:      %s\n", c.TaskDeadline)
 	fmt.Fprintf(&b, "first_response:     %s\n", c.FirstResponse)
 	fmt.Fprintf(&b, "shell_wrappers:     %s (env default; a runtime block overrides it)\n", orNone(strings.Join(c.ShellWrappers, ",")))

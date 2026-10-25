@@ -24,6 +24,9 @@ func TestDispatchIsOffByDefault(t *testing.T) {
 	if cfg.DispatchQueueSize != DefaultDispatchQueue {
 		t.Fatalf("queue = %d", cfg.DispatchQueueSize)
 	}
+	if cfg.FlowConcurrency != DefaultFlowConcurrency {
+		t.Fatalf("flow concurrency = %d", cfg.FlowConcurrency)
+	}
 	if cfg.TaskDeadline != DefaultTaskDeadline {
 		t.Fatalf("deadline = %s", cfg.TaskDeadline)
 	}
@@ -52,6 +55,7 @@ func TestLoadReadsDispatchEnvironment(t *testing.T) {
 	t.Setenv("FLOWHUB_OPENCODE_URL", "http://127.0.0.1:5000")
 	t.Setenv("FLOWHUB_DISPATCH_AGENT", "flowhub")
 	t.Setenv("FLOWHUB_DISPATCH_QUEUE", "4")
+	t.Setenv("FLOWHUB_FLOW_CONCURRENCY", "2")
 	t.Setenv("FLOWHUB_TASK_DEADLINE", "90s")
 	t.Setenv("FLOWHUB_MAX_TURNS", "3")
 	t.Setenv("FLOWHUB_TRIGGER", "/flowhub go")
@@ -69,7 +73,7 @@ func TestLoadReadsDispatchEnvironment(t *testing.T) {
 	if !cfg.Dispatch || cfg.OpenCodeURL != "http://127.0.0.1:5000" || cfg.DispatchAgent != "flowhub" {
 		t.Fatalf("dispatch settings = %+v", cfg)
 	}
-	if cfg.DispatchQueueSize != 4 || cfg.MaxTurns != 3 || cfg.TaskDeadline != 90*time.Second {
+	if cfg.DispatchQueueSize != 4 || cfg.FlowConcurrency != 2 || cfg.MaxTurns != 3 || cfg.TaskDeadline != 90*time.Second {
 		t.Fatalf("limits = %d/%d/%s", cfg.DispatchQueueSize, cfg.MaxTurns, cfg.TaskDeadline)
 	}
 	if cfg.Trigger != "/flowhub go" {
@@ -95,6 +99,8 @@ func TestLoadRejectsBadDispatchValues(t *testing.T) {
 	}{
 		{"FLOWHUB_DISPATCH", "maybe", "FLOWHUB_DISPATCH"},
 		{"FLOWHUB_DISPATCH_QUEUE", "0", "FLOWHUB_DISPATCH_QUEUE"},
+		{"FLOWHUB_FLOW_CONCURRENCY", "0", "FLOWHUB_FLOW_CONCURRENCY"},
+		{"FLOWHUB_FLOW_CONCURRENCY", "65", "FLOWHUB_FLOW_CONCURRENCY"},
 		{"FLOWHUB_MAX_TURNS", "-1", "FLOWHUB_MAX_TURNS"},
 		{"FLOWHUB_TASK_DEADLINE", "-5s", "FLOWHUB_TASK_DEADLINE"},
 		{"FLOWHUB_TASK_MAX_COST", "free", "FLOWHUB_TASK_MAX_COST"},
