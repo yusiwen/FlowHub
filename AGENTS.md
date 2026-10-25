@@ -23,8 +23,8 @@ the desktop. A real E2E harness under `e2e/` (build tag `e2e`, `make e2e`) drive
 the self-hosted YouTrack TEST project and local opencode; it is opt-in and never
 part of `make test`. `/hub/v1` exposes the definition and runs to the
 desktop under `FLOWHUB_HUB_TOKEN`, and `flowhub flow list|show|mode` is the local
-operator switch (`off`/`shadow`/`on`; `on` needs `FLOWHUB_DISPATCH=1` so the
-shared task service can execute turns).
+operator switch (`off`/`shadow`/`on`; `on` can run without `FLOWHUB_DISPATCH=1`; the dispatcher object is then constructed only
+as the shared task service/selector, not as an intake worker).
 
 The documents below are the specification — read the relevant section before
 changing behaviour:

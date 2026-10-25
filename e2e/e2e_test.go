@@ -31,6 +31,7 @@ type env struct {
 	baseURL     string
 	addr        string
 	live        bool
+	dispatch    bool
 	hookKey     string
 	hookToken   string
 	hubToken    string
@@ -66,6 +67,7 @@ func TestMain(m *testing.M) {
 func setup() *env {
 	e := &env{
 		live:        os.Getenv("FLOWHUB_E2E_LIVE") == "1",
+		dispatch:    true,
 		hookKey:     os.Getenv("FLOWHUB_HOOK_KEY"),
 		hookToken:   os.Getenv("FLOWHUB_TOKEN"),
 		hubToken:    fmt.Sprintf("e2e-%d", time.Now().UnixNano()),
@@ -142,7 +144,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" || os.Getenv("E2E_ON_RESTART") == "1" || os.Getenv("E2E_AGED_CURSOR") == "1" || os.Getenv("E2E_REBIND") == "1" || os.Getenv("E2E_CAPACITY") == "1" || os.Getenv("E2E_CANCEL") == "1" || os.Getenv("E2E_FLOW_CONCURRENCY") == "1" || os.Getenv("E2E_FLOW_SERIAL") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" || os.Getenv("E2E_ON_RESTART") == "1" || os.Getenv("E2E_AGED_CURSOR") == "1" || os.Getenv("E2E_REBIND") == "1" || os.Getenv("E2E_CAPACITY") == "1" || os.Getenv("E2E_CANCEL") == "1" || os.Getenv("E2E_FLOW_CONCURRENCY") == "1" || os.Getenv("E2E_FLOW_SERIAL") == "1" || os.Getenv("E2E_FLOW_NO_DISPATCH") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -169,6 +171,10 @@ func (e *env) start() {
 func (e *env) command() *exec.Cmd {
 	cmd := exec.Command(e.binary)
 	cmd.Dir = repoRoot()
+	dispatch := "0"
+	if e.dispatch {
+		dispatch = "1"
+	}
 	env := []string{
 		"FLOWHUB_ENV_FILE=-",
 		"FLOWHUB_ADDR=" + e.addr,
@@ -177,7 +183,7 @@ func (e *env) command() *exec.Cmd {
 		"FLOWHUB_HOOK_KEY=" + e.hookKey,
 		"FLOWHUB_TOKEN=" + e.hookToken,
 		"FLOWHUB_HUB_TOKEN=" + e.hubToken,
-		"FLOWHUB_DISPATCH=1",
+		"FLOWHUB_DISPATCH=" + dispatch,
 		"FLOWHUB_OPENCODE_URL=" + e.ocBase,
 		"FLOWHUB_ALLOWED_SOURCES=127.0.0.1,10.1.0.1",
 		"FLOWHUB_PAUSE_FILE=" + filepath.Join(e.dir, "DISPATCH_OFF"),
@@ -2194,7 +2200,9 @@ func TestAPIAuthAndInvalidDeployment(t *testing.T) {
 	suite.hubToken = originalToken
 
 	// on cannot be stored when the process has no task service.
-	suite.extraEnv = []string{"FLOWHUB_DISPATCH=0"}
+	suite.extraEnv = nil
+	suite.dispatch = false
+	t.Cleanup(func() { suite.dispatch = true })
 	suite.start()
 	if status, body := suite.apiRequest(t, http.MethodPost, base+"/deployment", suite.hubToken, []byte(`{"mode":"on"}`)); status != http.StatusConflict {
 		t.Fatalf("on without task service status = %d, want 409 (%s)", status, body)
@@ -2285,6 +2293,54 @@ func TestActiveOnGracefulRestart(t *testing.T) {
 		if run.Task == key && run.State == "running" {
 			t.Fatalf("run still running after restart: %+v", run)
 		}
+	}
+}
+
+func TestFlowOnRunsWithoutDispatchIntake(t *testing.T) {
+	if os.Getenv("E2E_FLOW_NO_DISPATCH") != "1" {
+		t.Skip("set E2E_FLOW_NO_DISPATCH=1 to run flow on with dispatch intake off")
+	}
+	if suite.live {
+		t.Skip("flow no-dispatch uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = nil
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	server := fake.start()
+	t.Cleanup(server.Close)
+	suite.pointAtRuntime(t, server.URL)
+	suite.dispatch = true
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("on", []string{suite.ytProject}); err != nil {
+		t.Fatalf("set on: %v", err)
+	}
+	suite.stop()
+	suite.dispatch = false
+	t.Cleanup(func() { suite.dispatch = true })
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	key := "TEST-FLOW-NOD-" + suffix
+	t.Cleanup(func() { suite.removeTestWorktree(key) })
+	summary := "FlowHub flow no-dispatch " + suffix
+	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Flow without dispatch E2E.", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("webhook = %d", status)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && fake.promptCount() < 1 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() != 1 {
+		t.Fatalf("flow did not run with dispatch intake off: prompts=%d", fake.promptCount())
+	}
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Turns == 1 && row.State == "awaiting_input"
+	}, 30*time.Second)
+	if row.Session == "" {
+		t.Fatalf("flow task has no session: %+v", row)
 	}
 }
 

@@ -83,12 +83,10 @@ func runFlowCommand(args []string, stdout, stderr io.Writer) int {
 		switch next {
 		case mode.Off, mode.Shadow:
 		case mode.On:
-			if !dispatchEnabled() {
-				fmt.Fprintln(stderr, "flowhub flow mode: on needs FLOWHUB_DISPATCH=1 and the task service; use off or shadow")
-				return 1
-			}
+			// The service builds the shared task service and selector when the
+			// persisted mode is on; FLOWHUB_DISPATCH is not required.
 		default:
-			fmt.Fprintln(stderr, "flowhub flow mode: mode must be off or shadow")
+			fmt.Fprintln(stderr, "flowhub flow mode: mode must be off, shadow or on")
 			return 1
 		}
 		projects := []string{}
@@ -112,15 +110,6 @@ func runFlowCommand(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func dispatchEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("FLOWHUB_DISPATCH"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
-
 func flowUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: flowhub flow list|show <id>|mode <id> <off|shadow> [--project KEY]...")
+	fmt.Fprintln(w, "usage: flowhub flow list|show <id>|mode <id> <off|shadow|on> [--project KEY]...")
 }

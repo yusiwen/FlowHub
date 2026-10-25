@@ -1173,9 +1173,10 @@ picture.
 | `~/.config/opencode/opencode.json` | you (+ `runtime init` prints a snippet) | MCP servers; holds `{env:...}` references, never values |
 | `~/.config/flowhub/runtime.json` | `runtime init --token` | this host's runtime identity (mode 0600) |
 
-`on` requires `FLOWHUB_DISPATCH=1`: dispatch is the task service and the runtime
-inventory, and it skips the projects the flow owns. A flow-only process can run
-shadow but cannot execute `on`.
+`on` no longer requires `FLOWHUB_DISPATCH=1`: when `on` is persisted before start,
+FlowHub constructs the shared task service and runtime selector without starting
+dispatch intake. A flow-only process can execute `on`; dispatch still owns the
+projects the flow does not.
 
 The event log is the only file written on the request path: it is appended
 **before** the `202` (no fsync). If the append fails, the receiver answers `503`,

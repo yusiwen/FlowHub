@@ -393,7 +393,8 @@ Deployment is state, not definition:
 - A missing file means every flow is `off`. The builtin flow is never deleted.
 - M1 supports `off` and `shadow`; M2-2 adds the project-scoped deployment schema
   and a token-authenticated `POST /hub/v1/flows/{id}/deployment` (the CLI writes
-  the same file). `on` requires the shared task service and `FLOWHUB_DISPATCH=1`:
+  the same file). `on` requires the shared task service; when it is persisted before
+  start, FlowHub builds that service and the selector without starting dispatch intake:
   dispatch skips the projects the flow owns, and the flow engine executes
   `task.ensure`/`task.turn`/`task.grant`/`task.revoke` through that service.
 

@@ -41,11 +41,15 @@ func TestFlowCommandLifecycle(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := runFlowCommand([]string{"mode", "default-youtrack", "on"}, &stdout, &stderr); code == 0 {
-		t.Fatal("on must be refused until the task service exists")
+	if code := runFlowCommand([]string{"mode", "default-youtrack", "on"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("on code = %d, stderr = %s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "task service") {
-		t.Fatalf("on error = %q", stderr.String())
+	stdout.Reset()
+	if code := runFlowCommand([]string{"list"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("list code = %d", code)
+	}
+	if !strings.Contains(stdout.String(), "on") {
+		t.Fatalf("on list output = %q", stdout.String())
 	}
 	if code := runFlowCommand([]string{"show", "unknown"}, &stdout, &stderr); code == 0 {
 		t.Fatal("unknown flow must be refused")
@@ -55,9 +59,9 @@ func TestFlowCommandLifecycle(t *testing.T) {
 	}
 }
 
-func TestFlowModeOnNeedsDispatch(t *testing.T) {
+func TestFlowModeOnPersistsWithoutDispatch(t *testing.T) {
 	t.Setenv("FLOWHUB_DATA_DIR", t.TempDir())
-	t.Setenv("FLOWHUB_DISPATCH", "1")
+	t.Setenv("FLOWHUB_DISPATCH", "0")
 	var stdout, stderr bytes.Buffer
 	if code := runFlowCommand([]string{"mode", "default-youtrack", "on", "--project", "TEST"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("on code = %d, stderr = %s", code, stderr.String())

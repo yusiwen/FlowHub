@@ -651,7 +651,8 @@ path at startup, so the loader, the logs and `-print-config` all name the same
 file — whatever the working directory was. The committed template is
 `config/config.example.json`.
 
-A match becomes work only when `FLOWHUB_DISPATCH=1`. The dispatcher then turns
+A match becomes work only when `FLOWHUB_DISPATCH=1` (or an `on` flow deployment is
+persisted before start, which builds the shared task service without dispatch intake). The dispatcher then turns
 the match into a per-task git worktree, an opencode session bound to that
 directory, and a row in the task registry; an unmapped project is refused before
 any of that happens. See "The dispatch workflow" below.
