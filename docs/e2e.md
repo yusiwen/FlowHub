@@ -188,6 +188,20 @@ task service, and `on` without it (409):
 make e2e-api
 ```
 
+Flow concurrency (fake runtime): two distinct tasks, `FLOWHUB_FLOW_CONCURRENCY=2`
+and runtime `max_concurrent=2`, must produce two prompts in flight:
+
+```bash
+make e2e-flow-concurrency
+```
+
+Same-task serialization (fake runtime): two events for one task, one held turn; the
+second must wait and then run in the same session:
+
+```bash
+make e2e-flow-serial
+```
+
 Cancel (fake runtime): hold the execute prompt, `POST /hub/v1/runs/{id}/cancel`,
 assert `canceled`, `409` on a second cancel, no extra prompt, and a `run.canceled`
 journal event:
@@ -278,6 +292,8 @@ the Make targets are only wrappers around the suite.
 | SIGKILL during an `on` run; needs_attention, task failed, engine usable | `TestCrashDuringOnRun` | `make e2e-crash-on` |
 | ingress rejects + append 503 + dedupe release | `TestIngressRejectionsAndAppendFailure` | `make e2e-ingress` |
 | attachment download allow/deny + other known kinds | `TestAttachmentsAndOtherEventKinds` | `make e2e-attachments` |
+| flow runs two distinct tasks concurrently | `TestFlowConcurrentTasks` | `make e2e-flow-concurrency` |
+| flow serializes two events for one task | `TestFlowSameTaskSerializes` | `make e2e-flow-serial` |
 | cancel an active `on` run | `TestCancelStopsAnActiveRun` | `make e2e-cancel` |
 | repository rebind refusal | `TestRepositoryRebindRefused` | `make e2e-rebind` |
 | cross-task capacity saturation | `TestCrossTaskCapacitySaturation` | `make e2e-capacity` |

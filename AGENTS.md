@@ -314,9 +314,11 @@ documents. The rules below are load-bearing; do not relax them casually.
    written before the source seam existed is read as `youtrack` (the field is written
    the next time the task is touched). `internal/workspace/localworktree` creates the
    checkout. The flow engine also persists a replay cursor in
-   `<DataDir>/flow-cursor.json`: after a run is created (or an event is ignored) it
-   records the event id, and startup replays the durable log after it. A missing
-   cursor starts at the current tail; a paused delivery does not advance. A
+   `<DataDir>/flow-cursor.json`: once a run exists (or an event is ignored) it
+   records the event id in scheduler receive order, and startup replays the durable
+   log after it. Parallel runs cannot skip an earlier event that has not reached that
+   point. A missing cursor starts at the current tail; a paused delivery does not
+   advance. A
    periodic catch-up (default 5s) reads after the cursor and blocks until the queue
    accepts the missing events, so a running process recovers from a queue drop
    without waiting for a restart. The base commit is **pinned through
@@ -333,7 +335,9 @@ documents. The rules below are load-bearing; do not relax them casually.
    intake loop decides which runtime takes a delivery and hands it to that runtime's
    scheduler, which groups the deliveries by task and serves up to
    `runtimes.<name>.max_concurrent` *distinct* tasks at once (default 1, at most 64,
-   and never more than the host claimed at `init`). A task is never in two turns at
+   and never more than the host claimed at `init`). The flow scheduler has the same
+   shape: `FLOWHUB_FLOW_CONCURRENCY` distinct tasks (default 4), with one task's events
+   serialized. A task is never in two turns at
    once — a prompt sent to a busy session is silently swallowed, and a session belongs
    to one task for life — so a second delivery for a running task waits in its
    scheduler and runs when that turn ends; it is never dropped and never races the

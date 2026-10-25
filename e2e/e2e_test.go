@@ -142,7 +142,7 @@ func setup() *env {
 	if _, err := os.Stat(e.binary); err != nil {
 		fatalf("e2e: binary %s: %v (run make build)", e.binary, err)
 	}
-	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" || os.Getenv("E2E_ON_RESTART") == "1" || os.Getenv("E2E_AGED_CURSOR") == "1" || os.Getenv("E2E_REBIND") == "1" || os.Getenv("E2E_CAPACITY") == "1" || os.Getenv("E2E_CANCEL") == "1" {
+	if os.Getenv("E2E_SILENT") == "1" || os.Getenv("E2E_DOWN") == "1" || os.Getenv("E2E_POLICY") == "1" || os.Getenv("E2E_SERIALIZATION") == "1" || os.Getenv("E2E_CRASH_EXECUTE") == "1" || os.Getenv("E2E_CRASH_ON") == "1" || os.Getenv("E2E_INGRESS") == "1" || os.Getenv("E2E_ATTACHMENTS") == "1" || os.Getenv("E2E_LIMITS") == "1" || os.Getenv("E2E_FLOW_CONTROL") == "1" || os.Getenv("E2E_API") == "1" || os.Getenv("E2E_ON_RESTART") == "1" || os.Getenv("E2E_AGED_CURSOR") == "1" || os.Getenv("E2E_REBIND") == "1" || os.Getenv("E2E_CAPACITY") == "1" || os.Getenv("E2E_CANCEL") == "1" || os.Getenv("E2E_FLOW_CONCURRENCY") == "1" || os.Getenv("E2E_FLOW_SERIAL") == "1" {
 		// Failure-path tests start their own fake (or no) runtime; starting the real
 		// receiver first would make them depend on opencode.
 		return e
@@ -2284,6 +2284,125 @@ func TestActiveOnGracefulRestart(t *testing.T) {
 	for _, run := range suite.runRows(t) {
 		if run.Task == key && run.State == "running" {
 			t.Fatalf("run still running after restart: %+v", run)
+		}
+	}
+}
+
+func TestFlowSameTaskSerializes(t *testing.T) {
+	if os.Getenv("E2E_FLOW_SERIAL") != "1" {
+		t.Skip("set E2E_FLOW_SERIAL=1 to queue two events for one flow task")
+	}
+	if suite.live {
+		t.Skip("flow serialization uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = []string{"FLOWHUB_FLOW_CONCURRENCY=2"}
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	hold := make(chan struct{})
+	fake.setHold(hold)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.setRuntimeMaxConcurrent(t, 2)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("on", []string{suite.ytProject}); err != nil {
+		t.Fatalf("set on: %v", err)
+	}
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	key := "TEST-FLOW-SERIAL-" + suffix
+	t.Cleanup(func() { suite.removeTestWorktree(key) })
+	summary := "FlowHub flow serialization " + suffix
+	if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Flow serialization E2E.", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("issue webhook = %d", status)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && fake.promptCount() < 1 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() != 1 {
+		t.Fatalf("prompts = %d, want 1", fake.promptCount())
+	}
+	// A second event for the same task must queue behind the held analysis; it
+	// must not start a second prompt on the same session.
+	if status := suite.postWebhook(t, commentAddedPayload(key, "plan-"+suffix, "/opencode start", suite.ytProject)); status != http.StatusAccepted {
+		t.Fatalf("comment webhook = %d", status)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if got := fake.promptCount(); got != 1 {
+		t.Fatalf("same-task event started concurrently: prompts=%d", got)
+	}
+	fake.release()
+	deadline = time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && fake.promptCount() < 2 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() != 2 {
+		t.Fatalf("prompts after release = %d, want 2", fake.promptCount())
+	}
+	row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+		return row.Turns == 2 && row.State == "awaiting_input"
+	}, 30*time.Second)
+	if row.Session == "" || row.Worktree == "" {
+		t.Fatalf("task has no worktree/session: %+v", row)
+	}
+}
+
+func TestFlowConcurrentTasks(t *testing.T) {
+	if os.Getenv("E2E_FLOW_CONCURRENCY") != "1" {
+		t.Skip("set E2E_FLOW_CONCURRENCY=1 to run two flow tasks concurrently")
+	}
+	if suite.live {
+		t.Skip("flow concurrency uses the fake runtime in direct mode")
+	}
+	suite.stop()
+	suite.extraEnv = []string{"FLOWHUB_FLOW_CONCURRENCY=2"}
+	fake := newFakeOpencode(t)
+	fake.setMode("every")
+	hold := make(chan struct{})
+	fake.setHold(hold)
+	server := fake.start()
+	t.Cleanup(server.Close)
+	t.Cleanup(fake.release)
+	suite.pointAtRuntime(t, server.URL)
+	suite.setRuntimeMaxConcurrent(t, 2)
+	suite.start()
+	t.Cleanup(func() { suite.stop() })
+	if err := suite.setMode("on", []string{suite.ytProject}); err != nil {
+		t.Fatalf("set on: %v", err)
+	}
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	keys := []string{"TEST-FLOW-A-" + suffix, "TEST-FLOW-B-" + suffix}
+	for _, key := range keys {
+		key := key
+		t.Cleanup(func() { suite.removeTestWorktree(key) })
+		summary := "FlowHub flow concurrency " + key
+		if status := suite.postWebhook(t, issueCreatedPayload(key, summary, "Flow concurrency E2E.", suite.ytProject)); status != http.StatusAccepted {
+			t.Fatalf("webhook for %s = %d", key, status)
+		}
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && fake.promptCount() < 2 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fake.promptCount() != 2 {
+		t.Fatalf("flow prompts = %d, want 2", fake.promptCount())
+	}
+	if got := fake.maxConcurrentPrompts(); got != 2 {
+		t.Fatalf("max concurrent flow prompts = %d, want 2", got)
+	}
+	fake.release()
+	for _, key := range keys {
+		row := suite.waitForRegistry(t, key, func(row taskRow) bool {
+			return row.Turns == 1 && row.State == "awaiting_input"
+		}, 30*time.Second)
+		if row.Session == "" || row.Worktree == "" {
+			t.Fatalf("task %s has no worktree/session: %+v", key, row)
 		}
 	}
 }

@@ -151,10 +151,12 @@ to be narrower and for the UI. An unknown kind is accepted and reaches
 
 - `<DataDir>/flow-cursor.json` holds the last event id the flow worker **accepted
   for processing**, mode `0600`, replaced atomically.
-- The cursor advances after a run is created (before the graph executes), so a
-  crash mid-run leaves the existing run to recovery instead of replaying the event
-  into a second run. Events that are ignored, mode `off`, or a denied author also
-  advance; a paused delivery does not, so it is replayed after the pause is lifted.
+- The cursor advances in scheduler receive order once a run exists (or the event is
+  ignored/mode `off`/denied), so a crash mid-run leaves the existing run to recovery
+  instead of replaying the event into a second run. Parallel runs are allowed, but a
+  later event cannot advance the cursor past an earlier event that has not reached
+  that point. A paused delivery does not advance, so it is replayed after the pause
+  is lifted.
 - At startup the flow reads every event after the cursor and submits it to the
   worker. A missing cursor initializes at the current durable tail, so upgrading a
   deployment does not replay its whole history; an event id that has aged out of the
@@ -581,8 +583,9 @@ down with their inputs; the UI and the parity harness read the same records.
 - Turn: a step attempt is journaled before the call. A crash during the call is
   `interrupted`, not a second attempt. A manual retry (later) is a new attempt with
   its own id, never a silent re-run.
-- Concurrency: one active step per run in v1; a global run-slot limit; a per-task
-  lease; per-runtime capacity. Shadow runs consume no runtime capacity.
+- Concurrency: one active step per run in v1; `FLOWHUB_FLOW_CONCURRENCY`
+  distinct tasks (default 4, `1`..`64`) with one task's events serialized; a
+  per-task lease; per-runtime capacity. Shadow runs consume no runtime capacity.
 - Retention: runs 30 days / 1000 by default; event log 30 days; artifacts bounded.
   `waiting` and `needs_attention` survive pruning.
 
@@ -659,8 +662,8 @@ There is no `PUT`/`DELETE` for the builtin flow.
 - No CORS, no SSE. The desktop polls with `after`; the main listener's write timeout
   is 10 s, so a long-lived stream does not belong here.
 - `/healthz` gains `flows` (`enabled`, `mode`, `definitions`, `runs`, `waiting`,
-  `needs_attention`, `shadow_compared`, `shadow_mismatches`, `pending`) and
-  `upstreams`.
+  `needs_attention`, `shadow_compared`, `shadow_mismatches`, `pending`,
+  `concurrency`, `active_tasks`, `pending_tasks`) and `upstreams`.
 - Run summaries carry `compared`/`match`/`differences`; a run snapshot carries the
   joined `comparison` (dispatch and flow action/reason). Comparisons are joined by
   the event id and persisted in `<DataDir>/flow-compare.jsonl`.

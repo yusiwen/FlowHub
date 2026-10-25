@@ -320,6 +320,7 @@ switched on explicitly:
 | `FLOWHUB_OPENCODE_PASSWORD` | *(unset)* | HTTP Basic Auth password, matching the server's `OPENCODE_SERVER_PASSWORD`. Never printed: `-print-config` shows a fingerprint |
 | `FLOWHUB_DISPATCH_AGENT` | `devops` | opencode agent for turns whose routing entry names none |
 | `FLOWHUB_DISPATCH_QUEUE` | `32` | Deliveries waiting for a runtime's worker. A full queue drops work instead of blocking the publisher |
+| `FLOWHUB_FLOW_CONCURRENCY` | `4` | Distinct flow tasks the flow scheduler may run at once, `1`..`64`; one task's events stay serialized |
 | `FLOWHUB_TASK_DEADLINE` | `15m` | One turn's budget. A deadline is not a failure: the session keeps running and is marked `executing` |
 | `FLOWHUB_FIRST_RESPONSE` | `90s` | How long a turn may take to produce its first assistant message before it is **failed**. A prompt the agent server never turns into a turn (a model its provider dropped) leaves the session idle with no message, which otherwise looks like a slow turn until the deadline. Capped at a third of `FLOWHUB_TASK_DEADLINE`, floored at `5s` |
 | `FLOWHUB_OPENCODE_REQUEST_TIMEOUT` | `30s` | How long **one HTTP request** to an agent server may take. Deliberately far below `FLOWHUB_TASK_DEADLINE`, which bounds the whole turn: a host that stops answering without closing the connection (black-holed packets, a wedged server) would otherwise hold a worker for the entire turn budget. A runtime whose own `deadline` is shorter gets the shorter bound, and a value at or above the turn budget is reported as a `warning:` |
@@ -356,7 +357,8 @@ The flow API is read-only and lives on the same listener as the webhook:
 `/hub/v1/runs/{id}/events?after=`. Run summaries carry `compared`, `match` and
 `differences` once dispatch's decision for the same event has arrived; the run
 snapshot carries the full comparison. `/healthz.flows` reports
-`shadow_compared`, `shadow_mismatches` and `pending`. `on` answers `409` when the
+`shadow_compared`, `shadow_mismatches`, `pending`, `concurrency`, `active_tasks` and
+`pending_tasks`. `on` answers `409` when the
 service was started without the task service (`FLOWHUB_DISPATCH=0`). Every request needs
 `Authorization: Bearer $FLOWHUB_HUB_TOKEN`; an unset token answers `503`. The
 builtin flow is **off** by default; `flowhub flow mode default-youtrack shadow`
