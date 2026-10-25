@@ -379,6 +379,13 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	if err != nil {
 		return err
 	}
+	// The dispatcher object also carries the routing selector and task service for
+	// the flow. It is not an intake path unless FLOWHUB_DISPATCH is on: without that,
+	// the object is constructed only because an `on` flow needs it.
+	var intake *dispatch.Dispatcher
+	if cfg.Dispatch {
+		intake = dispatcher
+	}
 
 	// The flow engine runs shadow by default and `on` when the deployment state says
 	// so and this process has the task service. It consumes the durable event log;
@@ -441,7 +448,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		"on_available", flowEngine.CanExecuteOn(), "runs", flowEngine.Snapshot()["dir"])
 	hubAPI, err := flowapi.New(flowapi.Options{
 		Token: cfg.HubToken, Flow: flowDefinition, Definition: flowRaw,
-		Modes: modes, Runs: flowEngine.RunStore(), OnAvailable: dispatcher != nil,
+		Modes: modes, Runs: flowEngine.RunStore(), OnAvailable: flowEngine.CanExecuteOn(),
 		Cancel: flowEngine.Cancel, Compare: comparisons, Logger: logger,
 	})
 	if err != nil {
@@ -457,7 +464,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		return err
 	}
 
-	handler := webhook.New(webhookOptions(cfg, dispatcher, src, events), sink, cache, logger, stats)
+	handler := webhook.New(webhookOptions(cfg, intake, src, events), sink, cache, logger, stats)
 
 	// The paths are registered without a method so that a wrong method is still
 	// audited (and answered with 405) instead of being swallowed by ServeMux.
@@ -466,7 +473,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	mux.Handle(base, handler)
 	mux.Handle(base+"/{key}", handler)
 	mux.Handle("/hub/v1/", hubAPI)
-	mux.Handle("GET /healthz", healthHandler(cfg, projects, stats, sink, cache, audit, detail, events, dispatcher, inventory, flowEngine, modes, started))
+	mux.Handle("GET /healthz", healthHandler(cfg, projects, stats, sink, cache, audit, detail, events, intake, inventory, flowEngine, modes, started))
 
 	server := &http.Server{
 		Handler:           mux,
@@ -929,13 +936,25 @@ func startControlAPI(ctx context.Context, cfg config.Config, projects *projectma
 	return server, nil
 }
 
-// startDispatcher builds and starts the opencode dispatcher, or returns (nil,
-// nil, nil) when FLOWHUB_DISPATCH is off.
+// flowDeploymentOn reports whether the flow has any `on` deployment. It lets main
+// construct the shared task service and selector without turning dispatch on.
+func flowDeploymentOn(modes *flowmode.Store, flowID string) bool {
+	if modes == nil {
+		return false
+	}
+	entry, ok := modes.Entry(flowID)
+	return ok && entry.Mode == flowmode.On
+}
+
+// startDispatcher builds the dispatcher and, when FLOWHUB_DISPATCH is on, starts
+// its intake worker. When dispatch is off but the flow deployment is `on`, it still
+// builds the object because it carries the routing selector and task service the
+// flow uses; no dispatch worker is started and the webhook does not hold it.
 //
 // The returned channel closes when the worker has stopped, so shutdown can wait
 // for an in-flight turn instead of killing the process under it.
 func startDispatcher(ctx context.Context, cfg config.Config, projects *projectmap.Map, inventory *runtimes.Inventory, src source.Source, logger *slog.Logger, capacity *runner.Capacity, tasks *registry.Registry, modes *flowmode.Store, flowID string, comparisons *compare.Store) (*dispatch.Dispatcher, <-chan struct{}, error) {
-	if !cfg.Dispatch {
+	if !cfg.Dispatch && !flowDeploymentOn(modes, flowID) {
 		return nil, nil, nil
 	}
 
@@ -943,7 +962,7 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 	// almost certainly a leftover from an incident: say so loudly rather than
 	// silently not working.
 	if _, err := os.Stat(cfg.ResolvedPauseFile()); err == nil {
-		logger.Warn("the dispatch pause file exists, so no work will be dispatched until it is removed",
+		logger.Warn("the pause file exists, so no work will run until it is removed",
 			"pause_file", cfg.ResolvedPauseFile())
 	}
 
@@ -1024,6 +1043,11 @@ func startDispatcher(ctx context.Context, cfg config.Config, projects *projectma
 		return nil, nil, err
 	}
 
+	if !cfg.Dispatch {
+		logger.Info("dispatch intake is off; the flow owns execution for its on projects",
+			"flow", flowID)
+		return dispatcher, nil, nil
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -1059,7 +1083,7 @@ func checkRuntimesReachable(ctx context.Context, cfg config.Config, inventory *r
 	if len(active) == 0 {
 		version, err := fallback.Health(probeCtx)
 		if err != nil {
-			return fmt.Errorf("FLOWHUB_DISPATCH=1 but opencode at %s is not answering: %w", cfg.OpenCodeURL, err)
+			return fmt.Errorf("no runtime is available: opencode at %s is not answering: %w", cfg.OpenCodeURL, err)
 		}
 		logger.Info("opencode is reachable", "url", cfg.OpenCodeURL, "version", version, "runtime", dispatch.DefaultRuntimeName)
 		return nil
@@ -1086,7 +1110,7 @@ func checkRuntimesReachable(ctx context.Context, cfg config.Config, inventory *r
 		reachable = append(reachable, runtime.Name)
 	}
 	if len(reachable) == 0 {
-		return fmt.Errorf("FLOWHUB_DISPATCH=1 but none of the %d enrolled runtime(s) answered; the hosts or the network between them need attention", len(active))
+		return fmt.Errorf("none of the %d enrolled runtime(s) answered; the hosts or the network between them need attention", len(active))
 	}
 	return nil
 }
@@ -1300,7 +1324,7 @@ func flowHealth(engine *flowengine.Engine, modes *flowmode.Store) map[string]any
 			snapshot["updated_at"] = entry.UpdatedAt
 		}
 		if mode == flowmode.On && !engine.CanExecuteOn() {
-			snapshot["state_error"] = "on needs FLOWHUB_DISPATCH=1 and the task service; the flow cannot execute task.turn"
+			snapshot["state_error"] = "on needs the shared task service; persist on before start (or enable dispatch) so this process can execute task.turn"
 		}
 	}
 	snapshot["definitions"] = 1

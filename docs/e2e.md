@@ -202,6 +202,13 @@ second must wait and then run in the same session:
 make e2e-flow-serial
 ```
 
+No-dispatch wiring (fake runtime): set flow `on`, restart with `FLOWHUB_DISPATCH=0`,
+and prove a task still runs through the flow's shared task service:
+
+```bash
+make e2e-flow-no-dispatch
+```
+
 Cancel (fake runtime): hold the execute prompt, `POST /hub/v1/runs/{id}/cancel`,
 assert `canceled`, `409` on a second cancel, no extra prompt, and a `run.canceled`
 journal event:
@@ -294,6 +301,7 @@ the Make targets are only wrappers around the suite.
 | attachment download allow/deny + other known kinds | `TestAttachmentsAndOtherEventKinds` | `make e2e-attachments` |
 | flow runs two distinct tasks concurrently | `TestFlowConcurrentTasks` | `make e2e-flow-concurrency` |
 | flow serializes two events for one task | `TestFlowSameTaskSerializes` | `make e2e-flow-serial` |
+| flow `on` without dispatch intake | `TestFlowOnRunsWithoutDispatchIntake` | `make e2e-flow-no-dispatch` |
 | cancel an active `on` run | `TestCancelStopsAnActiveRun` | `make e2e-cancel` |
 | repository rebind refusal | `TestRepositoryRebindRefused` | `make e2e-rebind` |
 | cross-task capacity saturation | `TestCrossTaskCapacitySaturation` | `make e2e-capacity` |

@@ -159,7 +159,7 @@ func (h *Handler) deploy(w http.ResponseWriter, r *http.Request) {
 	case mode.Off, mode.Shadow:
 	case mode.On:
 		if !h.opts.OnAvailable {
-			writeError(w, http.StatusConflict, "on needs FLOWHUB_DISPATCH=1 and the task service; use off or shadow")
+			writeError(w, http.StatusConflict, "on needs the shared task service; persist on before start or enable dispatch, or use off/shadow")
 			return
 		}
 	default:
