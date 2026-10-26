@@ -50,19 +50,28 @@ make build            # -> bin/flowhub, with version/commit/build-time stamped i
 make secrets          # prints a fresh hook_key / token pair for one project
 
 mkdir -p ~/.config/flowhub
+cat > ~/.config/flowhub/.env <<'EOF'
+FLOWHUB_HOOK_KEY_TEST=<the hook_key>
+FLOWHUB_TOKEN_TEST=<the token>
+EOF
+chmod 600 ~/.config/flowhub/.env
+
 cat > ~/.config/flowhub/config.json <<'EOF'
 {
   "version": 2,
   "projects": [
     {
-      "source": {"name": "youtrack", "hook_key": "<the hook_key>", "token": "<the token>"},
+      "source": {
+        "name": "youtrack",
+        "hook_key_env": "FLOWHUB_HOOK_KEY_TEST",
+        "token_env": "FLOWHUB_TOKEN_TEST"
+      },
       "project": "<YOUR_PROJECT_KEY>",
       "repo": {"path": "/absolute/path/to/your/repo"}
     }
   ]
 }
 EOF
-chmod 600 ~/.config/flowhub/config.json   # it carries the project's locks
 
 export FLOWHUB_DATA_DIR=./data
 
@@ -75,9 +84,14 @@ Triggers → Settings`):
 
 | Setting | Value |
 | --- | --- |
-| Webhook URL (**per project**) | `https://<your-host>/hooks/youtrack/<that project's source.hook_key>` |
+| Webhook URL (**per project**) | `https://<your-host>/hooks/youtrack/<that project's hook_key>` |
 | Header name | `X-YouTrack-Token` |
-| Token | that project's `source.token` |
+| Token | that project's `token` |
+
+The key and token can be written inline (`"hook_key"`, `"token"`), but the form
+above — name an environment variable (`hook_key_env`, `token_env`) or a `0600`
+file (`hook_key_file`, `token_file`) — keeps `config.json` free of secrets. Each
+field names exactly one source, and the value is read once at load time.
 
 Each project is a separate app attachment, so each has its own URL key and token.
 A key copied from one project's settings cannot post another project's events: the
@@ -144,8 +158,10 @@ Two related settings, so the precedence is in one place:
 ### Local delivery test
 
 ```bash
-KEY=$(jq -r '.projects[0].source.hook_key' ~/.config/flowhub/config.json)
-TOKEN=$(jq -r '.projects[0].source.token' ~/.config/flowhub/config.json)
+# The quick start above put the pair in ~/.config/flowhub/.env.
+set -a; . ~/.config/flowhub/.env; set +a
+KEY=$FLOWHUB_HOOK_KEY_TEST
+TOKEN=$FLOWHUB_TOKEN_TEST
 PROJECT=$(jq -r '.projects[0].project' ~/.config/flowhub/config.json)
 FLOWHUB_ALLOWED_SOURCES=127.0.0.1 FLOWHUB_LOG_HEADERS=true ./bin/flowhub &
 
@@ -299,7 +315,7 @@ Flags: `-version`, `-print-config`.
 | `FLOWHUB_ADDR` | `127.0.0.1:8080` | Listen address. Bind the WireGuard address, the LAN address a router forwards to, or loopback behind a reverse proxy. A wildcard bind (`0.0.0.0:8080`, `:8080`, `[::]:8080`) refuses to start unless `FLOWHUB_ALLOW_WILDCARD_LISTEN=1` acknowledges it |
 | `FLOWHUB_ALLOW_WILDCARD_LISTEN` | `false` | Acknowledge a wildcard bind. Required for container images (the process must listen on the pod address); the right choice nowhere else |
 | `FLOWHUB_HOOK_PATH` | `/hooks/youtrack` | Base path of the endpoint |
-| `FLOWHUB_TOKEN_HEADER` | `X-YouTrack-Token` | Header carrying each project's token; the value is `projects[].source.token` |
+| `FLOWHUB_TOKEN_HEADER` | `X-YouTrack-Token` | Header carrying each project's token; the value is the project's `token` (inline, `token_env` or `token_file`) |
 | `FLOWHUB_ALLOWED_SOURCES` | *(unset)* | Lock 3: comma separated IPs/CIDRs, e.g. `10.8.0.0/24,127.0.0.1`. Empty disables the lock |
 | `FLOWHUB_DATA_DIR` | `./data` | Audit log directory (created `0700`, files `0600`) |
 | `FLOWHUB_MAX_BODY_BYTES` | `262144` | Body cap; mirrors nginx `client_max_body_size` |
@@ -317,16 +333,19 @@ Flags: `-version`, `-print-config`.
 | `FLOWHUB_SHUTDOWN_TIMEOUT` | `10s` | Graceful drain budget on `SIGINT`/`SIGTERM` |
 | `FLOWHUB_CONFIG_FILE` | `~/.config/flowhub/config.json` | The configuration file: sources, runtimes, and the `(source, project)` → local repository table. `$XDG_CONFIG_HOME/flowhub/config.json` when that is set. A leading `~` is expanded, and the path is made absolute at startup. A missing file only warns (the receiver still records); a file that exists but fails validation stops startup |
 | `FLOWHUB_PROJECTS_FILE` | *(alias)* | The old name of `FLOWHUB_CONFIG_FILE`, still read. The file is no longer only a routing table, so the new spelling is preferred; setting both uses `FLOWHUB_CONFIG_FILE` |
-| `FLOWHUB_ENV_FILE` | `~/.config/flowhub/.env` | An environment file applied at startup, whose values are **defaults**: a variable already set in the environment wins. `-` (or `none`, `off`) disables it. A named path that does not exist stops startup; an absent default path does not. The file must be mode `0600`, because it holds the URL key and the token |
+| `FLOWHUB_ENV_FILE` | `~/.config/flowhub/.env` | An environment file applied at startup, whose values are **defaults**: a variable already set in the environment wins. `-` (or `none`, `off`) disables it. A named path that does not exist stops startup; an absent default path does not. The file must be mode `0600`: it may hold the lock variables (`hook_key_env` / `token_env` point at them) and credentials |
 | `FLOWHUB_SOURCE` | `youtrack` | Which registered event source this receiver serves. It selects the adapter that decodes deliveries and the `sources.<name>` block that supplies the trigger policy |
 | `FLOWHUB_YOUTRACK_ALLOWED_SOURCES` | *(unset)* | Lock 3 (source IP allowlist) for YouTrack. `FLOWHUB_ALLOWED_SOURCES` is the alias |
 
-The URL key (lock 1) and the header token (lock 2) are **per project**: they are
-`projects[].source.hook_key` and `projects[].source.token` in the configuration
-file. The file therefore must be mode `0600`, and `-print-config` reports only that
-a lock exists. The old global variables (`FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN`,
-`FLOWHUB_YOUTRACK_HOOK_KEY`, `FLOWHUB_YOUTRACK_TOKEN`) are no longer read; a process
-that still has one set logs a warning naming it (ADR 0015).
+The URL key (lock 1) and the header token (lock 2) are **per project**. Each is
+named in `projects[].source` as exactly one of `hook_key`/`token` (inline),
+`hook_key_env`/`token_env` (a variable, usually in `~/.config/flowhub/.env`) or
+`hook_key_file`/`token_file` (a `0600` file). The values are read once at load
+time; `-print-config` reports where each came from and never the value. Only the
+inline form makes the configuration file a secret. The old global variables
+(`FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN`, `FLOWHUB_YOUTRACK_HOOK_KEY`,
+`FLOWHUB_YOUTRACK_TOKEN`) are no longer read; a process that still has one set logs
+a warning naming it (ADR 0015).
 
 The dispatcher (`opencode-devops-orchestration-design.md` §12) is off until it is
 switched on explicitly:
@@ -393,9 +412,10 @@ table, an entry with no `default_branch`, an entry with no `worktrees` directory
 and no fallback, or an opencode server that is not answering. A hub that accepts
 deliveries and then fails every one of them is worse than one that does not start.
 
-The URL key and token are **per project and required**: an enabled entry without
-`source.hook_key` or `source.token` refuses startup, and `-print-config` lists the
-lock types plus each entry's presence (never a value). The source IP allowlist is
+The URL key and token are **per project and required**: an enabled entry whose
+`hook_key`/`token` resolves to nothing (no inline value, no variable, no file)
+refuses startup, and `-print-config` lists the lock types, their provenance and
+each entry's presence (never a value). The source IP allowlist is
 the only lock that can be disabled, and it warns when it is
 (`youtrack-webhook-and-flowhub-security.md` §12.2).
 
@@ -435,8 +455,8 @@ cp config/config.example.json ~/.config/flowhub/config.json   # then edit it
     {
       "source": {
         "name": "youtrack",
-        "hook_key": "0123...cdef",
-        "token": "89ab...4567"
+        "hook_key_env": "FLOWHUB_HOOK_KEY_BEAP_BE",
+        "token_env": "FLOWHUB_TOKEN_BEAP_BE"
       },
       "project": "BEAP_BE",
       "also": ["BEAP"],
@@ -454,11 +474,13 @@ cp config/config.example.json ~/.config/flowhub/config.json   # then edit it
 }
 ```
 
-The file has three parts. **Secrets are opt-in:** a project's entry locks
-(`projects[].source.hook_key` / `.token`) are written here because they address the
-project, so the file is itself a secret and must be mode `0600`; the source IP
-allowlist stays in the environment. A runtime's password has four sources, and a
-block names exactly one of them:
+The file has three parts. **Secrets are opt-in.** A project's entry locks can live
+in the environment (`hook_key_env` / `token_env`), in a `0600` file
+(`hook_key_file` / `token_file`), or inline (`hook_key` / `token`). Each field
+names exactly one source; only the inline form makes the configuration file itself
+a secret, and then it must be mode `0600`. The source IP allowlist stays in the
+environment. A runtime's password has four sources, and a block names exactly one
+of them:
 
 | Source | Written as | Where the secret lives |
 | --- | --- | --- |

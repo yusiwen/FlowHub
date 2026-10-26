@@ -161,10 +161,18 @@ type v2RuntimeAuth struct {
 // predates these locks. It is still decoded so an existing file keeps parsing and
 // `-print-config` can explain it, but an enabled entry must use the object: a
 // project without a key can never be addressed by a delivery.
+// Each lock names exactly one source: the inline value, the name of an environment
+// variable, or a file holding one secret. The environment form is what lets a
+// project read its pair from the environment file, keeping the routing table free of
+// secrets; the inline form is the one that makes the table itself a secret.
 type v2ProjectSource struct {
-	Name    string `json:"name"`
-	HookKey string `json:"hook_key,omitempty"`
-	Token   string `json:"token,omitempty"`
+	Name        string `json:"name"`
+	HookKey     string `json:"hook_key,omitempty"`
+	HookKeyEnv  string `json:"hook_key_env,omitempty"`
+	HookKeyFile string `json:"hook_key_file,omitempty"`
+	Token       string `json:"token,omitempty"`
+	TokenEnv    string `json:"token_env,omitempty"`
+	TokenFile   string `json:"token_file,omitempty"`
 }
 
 // UnmarshalJSON accepts either the object or the old bare string. The object is

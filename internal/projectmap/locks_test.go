@@ -1,6 +1,8 @@
 package projectmap
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -103,7 +105,7 @@ func TestDuplicateHookKeysAreRefused(t *testing.T) {
 	  {"source": `+sourceObject("youtrack", lockKeyA, lockTokenA)+`, "project": "A", "repo": {"path": "`+repo+`"}},
 	  {"source": `+sourceObject("youtrack", lockKeyA, lockTokenB)+`, "project": "B", "repo": {"path": "`+repo+`"}}
 	]}`)
-	if !strings.Contains(err, "same source.hook_key") {
+	if !strings.Contains(err, "same hook_key") {
 		t.Fatalf("error = %q, want the duplicate key named", err)
 	}
 	if strings.Contains(err, lockKeyA) {
@@ -193,5 +195,127 @@ func TestHasInlineLockMaterialTracksTheSourceObject(t *testing.T) {
 	]}`)
 	if stringForm.HasInlineLockMaterial() {
 		t.Fatal("a file naming only the source carries no secret")
+	}
+}
+
+// The environment form is what keeps the routing table free of secrets: the value
+// lives in the environment (or the environment file, which is applied before the
+// configuration is loaded) and the entry only names the variable.
+func TestEntryLocksFromEnvironment(t *testing.T) {
+	const (
+		keyVar   = "FLOWHUB_TEST_HOOK_KEY"
+		tokenVar = "FLOWHUB_TEST_TOKEN"
+	)
+	t.Setenv(keyVar, lockKeyA)
+	t.Setenv(tokenVar, lockTokenA)
+
+	repo := t.TempDir()
+	m := writeConfig(t, `{"version": 2, "projects": [
+	  {"source": {"name": "youtrack", "hook_key_env": "`+keyVar+`", "token_env": "`+tokenVar+`"},
+	   "project": "A", "repo": {"path": "`+repo+`"}}
+	]}`)
+
+	locks := m.EntryLocks("youtrack")
+	if len(locks) != 1 || locks[0].Key != lockKeyA || locks[0].Token != lockTokenA {
+		t.Fatalf("EntryLocks = %+v, want the values read from the environment", locks)
+	}
+	if m.HasInlineLockMaterial() {
+		t.Fatal("a table that only names variables is not itself a secret")
+	}
+	report := m.Report()
+	if !strings.Contains(report, "env "+keyVar) || !strings.Contains(report, "env "+tokenVar) {
+		t.Fatalf("report does not show the environment provenance:\n%s", report)
+	}
+	if strings.Contains(report, lockKeyA) || strings.Contains(report, lockTokenA) {
+		t.Fatalf("report leaks a lock value:\n%s", report)
+	}
+}
+
+// A disabled entry is not addressable: an unset variable it names must not keep
+// the receiver from starting, because the operator has already turned the entry off.
+func TestDisabledEntryDoesNotResolveItsLocks(t *testing.T) {
+	repo := t.TempDir()
+	m := writeConfig(t, `{"version": 2, "projects": [
+	  {"source": {"name": "youtrack", "hook_key_env": "FLOWHUB_UNUSED_HOOK_KEY", "token_env": "FLOWHUB_UNUSED_TOKEN"},
+	   "project": "OFF", "repo": {"path": "`+repo+`"}, "enabled": false}
+	]}`)
+	if locks := m.EntryLocks("youtrack"); len(locks) != 0 {
+		t.Fatalf("EntryLocks = %+v, want none for a disabled entry", locks)
+	}
+	if problems := m.LockProblems("youtrack"); len(problems) != 0 {
+		t.Fatalf("LockProblems = %v, want none for a disabled entry", problems)
+	}
+}
+
+func TestUnsetLockVariableRefusesTheLoad(t *testing.T) {
+	const keyVar = "FLOWHUB_TEST_HOOK_KEY_UNSET"
+	repo := t.TempDir()
+	err := loadErr(t, `{"version": 2, "projects": [
+	  {"source": {"name": "youtrack", "hook_key_env": "`+keyVar+`", "token": "`+lockTokenA+`"},
+	   "project": "A", "repo": {"path": "`+repo+`"}}
+	]}`)
+	if !strings.Contains(err, keyVar) || !strings.Contains(err, "unset or empty") {
+		t.Fatalf("error = %q, want it to name %s and say it is unset", err, keyVar)
+	}
+}
+
+// A resolved value is held to the same shape rules as an inline one: an environment
+// variable cannot smuggle in a weak key.
+func TestEnvironmentLockIsValidatedLikeAnInlineOne(t *testing.T) {
+	const keyVar = "FLOWHUB_TEST_SHORT_HOOK_KEY"
+	t.Setenv(keyVar, "short")
+	repo := t.TempDir()
+	err := loadErr(t, `{"version": 2, "projects": [
+	  {"source": {"name": "youtrack", "hook_key_env": "`+keyVar+`", "token": "`+lockTokenA+`"},
+	   "project": "A", "repo": {"path": "`+repo+`"}}
+	]}`)
+	if !strings.Contains(err, "source.hook_key") || !strings.Contains(err, "32 character floor") {
+		t.Fatalf("error = %q, want the key floor named", err)
+	}
+}
+
+func TestTwoLockSourcesForOneFieldAreRefused(t *testing.T) {
+	t.Setenv("FLOWHUB_TEST_HOOK_KEY_BOTH", lockKeyB)
+	repo := t.TempDir()
+	err := loadErr(t, `{"version": 2, "projects": [
+	  {"source": {"name": "youtrack", "hook_key": "`+lockKeyA+`", "hook_key_env": "FLOWHUB_TEST_HOOK_KEY_BOTH", "token": "`+lockTokenA+`"},
+	   "project": "A", "repo": {"path": "`+repo+`"}}
+	]}`)
+	if !strings.Contains(err, "more than one source") {
+		t.Fatalf("error = %q, want the ambiguity refused", err)
+	}
+}
+
+func TestEntryLocksFromAFile(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "hook.key")
+	tokenFile := filepath.Join(dir, "token")
+	if err := os.WriteFile(keyFile, []byte(lockKeyA+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokenFile, []byte(lockTokenA+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repo := t.TempDir()
+	body := `{"version": 2, "projects": [
+	  {"source": {"name": "youtrack", "hook_key_file": "` + keyFile + `", "token_file": "` + tokenFile + `"},
+	   "project": "A", "repo": {"path": "` + repo + `"}}
+	]}`
+	m := writeConfig(t, body)
+	locks := m.EntryLocks("youtrack")
+	if len(locks) != 1 || locks[0].Key != lockKeyA || locks[0].Token != lockTokenA {
+		t.Fatalf("EntryLocks = %+v, want the values read from the files", locks)
+	}
+	if !strings.Contains(m.Report(), "file "+keyFile) {
+		t.Fatalf("report does not show the file provenance:\n%s", m.Report())
+	}
+
+	// A secret file the group or the world can read is refused, like every other
+	// secret file in this project.
+	if err := os.Chmod(keyFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadErr(t, body); !strings.Contains(err, "chmod 600") {
+		t.Fatalf("error = %q, want the permission fix named", err)
 	}
 }
