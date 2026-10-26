@@ -41,11 +41,12 @@ build:
 run: build
 	./$(BINDIR)/$(NAME) $(ARGS)
 
-# Generate the two shared secrets. Put the key in the webhook URL and the token in
-# the X-YouTrack-Token header; see README.md.
+# Generate one project's entry locks. Put the key in that project's webhook URL,
+# the token in its Webhook Triggers settings, and both in `projects[].source` in
+# the routing table; see README.md (ADR 0015).
 secrets:
-	@echo "FLOWHUB_HOOK_KEY=$$(openssl rand -hex 32)"
-	@echo "FLOWHUB_TOKEN=$$(openssl rand -hex 32)"
+	@echo "hook_key: $$(openssl rand -hex 32)"
+	@echo "token:    $$(openssl rand -hex 32)"
 
 test:
 	@go test ./... -count=1 2>&1; status=$$?; \

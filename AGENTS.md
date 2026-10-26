@@ -43,18 +43,18 @@ changing behaviour:
 
 ```bash
 make build          # build to bin/flowhub
-make secrets        # print a fresh FLOWHUB_HOOK_KEY / FLOWHUB_TOKEN pair
+make secrets        # print a fresh hook_key / token pair for one project
 make test           # unit tests
 make test-race      # race detector (needs cgo; the Nix shell leaves it on)
 make lint           # go vet
 make smoke          # end-to-end: real process, real HTTP, asserts the logs
 ```
 
-Run the receiver locally:
+Run the receiver locally (the project's URL key and token live in
+`projects[].source` in the routing table, not in the environment — ADR 0015):
 
 ```bash
-export FLOWHUB_HOOK_KEY=$(openssl rand -hex 32)
-export FLOWHUB_TOKEN=$(openssl rand -hex 32)
+mkdir -p ~/.config/flowhub   # then write config.json; config/config.example.json is the template
 export FLOWHUB_ALLOWED_SOURCES=127.0.0.1
 export FLOWHUB_HUB_TOKEN=$(openssl rand -hex 32)   # enables /hub/v1 and the desktop read view
 make run
@@ -76,8 +76,8 @@ cached model included — until `opencode serve` restarts. FlowHub therefore pin
 model the runtime reported for that profile (ADR 0002), and `init` refuses a
 profile whose model the provider no longer offers.
 
-Then post to `http://127.0.0.1:8080/hooks/youtrack/$FLOWHUB_HOOK_KEY` with the
-header `X-YouTrack-Token: $FLOWHUB_TOKEN`. See `README.md`.
+Then post to `http://127.0.0.1:8080/hooks/youtrack/<the project's source.hook_key>` with the
+header `X-YouTrack-Token: <that project's source.token>`. See `README.md`.
 
 ## Toolchain
 
@@ -157,8 +157,8 @@ tests wire the real adapter against a fake server, which is what proves the seam
 
 ```
 POST /hooks/youtrack/<url key>
-  -> lock 1 URL key -> lock 2 header token -> lock 3 source IP
-  -> body cap -> content type -> JSON -> known event -> replay window
+  -> lock 1 URL key selects the project -> lock 2 its header token -> lock 3 source IP
+  -> body cap -> content type -> JSON -> known event -> project match -> replay window
   -> idempotency -> event append (durable) -> audit queue (background) -> 202
 ```
 
@@ -188,6 +188,15 @@ documents. The rules below are load-bearing; do not relax them casually.
    fixed the same day; the redaction runs even when lock 1 is disabled. The
    service answers the "is the app sending the literal `secret`?" question
    through `MatchesConfigured` / `LooksLikeLiteralSecret` fingerprints instead.
+   **The URL key and the header token are per project (ADR 0015).** They live in
+   `projects[].source.hook_key` / `.token` in the routing table: the key selects the
+   entry before the body is read, the entry's token authenticates the delivery, and
+   the decoded project must be one of that entry's keys (`project` or `also`) or it
+   is refused as `project_mismatch` — one project's key must never post another
+   project's event. A file that carries these locks is itself a secret and must be
+   mode `0600`; the process-wide `FLOWHUB_HOOK_KEY` / `FLOWHUB_TOKEN` (and their
+   `FLOWHUB_YOUTRACK_*` spellings) are no longer read, and a process that still has
+   one set warns.
    **An agent server's Basic Auth password follows the same rule (ADR 0004).** It
    comes from the environment (`FLOWHUB_OPENCODE_PASSWORD`, or
    `auth.password_env`), from a per-runtime `auth.password_file`, from the shared
@@ -232,8 +241,9 @@ documents. The rules below are load-bearing; do not relax them casually.
    derives a project from an issue ID**: splitting `TEST-12` on its last dash is a
    YouTrack convention, so the adapter that knows it fills the subject's project
    while the router stays free of conventions. The index is `(source, project)`, the
-   file's version is explicit (a version 1 file is translated on read and reported
-   as such), every unknown field is an error, and each effective value is printed
+   file's version is explicit (a version 1 file is still translated on read, but it
+   cannot carry entry locks, so a served source's version 1 table is refused at
+   startup with the migration named), every unknown field is an error, and each effective value is printed
    with the level that supplied it. A `prompt_file` (source or project level) may only
    *add* instructions: the untrusted-input warning, the reply tool, the sign-off and
    the `<!-- flowhub-auto -->` marker are the adapter's contract and stay in code,
@@ -409,8 +419,9 @@ documents. The rules below are load-bearing; do not relax them casually.
     inverted: `FLOWHUB_ADDR=… ./bin/flowhub` has to mean what it says, and a file the
     operator forgot is not allowed to change it. `skipped_already_set` in the startup
     log and `env_file_skipped:` in `-print-config` exist to explain exactly that
-    (see ADR 0005). The file holds the URL key and the token, so it carries the same
-    `0600` floor as the credentials file in rule 3, a malformed line refuses with its
+    (see ADR 0005). The file may name credentials (older deployments kept the lock
+    material there), so it carries the same `0600` floor as the credentials file in
+    rule 3, a malformed line refuses with its
     line number, a duplicate key is refused rather than guessed, and **only variable
     names may reach a log or a report** — never a value.
 16. **A comment is the deliverable, and a silent turn is a failure.** The agent's only
