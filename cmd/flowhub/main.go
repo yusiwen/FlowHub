@@ -199,6 +199,9 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		for _, problem := range projects.SourceProblems(sources.Names()) {
 			fmt.Printf("source_problem:     %s\n", problem)
 		}
+		for _, problem := range projects.LockProblems(cfg.Source) {
+			fmt.Printf("lock_problem:       %s\n", problem)
+		}
 		for _, problem := range projects.RuntimeProblems() {
 			fmt.Printf("runtime_problem:    %s\n", problem)
 		}
@@ -226,11 +229,25 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		}
 		return nil
 	}
+	// A delivery is attributed by its URL key before any body is parsed, so every
+	// enabled entry of the source this process serves needs its own key and token.
+	// Refusing here is what keeps the receiver from starting in a state where it
+	// would reject every delivery one at a time (ADR 0015).
+	if problems := projects.LockProblems(cfg.Source); len(problems) > 0 {
+		return fmt.Errorf("refusing to start, configuration %s:\n  - %s",
+			cfg.ConfigFile, strings.Join(problems, "\n  - "))
+	}
 	// Refuse to start on configuration that would silently widen the attack
 	// surface (a wildcard bind without an explicit acknowledgement). Checked
 	// before any file is created so a refused start leaves nothing behind.
 	if problems := cfg.Problems(); len(problems) > 0 {
 		return fmt.Errorf("refusing to start:\n  - %s", strings.Join(problems, "\n  - "))
+	}
+	// A configuration file that carries an inline secret is itself a secret. This
+	// applies whether or not dispatch is on: the entry locks are read by the
+	// receiver, so the file must be 0600 even in a record-only or flow-only process.
+	if problems := configFileSecretProblems(cfg.ConfigFile, projects); len(problems) > 0 {
+		return fmt.Errorf("refusing to start, configuration %s:\n  - %s", cfg.ConfigFile, strings.Join(problems, "\n  - "))
 	}
 	// A dispatcher that cannot reach a repository would fail one issue at a time
 	// while the operator believes the hub is running, so the same mapping is
@@ -245,9 +262,6 @@ func run(envResult config.EnvFileResult, envErr error) error {
 			return fmt.Errorf("refusing to start, dispatch is not possible:\n  - %s", strings.Join(problems, "\n  - "))
 		}
 		if problems := declaredAuthProblems(projects); len(problems) > 0 {
-			return fmt.Errorf("refusing to start, configuration %s:\n  - %s", cfg.ConfigFile, strings.Join(problems, "\n  - "))
-		}
-		if problems := configFileSecretProblems(cfg.ConfigFile, projects); len(problems) > 0 {
 			return fmt.Errorf("refusing to start, configuration %s:\n  - %s", cfg.ConfigFile, strings.Join(problems, "\n  - "))
 		}
 		if problems := shellWrapperProblems(cfg, projects); len(problems) > 0 {
@@ -286,10 +300,16 @@ func run(envResult config.EnvFileResult, envErr error) error {
 	}
 
 	if errors.Is(projectsErr, projectmap.ErrNotFound) {
-		logger.Warn("no project mapping configured: deliveries are recorded but never routed",
-			"path", cfg.ConfigFile, "hint", "copy config/config.example.json and set FLOWHUB_CONFIG_FILE")
+		logger.Warn("no project mapping configured: every delivery is refused as bad_url_key, because no project key can attribute it",
+			"path", cfg.ConfigFile, "hint", "add a project with a source object (source.hook_key and source.token) and set FLOWHUB_CONFIG_FILE")
 	} else {
-		logger.Info("project mapping loaded", "path", cfg.ConfigFile, "mappings", projects.Len(), "routable", projects.Routable(), "keys", strings.Join(projects.Keys(), ","))
+		logger.Info("project mapping loaded", "path", cfg.ConfigFile, "mappings", projects.Len(), "routable", projects.Routable(), "keys", strings.Join(projects.Keys(), ","), "entry_locks", len(projects.EntryLocks(cfg.Source)))
+		if len(projects.EntryLocks(cfg.Source)) == 0 {
+			// The table may name only projects of another source, or only disabled
+			// ones. Either way no key can match this receiver, and saying so here is
+			// the difference between "nothing arrives" and a debugging session.
+			logger.Warn("no enabled project of the served source carries entry locks: every delivery is refused as bad_url_key", "source", cfg.Source)
+		}
 	}
 
 	// Cancelled on SIGINT/SIGTERM and on a fatal serve error, so the dispatcher
@@ -464,7 +484,7 @@ func run(envResult config.EnvFileResult, envErr error) error {
 		return err
 	}
 
-	handler := webhook.New(webhookOptions(cfg, intake, src, events), sink, cache, logger, stats)
+	handler := webhook.New(webhookOptions(cfg, projects, intake, src, events), sink, cache, logger, stats)
 
 	// The paths are registered without a method so that a wrong method is still
 	// audited (and answered with 405) instead of being swallowed by ServeMux.
@@ -552,13 +572,12 @@ func run(envResult config.EnvFileResult, envErr error) error {
 // Dispatch on a nil receiver. Measured: with FLOWHUB_DISPATCH off, every
 // delivery was answered with an empty reply because that panic happened after
 // the 202 was written.
-func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src source.Source, events *upstream.Log) webhook.Options {
+func webhookOptions(cfg config.Config, projects *projectmap.Map, dispatcher *dispatch.Dispatcher, src source.Source, events *upstream.Log) webhook.Options {
 	opts := webhook.Options{
 		Source:         src,
 		HookPath:       cfg.HookPath,
-		HookKey:        cfg.HookKey,
+		Locks:          webhookLocks(projects, cfg.Source),
 		TokenHeader:    cfg.TokenHeader,
-		Token:          cfg.Token,
 		AllowedSources: cfg.AllowedSources,
 		MaxBodyBytes:   cfg.MaxBodyBytes,
 		ReplayWindow:   cfg.ReplayWindow,
@@ -571,6 +590,24 @@ func webhookOptions(cfg config.Config, dispatcher *dispatch.Dispatcher, src sour
 		opts.Events = events
 	}
 	return opts
+}
+
+// webhookLocks renders the served source's project entries as the receiver's lock
+// list. The map owns the values and the conversion stays here so internal/webhook
+// does not import internal/projectmap: the receiver compares what main hands it and
+// never learns how a routing table is written.
+func webhookLocks(projects *projectmap.Map, sourceName string) []webhook.EntryLock {
+	entries := projects.EntryLocks(sourceName)
+	locks := make([]webhook.EntryLock, 0, len(entries))
+	for _, entry := range entries {
+		locks = append(locks, webhook.EntryLock{
+			Entry:    entry.Entry,
+			Key:      entry.Key,
+			Token:    entry.Token,
+			Projects: entry.Projects,
+		})
+	}
+	return locks
 }
 
 // sourcePolicyDefaults is the outermost level of a source's trigger policy: the
@@ -765,12 +802,12 @@ func declaredAuthProblems(projects *projectmap.Map) []string {
 // An unreadable file is reported as unreadable, never as "no secret inside": the two
 // need different fixes.
 func configFileSecretProblems(path string, projects *projectmap.Map) []string {
-	if !projects.HasInlinePassword() {
+	if !projects.HasInlineLockMaterial() {
 		return nil
 	}
 	if err := projectmap.CheckSecretPermissions("configuration file", path); err != nil {
 		return []string{fmt.Sprintf(
-			"%v; this file holds an inline `password`, so it is itself a secret — move the password to `password_env`, `password_file` or `credentials_file` to drop this requirement", err)}
+			"%v; this file holds an inline secret (a project's `source.hook_key`/`source.token`, or a runtime `password`), so it is itself a secret — move lock material to the entry that needs it and keep the file at 0600", err)}
 	}
 	return nil
 }

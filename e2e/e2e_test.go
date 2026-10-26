@@ -7,6 +7,8 @@ package e2e
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,12 +66,24 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// randomLock returns a fresh 32-byte hex secret for the test project's entry lock.
+// The harness generates its own pair instead of reading one from the environment: the
+// key and token only have to agree between the config it writes and the requests it
+// posts, and an operator's real values have no business in a test process (ADR 0015).
+func randomLock() string {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		fatalf("e2e: generate a lock: %v", err)
+	}
+	return hex.EncodeToString(buf)
+}
+
 func setup() *env {
 	e := &env{
 		live:        os.Getenv("FLOWHUB_E2E_LIVE") == "1",
 		dispatch:    true,
-		hookKey:     os.Getenv("FLOWHUB_HOOK_KEY"),
-		hookToken:   os.Getenv("FLOWHUB_TOKEN"),
+		hookKey:     randomLock(),
+		hookToken:   randomLock(),
 		hubToken:    fmt.Sprintf("e2e-%d", time.Now().UnixNano()),
 		ytBase:      strings.TrimRight(os.Getenv("YOUTRACK_URL"), "/"),
 		ytToken:     os.Getenv("YOUTRACK_TOKEN"),
@@ -86,8 +100,6 @@ func setup() *env {
 		e.ocBase = "http://127.0.0.1:4096"
 	}
 	required := map[string]string{
-		"FLOWHUB_HOOK_KEY": e.hookKey,
-		"FLOWHUB_TOKEN":    e.hookToken,
 		"YOUTRACK_URL":     e.ytBase,
 		"YOUTRACK_TOKEN":   e.ytToken,
 		"YOUTRACK_PROJECT": e.ytProject,
@@ -130,7 +142,7 @@ func setup() *env {
 			fatalf("e2e: permit prompt: %v", err)
 		}
 	}
-	if err := writeTestConfig(configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject, promptFile, e.ocBase); err != nil {
+	if err := writeTestConfig(configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject, promptFile, e.ocBase, e.hookKey, e.hookToken); err != nil {
 		fatalf("e2e: write config: %v", err)
 	}
 	e.configPath = configPath
@@ -180,8 +192,6 @@ func (e *env) command() *exec.Cmd {
 		"FLOWHUB_ADDR=" + e.addr,
 		"FLOWHUB_DATA_DIR=" + filepath.Join(e.dir, "data"),
 		"FLOWHUB_CONFIG_FILE=" + e.configPath,
-		"FLOWHUB_HOOK_KEY=" + e.hookKey,
-		"FLOWHUB_TOKEN=" + e.hookToken,
 		"FLOWHUB_HUB_TOKEN=" + e.hubToken,
 		"FLOWHUB_DISPATCH=" + dispatch,
 		"FLOWHUB_OPENCODE_URL=" + e.ocBase,
@@ -191,7 +201,17 @@ func (e *env) command() *exec.Cmd {
 		"FLOWHUB_TASK_DEADLINE=5m",
 	}
 	env = append(env, e.extraEnv...)
-	cmd.Env = append(os.Environ(), env...)
+	// The operator's .env may still carry the retired FLOWHUB_HOOK_KEY /
+	// FLOWHUB_TOKEN (the Makefile sources it). Passing them to the child would make
+	// it warn about variables it no longer honours (ADR 0015).
+	base := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "FLOWHUB_HOOK_KEY=") || strings.HasPrefix(kv, "FLOWHUB_TOKEN=") {
+			continue
+		}
+		base = append(base, kv)
+	}
+	cmd.Env = append(base, env...)
 	return cmd
 }
 
@@ -1268,7 +1288,7 @@ func TestSilentTurnNudgeAndFailure(t *testing.T) {
 	server := fake.start()
 	t.Cleanup(server.Close)
 	suite.ocBase = server.URL
-	if err := writeTestConfig(suite.configPath, suite.repo, filepath.Join(suite.dir, "worktrees"), suite.ytProject, "", suite.ocBase); err != nil {
+	if err := writeTestConfig(suite.configPath, suite.repo, filepath.Join(suite.dir, "worktrees"), suite.ytProject, "", suite.ocBase, suite.hookKey, suite.hookToken); err != nil {
 		t.Fatalf("rewrite config for fake runtime: %v", err)
 	}
 	suite.start()
@@ -1327,7 +1347,7 @@ func TestSilentTurnNudgeAndFailure(t *testing.T) {
 func (e *env) pointAtRuntime(t *testing.T, baseURL string) {
 	t.Helper()
 	e.ocBase = baseURL
-	if err := writeTestConfig(e.configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject, "", e.ocBase); err != nil {
+	if err := writeTestConfig(e.configPath, e.repo, filepath.Join(e.dir, "worktrees"), e.ytProject, "", e.ocBase, e.hookKey, e.hookToken); err != nil {
 		t.Fatalf("rewrite config for runtime %s: %v", baseURL, err)
 	}
 }
@@ -3492,7 +3512,7 @@ func issueUpdatedPayload(issue, description, timestamp, project string) []byte {
 	return data
 }
 
-func writeTestConfig(path, repo, worktrees, project, promptFile, ocBase string) error {
+func writeTestConfig(path, repo, worktrees, project, promptFile, ocBase, hookKey, hookToken string) error {
 	home, _ := os.UserHomeDir()
 	data, err := os.ReadFile(filepath.Join(home, ".config", "flowhub", "config.json"))
 	if err != nil {
@@ -3516,6 +3536,12 @@ func writeTestConfig(path, repo, worktrees, project, promptFile, ocBase string) 
 	for _, item := range projects {
 		entry, ok := item.(map[string]any)
 		if ok && entry["project"] == project {
+			// The entry locks are per project (ADR 0015), and the harness posts with
+			// its own pair: overwrite whatever the operator's table carries so the
+			// test does not depend on the real deployment's secrets.
+			entry["source"] = map[string]any{
+				"name": "youtrack", "hook_key": hookKey, "token": hookToken,
+			}
 			entry["repo"].(map[string]any)["path"] = repo
 			entry["worktrees"] = worktrees
 			if promptFile != "" {

@@ -101,14 +101,14 @@ type Config struct {
 	// secret is appended as a final path segment.
 	HookPath string
 
-	// HookKey is the URL embedded shared secret (lock 1). Empty disables it.
-	HookKey string
-
-	// TokenHeader is the header carrying the shared token (lock 2).
+	// TokenHeader is the header carrying each project's token (lock 2). The
+	// expected value is per project and lives in the routing entry, not here.
 	TokenHeader string
 
-	// Token is the expected header value (lock 2). Empty disables it.
-	Token string
+	// The URL key (lock 1) and the token value (lock 2) are per project: they
+	// belong to `projects[].source` and are resolved by projectmap.EntryLocks.
+	// Keeping them out of the process-wide configuration is what lets a delivery be
+	// attributed before its body is read (ADR 0015).
 
 	// AllowedSources restricts accepted source IPs/CIDRs (lock 3). Empty
 	// disables it.
@@ -297,12 +297,10 @@ func Load() (Config, error) {
 	cfg := Config{
 		Addr:     env("FLOWHUB_ADDR", DefaultAddr),
 		HookPath: env("FLOWHUB_HOOK_PATH", DefaultHookPath),
-		// Locks are per source: a process serving two trackers must not share one URL
-		// key. The unsuffixed names stay accepted as aliases for the default source, so
-		// an existing deployment keeps working unchanged.
-		HookKey:     firstEnv("", "FLOWHUB_"+strings.ToUpper(DefaultSourceName)+"_HOOK_KEY", "FLOWHUB_HOOK_KEY"),
+		// The URL key and token are not process-wide: each project's binding names
+		// its own pair (ADR 0015). Only the header name is shared, because it is
+		// part of the app's wire format rather than a secret.
 		TokenHeader: env("FLOWHUB_TOKEN_HEADER", DefaultTokenHeader),
-		Token:       firstEnv("", "FLOWHUB_"+strings.ToUpper(DefaultSourceName)+"_TOKEN", "FLOWHUB_TOKEN"),
 		DataDir:     env("FLOWHUB_DATA_DIR", DefaultDataDir),
 		LogFile:     env("FLOWHUB_LOG_FILE", ""),
 		ConfigFile:  firstEnv(DefaultProjectsFile(), "FLOWHUB_CONFIG_FILE", "FLOWHUB_PROJECTS_FILE"),
@@ -540,15 +538,11 @@ func (c Config) validate() error {
 	return nil
 }
 
-// ActiveLocks lists the entry locks currently enforced, in evaluation order.
+// ActiveLocks lists the lock types the delivery pipeline enforces, in evaluation
+// order. The key and token values are per project (ADR 0015); this summary says
+// which checks run, not which secrets they compare.
 func (c Config) ActiveLocks() []string {
-	var locks []string
-	if c.HookKey != "" {
-		locks = append(locks, "url_key")
-	}
-	if c.Token != "" {
-		locks = append(locks, "header_token")
-	}
+	locks := []string{"url_key", "header_token"}
 	if len(c.AllowedSources) > 0 {
 		locks = append(locks, "source_ip")
 	}
@@ -560,11 +554,16 @@ func (c Config) ActiveLocks() []string {
 // minimum bar, and a silently disabled lock is the worst outcome.
 func (c Config) Warnings() []string {
 	var warns []string
-	if c.HookKey == "" {
-		warns = append(warns, "FLOWHUB_HOOK_KEY is unset: lock 1 (URL embedded key) is DISABLED")
-	}
-	if c.Token == "" {
-		warns = append(warns, "FLOWHUB_TOKEN is unset: lock 2 (header token) is DISABLED")
+	// The URL key and token moved into the project entry (ADR 0015). A leftover
+	// global variable is a setting that silently does nothing — the operator would
+	// rotate it and see no effect — so it is named even though it cannot be honoured.
+	for _, name := range []string{
+		"FLOWHUB_HOOK_KEY", "FLOWHUB_TOKEN",
+		"FLOWHUB_YOUTRACK_HOOK_KEY", "FLOWHUB_YOUTRACK_TOKEN",
+	} {
+		if os.Getenv(name) != "" {
+			warns = append(warns, name+" is set but no longer used: the URL key and token are per project (projects[].source.hook_key / .token)")
+		}
 	}
 	if len(c.AllowedSources) == 0 {
 		warns = append(warns, "FLOWHUB_ALLOWED_SOURCES is unset: lock 3 (source IP allowlist) is DISABLED")
@@ -752,9 +751,8 @@ func (c Config) Report() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "addr:               %s\n", c.Addr)
 	fmt.Fprintf(&b, "hook_path:          %s\n", c.HookPath)
-	fmt.Fprintf(&b, "hook_key:           %s\n", MaskSecret(c.HookKey))
 	fmt.Fprintf(&b, "token_header:       %s\n", c.TokenHeader)
-	fmt.Fprintf(&b, "token:              %s\n", MaskSecret(c.Token))
+	fmt.Fprintf(&b, "entry_locks:        per project (projects[].source.hook_key / .token; see the routing report)\n")
 	sources := make([]string, 0, len(c.AllowedSources))
 	for _, n := range c.AllowedSources {
 		sources = append(sources, n.String())

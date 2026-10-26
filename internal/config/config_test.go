@@ -62,8 +62,6 @@ func TestLoadUsesSafeDefaults(t *testing.T) {
 
 func TestLoadReadsEnvironment(t *testing.T) {
 	t.Setenv("FLOWHUB_ADDR", "10.8.0.5:9000")
-	t.Setenv("FLOWHUB_HOOK_KEY", "abc")
-	t.Setenv("FLOWHUB_TOKEN", "def")
 	t.Setenv("FLOWHUB_ALLOWED_SOURCES", "10.8.0.0/24")
 	t.Setenv("FLOWHUB_REPLAY_WINDOW", "0")
 	t.Setenv("FLOWHUB_LOG_HEADERS", "true")
@@ -72,7 +70,7 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Addr != "10.8.0.5:9000" || cfg.HookKey != "abc" || cfg.Token != "def" {
+	if cfg.Addr != "10.8.0.5:9000" {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 	if len(cfg.AllowedSources) != 1 {
@@ -242,7 +240,7 @@ func TestWarningsNameEveryDisabledLock(t *testing.T) {
 		ShutdownTimeout: DefaultShutdown,
 	}
 	warnings := strings.Join(cfg.Warnings(), "\n")
-	for _, want := range []string{"FLOWHUB_HOOK_KEY", "FLOWHUB_TOKEN", "FLOWHUB_ALLOWED_SOURCES", "FLOWHUB_REPLAY_WINDOW"} {
+	for _, want := range []string{"FLOWHUB_ALLOWED_SOURCES", "FLOWHUB_REPLAY_WINDOW"} {
 		if !strings.Contains(warnings, want) {
 			t.Fatalf("warnings do not mention %s:\n%s", want, warnings)
 		}
@@ -268,13 +266,11 @@ func TestMaskSecretNeverLeaksTheValue(t *testing.T) {
 	}
 }
 
-func TestReportMasksSecrets(t *testing.T) {
+func TestReportShowsTheLockSummary(t *testing.T) {
 	cfg := Config{
 		Addr:            DefaultAddr,
 		HookPath:        DefaultHookPath,
-		HookKey:         "0123456789abcdef0123456789abcdef",
 		TokenHeader:     DefaultTokenHeader,
-		Token:           "feedfacefeedface",
 		DataDir:         DefaultDataDir,
 		MaxBodyBytes:    DefaultMaxBodyBytes,
 		ReplayWindow:    time.Minute,
@@ -285,8 +281,8 @@ func TestReportMasksSecrets(t *testing.T) {
 		ShutdownTimeout: time.Second,
 	}
 	report := cfg.Report()
-	if strings.Contains(report, cfg.HookKey) || strings.Contains(report, cfg.Token) {
-		t.Fatalf("report leaks a secret:\n%s", report)
+	if !strings.Contains(report, "entry_locks:        per project") {
+		t.Fatalf("report does not say the locks are per project:\n%s", report)
 	}
 	if !strings.Contains(report, "active_locks:       url_key,header_token") {
 		t.Fatalf("report lacks the active locks:\n%s", report)
