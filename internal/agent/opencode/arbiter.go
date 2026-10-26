@@ -114,6 +114,10 @@ func DefaultArbiter() *Arbiter {
 			mustCompile(`go\s+mod\s+(verify)(\s.*)?`),
 			mustCompile(`(make|npm|pnpm|yarn|bun)\s+(test|tests|lint|build|check|typecheck|verify)(\s.*)?`),
 			mustCompile(`(npm|pnpm|yarn|bun)\s+run\s+(test|lint|build|check|typecheck)(\s.*)?`),
+			// Maven and its wrapper are a Java repository's build/test entry point,
+			// exactly as `go test` and `make test` are for the others. The publishing
+			// goals stay on the deny list: a task may build and test, never deploy.
+			mustCompile(`(mvn|mvnw|\./mvnw)(\s.*)?`),
 			// Checkers that only report. Formatters that rewrite files are in
 			// ExecutionAllow instead, so a read-only turn cannot change the tree.
 			mustCompile(`(ruff\s+check|mypy|eslint|tsc|staticcheck|golangci-lint|gofmt\s+-[ld])(\s.*)?`),
@@ -139,7 +143,14 @@ func DefaultArbiter() *Arbiter {
 			mustCompile(`(docker|podman|kubectl|helm|systemctl|launchctl|service|kill|pkill|killall|shutdown|reboot)\b.*`),
 			mustCompile(`(npm|pnpm|yarn|bun|pip|pip3|gem|cargo|go)\s+(install|publish|add|remove|uninstall|get)\b.*`),
 			mustCompile(`(sh|bash|zsh|fish|python|python3|perl|ruby|node|osascript|env|printenv)\b.*`),
-			mustCompile(`.*[;&|].*`), // any separator that survived splitting is suspicious
+			// Publishing from Maven is a remote write: `deploy` and the release
+			// plugin stay impossible even though the build goals are allowed.
+			mustCompile(`(mvn|mvnw|\./mvnw)(\s+\S+)*\s+(deploy\S*|\S*:deploy\S*|release:\S+)(\s.*)?`),
+			// `find -exec` runs another command that the allowlist never saw. The
+			// separator check below catches the usual `;`, but an escaped `\;` is
+			// data to the splitter and syntax to find, so the construct is refused
+			// whole.
+			mustCompile(`find\b.*\s-(exec|execdir|ok|okdir)\b.*`),
 		},
 		AllowKinds: map[string]bool{
 			// Read-only built-ins. `read` cannot leave the worktree because the
@@ -258,16 +269,112 @@ func unsafeShell(command string) (bool, string) {
 }
 
 // splitSegments breaks a compound command into the parts that each get judged.
+// A separator inside single or double quotes is data, not a pipeline: a grep
+// alternation (`"a\|b"`) and a format string (`"%h && %s"`) must stay in one
+// segment. A backslash-escaped separator outside quotes is data too, because the
+// shell strips the backslash before the command sees it.
+//
+// The scan mirrors unsafeShell's quote rules on purpose: the splitter and the
+// construct check must agree about what is quoted, or one of them judges text the
+// other treats as syntax.
 func splitSegments(command string) []string {
-	replaced := strings.NewReplacer("&&", "\n", "||", "\n", ";", "\n", "|", "\n", "\r", "\n").Replace(command)
 	var segments []string
-	for _, line := range strings.Split(replaced, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			segments = append(segments, line)
+	var current strings.Builder
+	var quote byte
+	flush := func() {
+		if segment := strings.TrimSpace(current.String()); segment != "" {
+			segments = append(segments, segment)
+		}
+		current.Reset()
+	}
+	for index := 0; index < len(command); index++ {
+		char := command[index]
+		switch quote {
+		case '\'':
+			current.WriteByte(char)
+			if char == '\'' {
+				quote = 0
+			}
+			continue
+		case '"':
+			current.WriteByte(char)
+			switch char {
+			case '\\':
+				// Keep the escape and the byte it protects, so a quote inside the
+				// string cannot end it here.
+				if index+1 < len(command) {
+					index++
+					current.WriteByte(command[index])
+				}
+			case '"':
+				quote = 0
+			}
+			continue
+		}
+		switch char {
+		case '\'', '"':
+			quote = char
+			current.WriteByte(char)
+		case '\\':
+			current.WriteByte(char)
+			if index+1 < len(command) {
+				index++
+				current.WriteByte(command[index])
+			}
+		case ';', '\n', '\r':
+			flush()
+		case '&':
+			if index+1 < len(command) && command[index+1] == '&' {
+				flush()
+				index++
+			} else {
+				current.WriteByte(char)
+			}
+		case '|':
+			flush()
+			if index+1 < len(command) && command[index+1] == '|' {
+				index++
+			}
+		default:
+			current.WriteByte(char)
 		}
 	}
+	flush()
 	return segments
+}
+
+// hasUnquotedSeparator reports whether a segment still contains a separator that
+// the splitter should have consumed. It is the safety net for a splitter bug: a
+// quoted or escaped separator is data, anything else means the command was not
+// broken into judgeable parts.
+func hasUnquotedSeparator(segment string) bool {
+	var quote byte
+	for index := 0; index < len(segment); index++ {
+		char := segment[index]
+		switch quote {
+		case '\'':
+			if char == '\'' {
+				quote = 0
+			}
+		case '"':
+			switch char {
+			case '\\':
+				index++
+			case '"':
+				quote = 0
+			}
+		default:
+			switch char {
+			case '\'', '"':
+				quote = char
+			case '\\':
+				index++
+			case ';', '|', '&':
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func mustCompile(pattern string) *regexp.Regexp {

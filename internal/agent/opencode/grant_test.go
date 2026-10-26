@@ -15,7 +15,7 @@ func grantedArbiter(commands ...string) *Arbiter {
 // a human authorised that exact string.
 func TestAGrantedCommandIsJudgedByTheDenyListAlone(t *testing.T) {
 	for _, command := range []string{
-		"mvn -q verify",
+		"pytest -q",
 		"git stash pop",
 		"make integration-test",
 		"gotcha --now",
@@ -34,19 +34,19 @@ func TestAGrantedCommandIsJudgedByTheDenyListAlone(t *testing.T) {
 // human made it: the string they read in the comment, and nothing that merely resembles
 // it.
 func TestAGrantIsLiteral(t *testing.T) {
-	arbiter := grantedArbiter("mvn -q verify")
+	arbiter := grantedArbiter("pytest -q")
 	for _, command := range []string{
-		"mvn -q verify -DskipTests", // an extra flag is a different command
-		"mvn  -q verify",            // different whitespace is a different string
-		"mvn verify",
-		"mvn -q verify --also-make",
+		"pytest -q -k auth", // an extra flag is a different command
+		"pytest  -q",        // different whitespace is a different string
+		"pytest",
+		"pytest -q tests/",
 	} {
 		if decision := arbiter.Decide(bashRequest(command)); decision.Allowed() {
-			t.Errorf("a grant of %q also allowed %q", "mvn -q verify", command)
+			t.Errorf("a grant of %q also allowed %q", "pytest -q", command)
 		}
 	}
 	// The authorised string itself, and only it, is allowed.
-	if decision := arbiter.Decide(bashRequest("mvn -q verify")); !decision.Allowed() {
+	if decision := arbiter.Decide(bashRequest("pytest -q")); !decision.Allowed() {
 		t.Fatalf("the granted command was refused: %s", decision.Reason)
 	}
 }
@@ -127,13 +127,13 @@ func TestAGrantFollowsTheWrapperItWasRecordedWith(t *testing.T) {
 // granted command too, or every granted compound line would be refused by its own
 // patterns — a permission that the auditor half of the policy does not believe in.
 func TestAGrantedCommandAgreesWithTheRequestsOwnPatterns(t *testing.T) {
-	arbiter := grantedArbiter("mvn -q verify")
-	decision := arbiter.Decide(bashRequest("mvn -q verify && ls", "mvn -q verify", "ls"))
+	arbiter := grantedArbiter("pytest -q")
+	decision := arbiter.Decide(bashRequest("pytest -q && ls", "pytest -q", "ls"))
 	if !decision.Allowed() {
 		t.Fatalf("a granted command inside a compound line was refused: %s", decision.Reason)
 	}
 	// The pattern cross-check still refuses what the command path would.
-	disagreement := arbiter.Decide(bashRequest("mvn -q verify", "mvn -q verify", "rm -rf /"))
+	disagreement := arbiter.Decide(bashRequest("pytest -q", "pytest -q", "rm -rf /"))
 	if disagreement.Allowed() {
 		t.Fatal("a granted command smuggled a denied pattern through")
 	}
@@ -144,7 +144,7 @@ func TestAGrantedCommandAgreesWithTheRequestsOwnPatterns(t *testing.T) {
 // control is the same command with no grant at all.
 func TestAnEmptyGrantAuthorisesNothing(t *testing.T) {
 	arbiter := grantedArbiter("", "   ")
-	for _, command := range []string{"mvn -q verify", "git stash pop"} {
+	for _, command := range []string{"pytest -q", "git stash pop"} {
 		if decision := arbiter.Decide(bashRequest(command)); decision.Allowed() {
 			t.Errorf("an empty grant allowed %q", command)
 		}

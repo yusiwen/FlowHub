@@ -1260,7 +1260,7 @@ func assertNoOverlappingTurns(t *testing.T, fake *fakeOpencode, reason string) {
 // "reject" a moment earlier.
 func TestAPermitAuthorisesExactlyWhatWasRefusedAndContinuesTheTask(t *testing.T) {
 	fake := newFakeOpencode(t)
-	fake.permissionCommand = "mvn -q verify"
+	fake.permissionCommand = "pytest -q"
 	server := fake.start()
 	defer server.Close()
 	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
@@ -1271,7 +1271,7 @@ func TestAPermitAuthorisesExactlyWhatWasRefusedAndContinuesTheTask(t *testing.T)
 	if !ok {
 		t.Fatal("the task was not recorded")
 	}
-	if len(task.Refusals) != 1 || task.Refusals[0].Command != "mvn -q verify" {
+	if len(task.Refusals) != 1 || task.Refusals[0].Command != "pytest -q" {
 		t.Fatalf("refusals = %+v, want the refused command recorded", task.Refusals)
 	}
 	if task.LastAction != string(rules.ActionAnalyze) {
@@ -1289,7 +1289,7 @@ func TestAPermitAuthorisesExactlyWhatWasRefusedAndContinuesTheTask(t *testing.T)
 	if len(prompts) != 2 {
 		t.Fatalf("prompts = %d, want the permit to run a continuation turn", len(prompts))
 	}
-	for _, want := range []string{"## Authorised commands", "mvn -q verify", rules.PermitTrigger} {
+	for _, want := range []string{"## Authorised commands", "pytest -q", rules.PermitTrigger} {
 		if !strings.Contains(prompts[1], want) {
 			t.Errorf("the continuation prompt is missing %q", want)
 		}
@@ -1299,7 +1299,7 @@ func TestAPermitAuthorisesExactlyWhatWasRefusedAndContinuesTheTask(t *testing.T)
 	}
 
 	task, _ = reg.Get(youtrack.SourceName, "TEST-60")
-	if task.Grant == nil || len(task.Grant.Commands) != 1 || task.Grant.Commands[0] != "mvn -q verify" {
+	if task.Grant == nil || len(task.Grant.Commands) != 1 || task.Grant.Commands[0] != "pytest -q" {
 		t.Fatalf("grant = %+v, want the refused command authorised", task.Grant)
 	}
 	if task.Grant.By != "yusiwen" {
@@ -1320,7 +1320,7 @@ func TestAPermitAuthorisesExactlyWhatWasRefusedAndContinuesTheTask(t *testing.T)
 // judged by the policy alone again.
 func TestARevokeTakesTheAuthorisationBack(t *testing.T) {
 	fake := newFakeOpencode(t)
-	fake.permissionCommand = "mvn -q verify"
+	fake.permissionCommand = "pytest -q"
 	server := fake.start()
 	defer server.Close()
 	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
@@ -1359,7 +1359,7 @@ func TestARevokeTakesTheAuthorisationBack(t *testing.T) {
 // be able to authorise a command.
 func TestTheAgentCannotGrantItselfAPermit(t *testing.T) {
 	fake := newFakeOpencode(t)
-	fake.permissionCommand = "mvn -q verify"
+	fake.permissionCommand = "pytest -q"
 	server := fake.start()
 	defer server.Close()
 	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
@@ -1407,7 +1407,7 @@ func TestAPermitWithNothingRefusedDoesNothing(t *testing.T) {
 // it — the failure this test exists to prevent.
 func TestAPermitContinuesInThePhaseTheRefusalsStopped(t *testing.T) {
 	fake := newFakeOpencode(t)
-	fake.permissionCommand = "mvn -q verify"
+	fake.permissionCommand = "pytest -q"
 	server := fake.start()
 	defer server.Close()
 	dispatcher, reg, _ := newTestDispatcher(t, fake, server)

@@ -132,6 +132,12 @@ func (a *Arbiter) decideBash(req PermissionRequest) Decision {
 	}
 
 	for _, segment := range segments {
+		if hasUnquotedSeparator(segment) {
+			return Decision{
+				Reply:  ReplyReject,
+				Reason: fmt.Sprintf("command segment %q still contains an unquoted separator after splitting, so it cannot be judged", segment),
+			}
+		}
 		// A configured wrapper is stripped before anything is judged, and the
 		// remainder is judged by the same lists as an unwrapped command would be.
 		target, wrapper := a.stripWrappers(segment)
@@ -226,6 +232,15 @@ func (a *Arbiter) decideBash(req PermissionRequest) Decision {
 		pattern = strings.TrimSpace(pattern)
 		if pattern == "" {
 			continue
+		}
+		// The server reports one pattern per segment it received. A pattern that
+		// still contains an unquoted separator is not a segment, and accepting it
+		// would let the pattern list disagree with what was judged above.
+		if hasUnquotedSeparator(pattern) {
+			return Decision{
+				Reply:  ReplyReject,
+				Reason: fmt.Sprintf("request pattern %q contains an unquoted separator, so it is not a single command", pattern),
+			}
 		}
 		target, wrapper := a.stripWrappers(pattern)
 		if matchesAny(a.ExecutionAllow, target) {
