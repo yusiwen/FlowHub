@@ -47,13 +47,26 @@ toolchain.
 
 ```bash
 make build            # -> bin/flowhub, with version/commit/build-time stamped in
-make secrets          # prints a fresh FLOWHUB_HOOK_KEY / FLOWHUB_TOKEN pair
+make secrets          # prints a fresh hook_key / token pair for one project
 
-export FLOWHUB_HOOK_KEY=$(openssl rand -hex 32)   # goes into the webhook URL
-export FLOWHUB_TOKEN=$(openssl rand -hex 32)      # goes into the header
+mkdir -p ~/.config/flowhub
+cat > ~/.config/flowhub/config.json <<'EOF'
+{
+  "version": 2,
+  "projects": [
+    {
+      "source": {"name": "youtrack", "hook_key": "<the hook_key>", "token": "<the token>"},
+      "project": "<YOUR_PROJECT_KEY>",
+      "repo": {"path": "/absolute/path/to/your/repo"}
+    }
+  ]
+}
+EOF
+chmod 600 ~/.config/flowhub/config.json   # it carries the project's locks
+
 export FLOWHUB_DATA_DIR=./data
 
-./bin/flowhub -print-config   # verify the effective settings (secrets masked)
+./bin/flowhub -print-config   # verify the effective settings (secrets never printed)
 ./bin/flowhub
 ```
 
@@ -62,9 +75,13 @@ Triggers → Settings`):
 
 | Setting | Value |
 | --- | --- |
-| Webhook URL | `https://<your-host>/hooks/youtrack/<FLOWHUB_HOOK_KEY>` |
+| Webhook URL (**per project**) | `https://<your-host>/hooks/youtrack/<that project's source.hook_key>` |
 | Header name | `X-YouTrack-Token` |
-| Token | the same value as `FLOWHUB_TOKEN` |
+| Token | that project's `source.token` |
+
+Each project is a separate app attachment, so each has its own URL key and token.
+A key copied from one project's settings cannot post another project's events: the
+receiver refuses the payload with `project_mismatch`.
 
 The service must be reachable from YouTrack. During development you can drive it
 directly with `curl` (see below) instead of exposing a public domain.
@@ -78,10 +95,8 @@ set), beside the routing table.
 ```bash
 mkdir -p ~/.config/flowhub
 cat > ~/.config/flowhub/.env <<'EOF'
-# FlowHub settings for this machine. Mode 0600: this file holds the URL key
-# and the token.
-FLOWHUB_HOOK_KEY=<hex>
-FLOWHUB_TOKEN=<hex>
+# FlowHub settings for this machine. Mode 0600: the file may name credentials.
+# The project entry locks live in config.json, not here.
 FLOWHUB_ALLOWED_SOURCES=127.0.0.1
 EOF
 chmod 600 ~/.config/flowhub/.env
@@ -93,7 +108,7 @@ chmod 600 ~/.config/flowhub/.env
 reports both lists:
 
 ```
-msg="environment file applied" path=/home/you/.config/flowhub/.env applied=FLOWHUB_HOOK_KEY,FLOWHUB_TOKEN,FLOWHUB_ALLOWED_SOURCES skipped_already_set=FLOWHUB_ADDR
+msg="environment file applied" path=/home/you/.config/flowhub/.env applied=FLOWHUB_ALLOWED_SOURCES skipped_already_set=FLOWHUB_ADDR
 ```
 
 `skipped_already_set` names the variables the file carried but the environment had
@@ -129,16 +144,17 @@ Two related settings, so the precedence is in one place:
 ### Local delivery test
 
 ```bash
-KEY=$(openssl rand -hex 32); TOKEN=$(openssl rand -hex 32)
-FLOWHUB_HOOK_KEY=$KEY FLOWHUB_TOKEN=$TOKEN FLOWHUB_ALLOWED_SOURCES=127.0.0.1 \
-FLOWHUB_LOG_HEADERS=true ./bin/flowhub &
+KEY=$(jq -r '.projects[0].source.hook_key' ~/.config/flowhub/config.json)
+TOKEN=$(jq -r '.projects[0].source.token' ~/.config/flowhub/config.json)
+PROJECT=$(jq -r '.projects[0].project' ~/.config/flowhub/config.json)
+FLOWHUB_ALLOWED_SOURCES=127.0.0.1 FLOWHUB_LOG_HEADERS=true ./bin/flowhub &
 
 TS=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
 curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' \
   -X POST "http://127.0.0.1:8080/hooks/youtrack/$KEY" \
   -H "X-YouTrack-Token: $TOKEN" -H 'Content-Type: application/json' \
   -d '{"event":"issueUpdated","timestamp":"'"$TS"'","id":"2-123","summary":"Fix login",
-       "project":{"key":"SP","name":"Sample Project","shortName":"SP"},
+       "project":{"key":"'"$PROJECT"'","name":"Sample Project","shortName":"'"$PROJECT"'"},
        "updatedBy":{"login":"jane.doe","fullName":"Jane Doe"},
        "changedFields":[{"name":"State","oldValue":{"name":"Open"},"value":{"name":"In Progress"}}]}'
 # => 202 0.0004s
@@ -283,9 +299,7 @@ Flags: `-version`, `-print-config`.
 | `FLOWHUB_ADDR` | `127.0.0.1:8080` | Listen address. Bind the WireGuard address, the LAN address a router forwards to, or loopback behind a reverse proxy. A wildcard bind (`0.0.0.0:8080`, `:8080`, `[::]:8080`) refuses to start unless `FLOWHUB_ALLOW_WILDCARD_LISTEN=1` acknowledges it |
 | `FLOWHUB_ALLOW_WILDCARD_LISTEN` | `false` | Acknowledge a wildcard bind. Required for container images (the process must listen on the pod address); the right choice nowhere else |
 | `FLOWHUB_HOOK_PATH` | `/hooks/youtrack` | Base path of the endpoint |
-| `FLOWHUB_HOOK_KEY` | *(unset)* | Lock 1: URL embedded secret. Empty disables the lock |
-| `FLOWHUB_TOKEN_HEADER` | `X-YouTrack-Token` | Header carrying the shared token |
-| `FLOWHUB_TOKEN` | *(unset)* | Lock 2: expected header value. Empty disables the lock |
+| `FLOWHUB_TOKEN_HEADER` | `X-YouTrack-Token` | Header carrying each project's token; the value is `projects[].source.token` |
 | `FLOWHUB_ALLOWED_SOURCES` | *(unset)* | Lock 3: comma separated IPs/CIDRs, e.g. `10.8.0.0/24,127.0.0.1`. Empty disables the lock |
 | `FLOWHUB_DATA_DIR` | `./data` | Audit log directory (created `0700`, files `0600`) |
 | `FLOWHUB_MAX_BODY_BYTES` | `262144` | Body cap; mirrors nginx `client_max_body_size` |
@@ -305,9 +319,14 @@ Flags: `-version`, `-print-config`.
 | `FLOWHUB_PROJECTS_FILE` | *(alias)* | The old name of `FLOWHUB_CONFIG_FILE`, still read. The file is no longer only a routing table, so the new spelling is preferred; setting both uses `FLOWHUB_CONFIG_FILE` |
 | `FLOWHUB_ENV_FILE` | `~/.config/flowhub/.env` | An environment file applied at startup, whose values are **defaults**: a variable already set in the environment wins. `-` (or `none`, `off`) disables it. A named path that does not exist stops startup; an absent default path does not. The file must be mode `0600`, because it holds the URL key and the token |
 | `FLOWHUB_SOURCE` | `youtrack` | Which registered event source this receiver serves. It selects the adapter that decodes deliveries and the `sources.<name>` block that supplies the trigger policy |
-| `FLOWHUB_YOUTRACK_HOOK_KEY` | *(unset)* | Lock 1 (URL key) for the YouTrack source. `FLOWHUB_HOOK_KEY` is the same variable under its old name; a second source gets its own, which is why the locks are per source |
-| `FLOWHUB_YOUTRACK_TOKEN` | *(unset)* | Lock 2 (header token) for YouTrack. `FLOWHUB_TOKEN` is the alias |
 | `FLOWHUB_YOUTRACK_ALLOWED_SOURCES` | *(unset)* | Lock 3 (source IP allowlist) for YouTrack. `FLOWHUB_ALLOWED_SOURCES` is the alias |
+
+The URL key (lock 1) and the header token (lock 2) are **per project**: they are
+`projects[].source.hook_key` and `projects[].source.token` in the configuration
+file. The file therefore must be mode `0600`, and `-print-config` reports only that
+a lock exists. The old global variables (`FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN`,
+`FLOWHUB_YOUTRACK_HOOK_KEY`, `FLOWHUB_YOUTRACK_TOKEN`) are no longer read; a process
+that still has one set logs a warning naming it (ADR 0015).
 
 The dispatcher (`opencode-devops-orchestration-design.md` §12) is off until it is
 switched on explicitly:
@@ -363,17 +382,21 @@ service was started without the task service (`FLOWHUB_DISPATCH=0`). Every reque
 `Authorization: Bearer $FLOWHUB_HUB_TOKEN`; an unset token answers `503`. The
 builtin flow is **off** by default; `flowhub flow mode default-youtrack shadow`
 turns on the shadow evaluation. `on` executes the built-in pipeline through the
-shared task service and must name its projects; it requires `FLOWHUB_DISPATCH=1`
-because that process owns the task service and the runtime inventory. With `on`,
-dispatch skips those projects so exactly one orchestrator runs their turns.
+shared task service and must name its projects. The service is built either because
+`FLOWHUB_DISPATCH=1`, or because the persisted mode was already `on` when a
+dispatch-off process started (then only the task service is built, not the dispatch
+intake). With `on`, dispatch skips those projects so exactly one orchestrator runs
+their turns.
 
 `FLOWHUB_DISPATCH=1` refuses to start when dispatching cannot work: no routing
 table, an entry with no `default_branch`, an entry with no `worktrees` directory
 and no fallback, or an opencode server that is not answering. A hub that accepts
 deliveries and then fails every one of them is worse than one that does not start.
 
-Disabled locks produce a loud startup warning, and `-print-config` lists the
-active locks. All three locks are expected to be set once the public entry exists
+The URL key and token are **per project and required**: an enabled entry without
+`source.hook_key` or `source.token` refuses startup, and `-print-config` lists the
+lock types plus each entry's presence (never a value). The source IP allowlist is
+the only lock that can be disabled, and it warns when it is
 (`youtrack-webhook-and-flowhub-security.md` §12.2).
 
 ## Routing: YouTrack project → repository
@@ -410,7 +433,11 @@ cp config/config.example.json ~/.config/flowhub/config.json   # then edit it
 
   "projects": [
     {
-      "source": "youtrack",
+      "source": {
+        "name": "youtrack",
+        "hook_key": "0123...cdef",
+        "token": "89ab...4567"
+      },
       "project": "BEAP_BE",
       "also": ["BEAP"],
       "repo": {
@@ -427,10 +454,10 @@ cp config/config.example.json ~/.config/flowhub/config.json   # then edit it
 }
 ```
 
-The file has three parts and one rule: **no secret is ever written in it unless you
-choose to.** Locks and key material stay in the environment
-(`FLOWHUB_YOUTRACK_HOOK_KEY`, `FLOWHUB_YOUTRACK_TOKEN`,
-`FLOWHUB_YOUTRACK_ALLOWED_SOURCES`). A runtime's password has four sources, and a
+The file has three parts. **Secrets are opt-in:** a project's entry locks
+(`projects[].source.hook_key` / `.token`) are written here because they address the
+project, so the file is itself a secret and must be mode `0600`; the source IP
+allowlist stays in the environment. A runtime's password has four sources, and a
 block names exactly one of them:
 
 | Source | Written as | Where the secret lives |
@@ -464,10 +491,11 @@ time, and an unset or empty variable refuses the start rather than becoming an
 empty password.
 
 **A file that holds a secret must be mode `0600`.** A `credentials_file`, any
-`password_file`, and the configuration file *when it carries an inline `password`*
-are refused at startup if group or other can read or write them, and the message
-names the `chmod 600` fix. A configuration file that only names variables and paths
-carries no secret and is not checked, so an existing `0644` table keeps working.
+`password_file`, and the configuration file *when it carries an inline `password`,
+`source.hook_key` or `source.token`* are refused at startup if group or other can
+read or write them, and the message names the `chmod 600` fix. A configuration file
+with no inline secret (no entry locks and no inline password) carries none and is
+not checked, so an existing `0644` table keeps working.
 (The check reads permission bits; a macOS ACL that *grants* access is outside them,
 so this is a floor rather than a proof.)
 
@@ -908,8 +936,8 @@ model recovered by sending a single-line subject.
 The live run recovered the deployment's real URL key from FlowHub's own audit
 log. `Handler.redact` replaced only the *configured* key, and the deliveries that
 get audited are exactly the ones whose key did **not** match — so any receiver
-started with a rotated or freshly generated key (which is what
-`export FLOWHUB_HOOK_KEY=$(openssl rand -hex 32)` does on every restart) wrote
+started with a rotated or freshly generated key (which is what regenerating a key
+on every restart did) wrote
 the app's live key into `data/webhook-*.jsonl` and `data/payload-*.log` in
 plaintext. Redaction is now by *shape*: in a path, the segment after the hook base
 is the key; in a query string it is `k`. It is applied whether or not lock 1 is
@@ -954,7 +982,8 @@ flow engine will never see.
 | --- | --- |
 | `method_not_allowed` | Anything but `POST` (answered `405`) |
 | `bad_url_key` | Path/query key missing or wrong |
-| `bad_header_token` | Token header missing or wrong (constant-time compare) |
+| `bad_header_token` | Token header missing or wrong for the project the key selected (constant-time compare) |
+| `project_mismatch` | The payload's project is not one of the entry's keys (`project` or `also`); a TEST key cannot post a BEAP_BE event |
 | `source_not_allowed` | Source IP outside `FLOWHUB_ALLOWED_SOURCES` |
 | `body_too_large` | Body above `FLOWHUB_MAX_BODY_BYTES` (answered `413`) |
 | `body_read_error` | The body could not be read |
@@ -1151,10 +1180,10 @@ only address that works, and the isolation comes from how the port is published:
 docker run -d --name flowhub \
   -e FLOWHUB_ADDR=0.0.0.0:8080 \
   -e FLOWHUB_ALLOW_WILDCARD_LISTEN=1 \
-  -e FLOWHUB_HOOK_KEY=... -e FLOWHUB_TOKEN=... \
   -e FLOWHUB_ALLOWED_SOURCES=172.17.0.0/16 \
   -p 127.0.0.1:8080:8080 \
   -v /srv/flowhub/data:/data -e FLOWHUB_DATA_DIR=/data \
+  -v /srv/flowhub/config.json:/config.json:ro -e FLOWHUB_CONFIG_FILE=/config.json \
   flowhub
 ```
 
@@ -1191,7 +1220,7 @@ make staticcheck  # pinned staticcheck
 make fmt          # gofmt -w on the Go sources
 make fmt-check    # fail if any Go file is not gofmt-clean
 make smoke        # end-to-end: real process, real HTTP, asserts the logs
-make secrets      # print a fresh FLOWHUB_HOOK_KEY / FLOWHUB_TOKEN pair
+make secrets      # print a fresh hook_key / token pair for one project
 make fuzz         # fuzz the webhook parser (FUZZTIME=30s)
 make test-live    # live turn against opencode (OPENCODE_LIVE=1, spends tokens)
 make all          # cross-compile linux-amd64, linux-arm64, darwin-arm64

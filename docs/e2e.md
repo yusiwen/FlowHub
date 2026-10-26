@@ -24,8 +24,11 @@ The suite reads:
 
 - `YOUTRACK_URL`, `YOUTRACK_PROJECT`, `YOUTRACK_TOKEN`, `E2E_REPO` and `E2E_ISSUE`
   from a `0600` file such as `/tmp/flowhub-e2e.env`;
-- `FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN` and the opencode credentials from
-  `~/.config/flowhub/.env`.
+- the opencode credentials from `~/.config/flowhub/.env`.
+
+The harness generates its own hook key and token for each run and writes them into
+the test config it generates as the TEST project's `source.hook_key` and
+`source.token`; the receiver no longer reads a process-wide pair (ADR 0015).
 
 Do not commit either file or print its values. The test token can be placed by a
 human; the harness never writes it to the repository.

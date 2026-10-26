@@ -161,7 +161,7 @@ clean; `gofmt -l .` reports nothing.
 ```bash
 nix develop            # or `direnv allow` once; provides Go, curl, jq, openssl
 make build             # -> bin/flowhub with version/commit/build-time stamped in
-make secrets           # print a fresh FLOWHUB_HOOK_KEY / FLOWHUB_TOKEN pair
+make secrets           # print a fresh hook_key / token pair for one project
 make smoke             # end-to-end check against a real process
 ```
 
@@ -169,11 +169,9 @@ Manual run:
 
 ```bash
 make build
-FLOWHUB_HOOK_KEY=$(openssl rand -hex 32) \
-FLOWHUB_TOKEN=$(openssl rand -hex 32) \
 FLOWHUB_ALLOWED_SOURCES=127.0.0.1 \
 FLOWHUB_LOG_HEADERS=true \
-./bin/flowhub -print-config
+./bin/flowhub -print-config   # the project locks are in the routing table
 ./bin/flowhub
 ```
 

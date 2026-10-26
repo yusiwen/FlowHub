@@ -1,9 +1,9 @@
 {
   "_comment": "FlowHub configuration, version 2: which event sources exist, what starting work means for each, which agent runtimes are declared, and which local repository each (source, project) pair drives.",
   "_comment_usage": "Copy to ~/.config/flowhub/config.json ($XDG_CONFIG_HOME/flowhub/config.json when set) and replace every placeholder below; that is the default path, and FLOWHUB_CONFIG_FILE overrides it (FLOWHUB_PROJECTS_FILE still works). This file in the repository is NOT loaded by default.",
-  "_comment_version": "Version 1 was the original routing table: `projects[].youtrack_key`, one global key index, every source fact in the environment. A file with no `version` key is still read, translated, and reported as `1 (translated; migrate the file to version 2)`. A version 2 file that uses a version 1 spelling is refused with the replacement named.",
-  "_comment_secrets": "No secret belongs in this file. Locks and key material stay in the environment — FLOWHUB_YOUTRACK_HOOK_KEY, FLOWHUB_YOUTRACK_TOKEN, FLOWHUB_YOUTRACK_ALLOWED_SOURCES (the unsuffixed names still work for YouTrack) — so this file stays safe to copy, diff, back up and review. A runtime's credentials are named by the variable that holds them (see auth below), never written out.",
-  "_comment_startup": "Validation runs before any file is created, and a problem stops the process: an unknown version, an unknown field, a source this binary cannot build, a runtime block that cannot be honoured, a duplicate (source, project), a missing or relative repo.path, a malformed agent or model reference. The *filesystem* checks — does the repository exist, is it a git work tree, is its origin the declared one, does the checkout directory sit outside it — belong to the workspace provider and run in the same gate.",
+  "_comment_version": "Version 1 was the original routing table: `projects[].youtrack_key`, one global key index, every source fact in the environment. A file with no `version` key is still read and translated so the table can be inspected, but it cannot carry per-project entry locks, so a version 1 file is refused at startup with the migration named: rewrite it as version 2 and give each project a `source` object. A version 2 file that uses a version 1 spelling is refused with the replacement named.",
+  "_comment_secrets": "Secrets are opt-in. Each project's entry locks — the URL key that selects the project and the header token that authenticates it — are written in that project's `source` object, because they address the project and YouTrack configures them per project. A file carrying them is itself a secret and must be mode 0600; strip them before copying or pasting it anywhere. The source IP allowlist stays in the environment (FLOWHUB_YOUTRACK_ALLOWED_SOURCES / FLOWHUB_ALLOWED_SOURCES). A runtime's credentials are named by the variable or file that holds them (see auth below), never written out.",
+  "_comment_startup": "Validation runs before any file is created, and a problem stops the process: an unknown version, an unknown field, a source this binary cannot build, a runtime block that cannot be honoured, a duplicate (source, project), a duplicate URL key, a missing or relative repo.path, a malformed agent or model reference, and — for the source this process serves — an enabled project without `source.hook_key` and `source.token`. The *filesystem* checks — does the repository exist, is it a git work tree, is its origin the declared one, does the checkout directory sit outside it — belong to the workspace provider and run in the same gate.",
   "_comment_report": "`flowhub -print-config` prints each effective value with the level that supplied it (`effective: sources.youtrack trigger=... (level: FLOWHUB_TRIGGER)`), which is how a three-level file stays answerable.",
 
   "version": 2,
@@ -11,7 +11,7 @@
   "_comment_credentials_file": "Optional, and commented out below so this template loads as-is: add `\"credentials_file\": \"credentials.json\"` to hold the agent servers' Basic Auth pairs in one file instead of an environment variable per host. The file is JSON keyed by runtime name — {\"runtimes\": {\"local\": {\"user\": \"opencode\", \"password\": \"...\"}}} — and a runtime whose `auth` block names only a user takes its password from it, while a per-runtime `auth` source wins over it. The path resolves like `prompt_file`: relative to this file, with a leading `~` expanded. It is read once at load time (rotating a password needs a restart), `{env:NAME}` inside an entry is expanded then, and the file must be mode 0600 — a file group or other can read refuses the start rather than leaving a secret exposed.",
 
   "sources": {
-    "_comment": "Keyed by the adapter's own name. `enabled` defaults to true, and a source the file never mentions is enabled: the hook key is the lock, and a record-only receiver should not need the file at all. `policy` holds what starting work means for this tracker; every field is optional and the environment is the outermost default.",
+    "_comment": "Keyed by the adapter's own name. `enabled` defaults to true; a source the file never mentions is enabled, but without a project entry a delivery has no key to match and is refused. `policy` holds what starting work means for this tracker; every field is optional and the environment is the outermost default.",
     "youtrack": {
       "enabled": true,
       "policy": {
@@ -54,7 +54,12 @@
   "projects": [
     {
       "_comment": "One entry per (source, project) pair. The same project key in two sources is two entries; the same key twice in one source is refused. `also` lets several tracker projects share one repository. `runtime`/`runtimes` is an eligibility set, not a preference list; `runtime_policy` decides how a new task picks within it. A task that is already bound to a runtime stays there for life.",
-      "source": "youtrack",
+      "_comment_source": "The project's binding to its source. `hook_key` is the URL path segment YouTrack posts to, and `token` is the value of the header named by FLOWHUB_TOKEN_HEADER. Both are per project because YouTrack's Webhook Triggers app is configured per project; a key must select exactly one project, and the payload's project must be one of `project`/`also`. Each is at least 32 characters: `make secrets` prints a pair. The file must then be mode 0600.",
+      "source": {
+        "name": "youtrack",
+        "hook_key": "REPLACE_WITH_AT_LEAST_32_URL_SAFE_CHARACTERS",
+        "token": "REPLACE_WITH_AT_LEAST_32_CHARACTERS"
+      },
       "project": "REPLACE_WITH_YOUTRACK_PROJECT_KEY",
       "also": [],
 

@@ -36,7 +36,7 @@ anything, because it decides which variables you need.
 
 | Model | What runs | Good for | Required |
 | --- | --- | --- | --- |
-| **A. Receiver only** | The webhook receiver, recording every delivery | Your first day. Observing real traffic, answering "what does YouTrack actually send" | Nothing but the three locks |
+| **A. Receiver only** | The webhook receiver, recording every delivery | Your first day. Observing real traffic, answering "what does YouTrack actually send" | A routing entry for the project (its `source.hook_key`/`.token`, mode 0600) plus the source IP allowlist; the delivery is attributed before it is recorded |
 | **B. Single host (receiver + dispatcher)** | Everything on one machine: receiver, dispatcher, opencode | The normal setup: one builder | Model A plus `FLOWHUB_DISPATCH=1` and a running `opencode serve` |
 | **C. Control plane + builders** | Receiver/dispatcher on one host, agent turns on one or more enrolled hosts | Several repositories, or a laptop that must hold the clones | Model B plus the control API (`FLOWHUB_ADMIN_ADDR`, `FLOWHUB_ADMIN_TOKEN`) and `flowhub runtime init` on each builder |
 
@@ -238,15 +238,19 @@ Fill in:
 
 | Setting | Value |
 | --- | --- |
-| `webhookToken` | the value of `FLOWHUB_YOUTRACK_TOKEN` (≥32 chars) |
+| `webhookToken` | **that project's** `source.token` (≥32 chars) |
 | `headerName` | `X-YouTrack-Token` (must equal `FLOWHUB_TOKEN_HEADER`) |
-| `webhooksOnIssueCreated` | `https://<YOUR_ENTRY_HOST>/hooks/youtrack/<FLOWHUB_HOOK_KEY>` |
+| `webhooksOnIssueCreated` | `https://<YOUR_ENTRY_HOST>/hooks/youtrack/<that project's source.hook_key>` |
 | `webhooksOnCommentAdded` | same URL |
 | `webhooksOnIssueUpdated` | same URL |
 | the remaining event fields | same URL (the full set is listed in `README.md`) |
 
 Notes that save time later:
 
+* Each project is a **separate attachment** and therefore has its own `webhookToken`
+  and URLs. Do not copy one project's pair into another: the receiver selects the
+  project by the URL key and then refuses a payload whose project does not belong to
+  that entry (`project_mismatch`). `make secrets` prints a fresh pair per project.
 * The URL must be a **domain**, not a private IP literal (see §2.3).
 * The URL must not contain a comma.
 * Put the same URL in `webhooksOnAllEvents` only if you want a catch-all; the app
@@ -309,9 +313,8 @@ set), beside the routing table:
 
 ```bash
 cat > ~/.config/flowhub/.env <<'EOF'
-# FlowHub settings for this machine. Mode 0600: it holds the URL key and the token.
-FLOWHUB_HOOK_KEY=<hex>
-FLOWHUB_TOKEN=<hex>
+# FlowHub settings for this machine. Mode 0600: the file may name credentials.
+# The per-project URL key and token live in config.json, not here.
 FLOWHUB_ALLOWED_SOURCES=127.0.0.1
 EOF
 chmod 600 ~/.config/flowhub/.env
@@ -324,8 +327,9 @@ Rules that decide whether the start is allowed:
   address even when the file names another one; the startup log's
   `skipped_already_set=` list names the file entries the environment overrode, and
   `-print-config` prints the same as `env_file_skipped:`.
-* **`chmod 600`.** The file holds the URL key and the token, so group/other access
-  refuses the start with the fix in the message.
+* **`chmod 600`.** The file may name credentials (and older deployments kept the
+  lock material there), so group/other access refuses the start with the fix in the
+  message.
 * `FLOWHUB_ENV_FILE` points somewhere else; `-` (or `none`, `off`) disables the file.
   A path you name that does not exist stops the start; an absent default path is fine.
 * Syntax is a subset: `KEY=VALUE`, `# comments`, blank lines, an optional `export `,
@@ -369,7 +373,11 @@ variable it sets that the unit does not will apply.
 
   "projects": [
     {
-      "source": "youtrack",
+      "source": {
+        "name": "youtrack",
+        "hook_key": "<AT_LEAST_32_URL_SAFE_CHARACTERS>",
+        "token": "<AT_LEAST_32_CHARACTERS>"
+      },
       "project": "<YOUTRACK_PROJECT_KEY>",
       "repo": {
         "path": "<ABSOLUTE_PATH_TO_LOCAL_CLONE>",
@@ -387,6 +395,8 @@ What each value means, and how to get it right:
 
 | Field | Rule |
 | --- | --- |
+| `source.hook_key` | That project's URL key: the last path segment YouTrack posts to. At least 32 URL-safe characters, unique within the source. Required for every enabled entry, per project (ADR 0015). |
+| `source.token` | That project's `webhookToken`, sent in `FLOWHUB_TOKEN_HEADER`. At least 32 characters. Required for every enabled entry. |
 | `project` | The **project key** as it appears in issue IDs (`BEAP-12` → `BEAP`). Case-insensitive. When a payload carries both `project.key` and `project.shortName`, `key` wins. |
 | `also` | Extra project keys that share this repository. All of them map to the same entry. |
 | `repo.path` | Absolute, canonicalised on load. Must be a directory, a git work tree, and its `origin` must equal `remote`. |
@@ -399,9 +409,10 @@ What each value means, and how to get it right:
 | `max_concurrent` | How many **distinct tasks** a host serves at once, `1`..`64`. A single task is never in two turns at once. |
 | `shell_wrappers` | Optional, `[]` by default. Command prefixes this host's opencode plugins are trusted to insert in front of a bash command. See §8.6 — get this wrong and every read-only git command is refused. |
 
-By default no secret goes in this file: locks live in the environment. A runtime's
-Basic Auth password has four possible sources — see §5.4 — and only the inline one
-puts a secret here, which then requires mode `0600`.
+The entry locks in `source` are a secret, so this file must be mode `0600`; the
+same check also covers a runtime's inline Basic Auth password (the other four
+possible sources are described in §5.4). `-print-config` reports the locks as
+present, never their values.
 
 ### 5.4 Credentials for the agent server
 
@@ -522,17 +533,21 @@ what you think it is.
 make secrets
 ```
 
-Produces a fresh pair. Put them in a root-readable environment file:
+Produces a fresh pair **per project**. Put the pair in that project's
+`projects[].source` (`hook_key`, `token`) in the routing table, and the same pair in
+that project's Webhook Triggers settings. The routing table then carries a secret
+and must be mode 0600.
+
+The source IP allowlist stays in the environment:
 
 ```
 # /etc/flowhub/flowhub.env   (mode 600, owned by the service user)
-FLOWHUB_YOUTRACK_HOOK_KEY=<hex>
-FLOWHUB_YOUTRACK_TOKEN=<hex>
 FLOWHUB_YOUTRACK_ALLOWED_SOURCES=<youtrack_or_proxy_source_ip>
 ```
 
-Use the **new** per-source variable names. `FLOWHUB_HOOK_KEY` and
-`FLOWHUB_TOKEN` still work as aliases, but a second source would need its own.
+The old global `FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN`, `FLOWHUB_YOUTRACK_HOOK_KEY` and
+`FLOWHUB_YOUTRACK_TOKEN` are no longer read; a process that still has one set logs a
+warning naming it.
 
 ### 7.2 Start it
 
@@ -557,8 +572,8 @@ wildcard (`0.0.0.0:8080`) **refuses to start** unless
 ### 7.3 Send one delivery by hand
 
 ```bash
-KEY=<FLOWHUB_YOUTRACK_HOOK_KEY>
-TOKEN=<FLOWHUB_YOUTRACK_TOKEN>
+KEY=<the TEST project's source.hook_key>
+TOKEN=<the TEST project's source.token>
 TS=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
 
 curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' \
@@ -1048,10 +1063,11 @@ find /var/lib/flowhub -name 'payload-*.log'   -mtime +30 -delete
 
 ### 11.6 Secret rotation
 
-1. Generate a new pair (`make secrets`).
-2. Update only `FLOWHUB_YOUTRACK_HOOK_KEY` (and the URL in YouTrack) **or** only
-   the token, not both at once — during the gap, deliveries are rejected but
-   answered `202`, so check the audit for `bad_url_key` / `bad_header_token`.
+1. Generate a new pair for **one project** (`make secrets`).
+2. Update that project's `projects[].source.hook_key` (and the URL in its YouTrack
+   settings) **or** only its token, not both at once — during the gap, deliveries
+   are rejected but answered `202`, so check the audit for `bad_url_key` /
+   `bad_header_token`. Only that project is affected.
 3. Runtime secrets: `flowhub runtime rotate <name>`.
 4. Redaction is positional and applies even to a key that does not match, so a
    rotated key never lands in the audit file.
@@ -1106,8 +1122,9 @@ tail -5 /var/lib/flowhub/webhook-$(date -u +%F).jsonl | jq -c '{accepted,reason,
 
 | `reason` | Cause | Fix |
 | --- | --- | --- |
-| `bad_url_key` | wrong or absent key in the URL | the URL must end in `/hooks/youtrack/<FLOWHUB_YOUTRACK_HOOK_KEY>`; if you changed the key, update YouTrack |
-| `bad_header_token` | header missing or wrong | `headerName` in the app and `FLOWHUB_TOKEN_HEADER` must match; token values must match. If `literal_secret=true`, YouTrack is sending the literal string `secret` |
+| `bad_url_key` | wrong or absent key in the URL | the URL must end in `/hooks/youtrack/<that project's source.hook_key>`; if you changed the key, update that project's YouTrack settings |
+| `bad_header_token` | header missing or wrong for the project the key selected | `headerName` in the app and `FLOWHUB_TOKEN_HEADER` must match; the token must be that project's `source.token`. If `literal_secret=true`, YouTrack is sending the literal string `secret` |
+| `project_mismatch` | the payload's project is not one of the entry's keys | the URL key belongs to one project; the app posting it is configured with another project's URL. Give each project its own pair |
 | `source_not_allowed` | your source IP is not in `FLOWHUB_YOUTRACK_ALLOWED_SOURCES` | read the `source remote=` line in the payload log and put **that** value in the allowlist |
 | `outside_replay_window` | clock skew beyond `FLOWHUB_REPLAY_WINDOW` between YouTrack and this host | fix NTP, or set the window to `0` for the very first delivery while diagnosing |
 | `duplicate` | the same delivery seen inside `FLOWHUB_DEDUPE_TTL` | normal (the app can retry across a proxy); raise the TTL only if genuine events collide |
@@ -1196,8 +1213,8 @@ succeed; audit and dispatch remain asynchronous.
 
 | Secret | Variable | Where the other side holds it |
 | --- | --- | --- |
-| URL key (lock 1) | `FLOWHUB_YOUTRACK_HOOK_KEY` | inside the webhook URL in the YouTrack app |
-| Header token (lock 2) | `FLOWHUB_YOUTRACK_TOKEN` | the app's `webhookToken` |
+| URL key (lock 1) | `projects[].source.hook_key` in the routing table (mode 0600) | inside that project's webhook URL in the YouTrack app |
+| Header token (lock 2) | `projects[].source.token` in the routing table (mode 0600) | that project's `webhookToken` |
 | Source allowlist (lock 3) | `FLOWHUB_YOUTRACK_ALLOWED_SOURCES` | not a secret |
 | Control API | `FLOWHUB_ADMIN_TOKEN` | the CLI's `--token` |
 | Flow API | `FLOWHUB_HUB_TOKEN` | `Authorization: Bearer …` on `/hub/v1`; unset means 503 |
