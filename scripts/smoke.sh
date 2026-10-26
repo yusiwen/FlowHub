@@ -53,15 +53,29 @@ TOKEN="$(openssl rand -hex 32)"
 BASE="http://127.0.0.1:$PORT"
 URL="$BASE/hooks/youtrack/$KEY"
 
+# The entry locks are per project (ADR 0015), so the run needs its own mapping.
+# Without one every delivery is refused as bad_url_key, which would make the
+# rejection assertions below vacuous. The config lives outside $DATA on purpose: it
+# carries the secrets, and the containment check greps $DATA.
+mkdir -p "$WORK/repo"
+CONFIG="$WORK/config.json"
+cat >"$CONFIG" <<EOF
+{"version": 2, "projects": [
+  {"source": {"name": "youtrack", "hook_key": "$KEY", "token": "$TOKEN"},
+   "project": "SP", "repo": {"path": "$WORK/repo"}}
+]}
+EOF
+chmod 600 "$CONFIG"
+
 echo "== start =="
 # A test must not read the operator's own environment file. This run asserts its own
 # key, token and data directory, so a ~/.config/flowhub/.env with other values — or
 # merely a permissive mode, which is refused — would make the result depend on the
-# machine it ran on. `FLOWHUB_ENV_FILE=-` disables the file (ADR 0005).
+# machine it ran on. `FLOWHUB_ENV_FILE=-` disables the file (ADR 0005), and
+# FLOWHUB_CONFIG_FILE pins the mapping rather than using the operator's.
 FLOWHUB_ENV_FILE=- \
 FLOWHUB_ADDR="127.0.0.1:$PORT" \
-FLOWHUB_HOOK_KEY="$KEY" \
-FLOWHUB_TOKEN="$TOKEN" \
+FLOWHUB_CONFIG_FILE="$CONFIG" \
 FLOWHUB_ALLOWED_SOURCES=127.0.0.1 \
 FLOWHUB_DATA_DIR="$DATA" \
 FLOWHUB_LOG_HEADERS=true \
@@ -100,7 +114,8 @@ check_code "bad url key"     202 "$(curl -s -o /dev/null -w '%{http_code} %{time
   -H "X-YouTrack-Token: $TOKEN" --data-binary "$ISSUE")"
 check_code "unknown event"   202 "$(post "$TOKEN" '{"event":"issueRenamed","timestamp":"'"$TS"'","id":"2-9"}')"
 check_code "invalid json"    202 "$(post "$TOKEN" '{"oops"')"
-check_code "stale timestamp" 202 "$(post "$TOKEN" '{"event":"issueCreated","timestamp":"2020-01-01T00:00:00.000Z","id":"2-8"}')"
+check_code "stale timestamp" 202 "$(post "$TOKEN" '{"event":"issueCreated","timestamp":"2020-01-01T00:00:00.000Z","id":"SP-8","project":{"key":"SP"}}')"
+check_code "project mismatch" 202 "$(post "$TOKEN" '{"event":"issueUpdated","timestamp":"'"$TS"'","id":"OTHER-1","project":{"key":"OTHER"},"changedFields":[{"name":"State","value":{"name":"Open"}}]}')"
 check_code "GET"             405 "$(curl -s -o /dev/null -w '%{http_code} %{time_total}' "$URL")"
 
 echo "== audit trail =="
@@ -113,7 +128,7 @@ accepted="$(jq -r 'select(.accepted) | .event' "$JSONL" | grep -c .)"
 printf '  %-22s %s\n' "accepted" "$accepted"
 
 for pair in "duplicate:1" "bad_header_token:2" "bad_url_key:1" "unknown_event:1" \
-            "invalid_json:1" "outside_replay_window:1" "method_not_allowed:1"; do
+            "invalid_json:1" "outside_replay_window:1" "method_not_allowed:1" "project_mismatch:1"; do
   reason="${pair%%:*}"
   want="${pair##*:}"
   got="$(jq -r --arg r "$reason" 'select(.reason == $r) | .reason' "$JSONL" | grep -c .)"
@@ -124,6 +139,8 @@ done
 echo "== payload analysis =="
 jq -e 'select(.accepted) | (.payload_schema | length) > 0' "$JSONL" >/dev/null \
   || fail "accepted record carries no payload schema"
+jq -e 'select(.accepted) | .entry == "youtrack:SP"' "$JSONL" >/dev/null \
+  || fail "accepted record does not name the entry whose key matched"
 jq -e 'select(.accepted) | .has_number_in_project == false' "$JSONL" >/dev/null \
   || fail "numberInProject probe is missing"
 jq -e 'select(.accepted) | (.headers["X-Youtrack-Token"][0] | startswith("<masked"))' "$JSONL" >/dev/null \

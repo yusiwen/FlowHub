@@ -89,23 +89,82 @@ func TestWebhookOptionsNeverHoldATypedNilDispatcher(t *testing.T) {
 	if absent != nil {
 		t.Fatal("precondition: a nil pointer must compare equal to nil")
 	}
-	if opts := webhookOptions(config.Config{}, absent, youtrack.New(rules.Policy{}, ""), nil); opts.Dispatcher != nil {
+	if opts := webhookOptions(config.Config{}, nil, absent, youtrack.New(rules.Policy{}, ""), nil); opts.Dispatcher != nil {
 		t.Fatal("webhookOptions put a nil dispatcher behind the interface")
 	}
 }
 
-func TestWebhookOptionsCarryTheReceiverLocks(t *testing.T) {
+// The receiver gets its entries from the routing table: main converts the served
+// source's project locks into the webhook options, and the conversion is the only
+// place the two packages meet (ADR 0015).
+func TestWebhookOptionsCarryTheProjectLocks(t *testing.T) {
+	const (
+		key   = "0123456789abcdef0123456789abcdef"
+		token = "feedfacefeedfacefeedfacefeedface"
+	)
+	dir := t.TempDir()
+	body := `{"version": 2, "projects": [
+	  {"source": {"name": "youtrack", "hook_key": "` + key + `", "token": "` + token + `"},
+	   "project": "SP", "repo": {"path": "` + dir + `"}}
+	]}`
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
 	cfg := config.Config{
-		HookKey:      "k",
+		Source:       "youtrack",
 		TokenHeader:  "X-YouTrack-Token",
-		Token:        "t",
 		MaxBodyBytes: 1024,
 		ReplayWindow: time.Minute,
 		LogHeaders:   true,
 	}
-	opts := webhookOptions(cfg, &dispatch.Dispatcher{}, youtrack.New(rules.Policy{}, ""), nil)
-	if opts.HookKey != "k" || opts.Token != "t" || opts.Dispatcher == nil {
-		t.Fatalf("options = %+v", opts)
+	opts := webhookOptions(cfg, projects, &dispatch.Dispatcher{}, youtrack.New(rules.Policy{}, ""), nil)
+	if opts.Dispatcher == nil {
+		t.Fatal("webhookOptions dropped the dispatcher")
+	}
+	if len(opts.Locks) != 1 || opts.Locks[0].Key != key || opts.Locks[0].Token != token {
+		t.Fatalf("locks = %+v", opts.Locks)
+	}
+	if got := opts.Locks[0].Projects; len(got) != 1 || got[0] != "SP" {
+		t.Fatalf("lock projects = %v", got)
+	}
+}
+
+// The entry locks are secrets too. A configuration file that carries them is
+// refused when group or other can read it, exactly like an inline password, and a
+// file that carries them at 0600 is accepted (ADR 0015).
+func TestAWorldReadableConfigRefusesToStartWhenItHoldsEntryLocks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	body := `{"version": 2, "projects": [{
+	  "source": {"name": "youtrack", "hook_key": "0123456789abcdef0123456789abcdef", "token": "feedfacefeedfacefeedfacefeedface"},
+	  "project": "TEST", "repo": {"path": "/tmp/test"}}]}`
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := projectmap.Load(path)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+	if !projects.HasInlineLockMaterial() {
+		t.Fatal("HasInlineLockMaterial = false for a file that carries entry locks")
+	}
+	if problems := configFileSecretProblems(path, projects); len(problems) != 0 {
+		t.Fatalf("a 0600 file holding entry locks was refused: %v", problems)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if problems := configFileSecretProblems(path, projects); len(problems) == 0 {
+		t.Fatal("a 0644 file holding entry locks was accepted")
 	}
 }
 
