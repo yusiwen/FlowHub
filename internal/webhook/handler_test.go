@@ -56,11 +56,12 @@ type harness struct {
 func newHarness(t *testing.T, mutate func(*Options)) *harness {
 	t.Helper()
 	opts := Options{
-		Source:       youtrack.New(rules.Policy{}, ""),
-		HookPath:     "/hooks/youtrack",
-		HookKey:      testKey,
+		Source:   youtrack.New(rules.Policy{}, ""),
+		HookPath: "/hooks/youtrack",
+		Locks: []EntryLock{{
+			Entry: "youtrack:SP", Key: testKey, Token: testToken, Projects: []string{"SP"},
+		}},
 		TokenHeader:  "X-YouTrack-Token",
-		Token:        testToken,
 		MaxBodyBytes: 64 << 10,
 		ReplayWindow: 10 * time.Minute,
 	}
@@ -170,6 +171,9 @@ func TestAcceptsValidDelivery(t *testing.T) {
 	if got.Event != "issueUpdated" || got.IssueID != "2-123" || got.ProjectKey != "SP" {
 		t.Fatalf("payload facts = %s/%s/%s", got.Event, got.IssueID, got.ProjectKey)
 	}
+	if got.Entry != "youtrack:SP" {
+		t.Fatalf("entry = %q, want the project whose key matched", got.Entry)
+	}
 	if got.IssueIDForm != "database" {
 		t.Fatalf("issue id form = %q, want database", got.IssueIDForm)
 	}
@@ -223,13 +227,18 @@ func TestURLKeyAcceptedFromQuery(t *testing.T) {
 	}
 }
 
-func TestURLKeyLockCanBeDisabled(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.HookKey = "" })
+// Without entry locks no delivery can be attributed to a project: the receiver
+// refuses the key instead of routing by the payload, which is the whole point of
+// moving the locks into the project entry (ADR 0015).
+func TestWithoutEntryLocksEveryDeliveryIsRefused(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.Locks = nil })
 	resp := h.post(t, "/hooks/youtrack", testToken, issueUpdatedBody(freshTimestamp()))
-	assertRejected(t, resp, "")
-	if got := h.sink.last(t); !got.Accepted || got.Locks.URLKey {
+	assertRejected(t, resp, ReasonBadURLKey)
+	if got := h.sink.last(t); got.Accepted || got.Reason != ReasonBadURLKey {
 		t.Fatalf("record = %+v", got)
 	}
+	resp = h.post(t, keyedPath(), testToken, issueUpdatedBody(freshTimestamp()))
+	assertRejected(t, resp, ReasonBadURLKey)
 }
 
 func TestLockHeaderToken(t *testing.T) {
@@ -603,7 +612,7 @@ func TestRedactionNeverEchoesAnUnrecognisedKey(t *testing.T) {
 	// 64 hex characters, the shape `openssl rand -hex 32` produces. Synthetic:
 	// never paste a real key into a test, which is how one ends up in git.
 	const liveKey = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888"
-	h := newHarness(t, func(o *Options) { o.HookKey = testKey })
+	h := newHarness(t, nil)
 
 	assertRejected(t, h.post(t, "/hooks/youtrack/"+liveKey, testToken, issueUpdatedBody(freshTimestamp())),
 		ReasonBadURLKey)
@@ -624,7 +633,7 @@ func TestRedactionNeverEchoesAnUnrecognisedKey(t *testing.T) {
 }
 
 func TestRedactionCoversTheEdgesOfTheRouteShape(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.HookKey = testKey })
+	h := newHarness(t, nil)
 	cases := map[string]string{
 		"/hooks/youtrack/" + testKey: "/hooks/youtrack/***",
 		"/hooks/youtrack":            "/hooks/youtrack",
@@ -650,8 +659,73 @@ func TestRedactionCoversTheEdgesOfTheRouteShape(t *testing.T) {
 
 	// A receiver with the key lock disabled still must not store the key the app
 	// sends: the lock being off is a configuration choice, not a licence to leak.
-	off := newHarness(t, func(o *Options) { o.HookKey = "" })
+	off := newHarness(t, func(o *Options) { o.Locks = nil })
 	if got := off.handler.redactPath("/hooks/youtrack/" + testKey); got != "/hooks/youtrack/***" {
 		t.Fatalf("with the lock off, path = %q", got)
 	}
+}
+
+// issueUpdatedBodyForProject rewrites the sample payload's project, so a test can
+// present a body that belongs to a project other than the one the key selected.
+func issueUpdatedBodyForProject(timestamp, project string) string {
+	return strings.Replace(issueUpdatedBody(timestamp),
+		`"project":{"key":"SP","name":"Sample Project","shortName":"SP"}`,
+		`"project":{"key":"`+project+`","name":"Sample Project","shortName":"`+project+`"}`,
+		1)
+}
+
+// A key selects one project; the payload has to agree. Routing downstream reads the
+// payload's project, so without this check a TEST key could post a BEAP_BE event.
+func TestPayloadForAnotherProjectIsRefused(t *testing.T) {
+	h := newHarness(t, nil)
+	resp := h.post(t, keyedPath(), testToken, issueUpdatedBodyForProject(freshTimestamp(), "OTHER"))
+	assertRejected(t, resp, ReasonProjectMismatch)
+	got := h.sink.last(t)
+	if got.Accepted || got.Reason != ReasonProjectMismatch {
+		t.Fatalf("record = %+v", got)
+	}
+	if got.ProjectKey != "OTHER" {
+		t.Fatalf("project key = %q, want the payload's own project in the audit", got.ProjectKey)
+	}
+}
+
+// The comparison must agree with routing's case-insensitive project match.
+func TestProjectMatchIsCaseInsensitive(t *testing.T) {
+	h := newHarness(t, nil)
+	resp := h.post(t, keyedPath(), testToken, issueUpdatedBodyForProject(freshTimestamp(), "sp"))
+	assertRejected(t, resp, "")
+	if got := h.sink.last(t); !got.Accepted {
+		t.Fatalf("record = %+v", got)
+	}
+}
+
+// Two projects, two tokens: neither project's token authenticates the other, and
+// the audit fingerprint is computed against the token of the entry the key selected.
+func TestEachProjectChecksItsOwnToken(t *testing.T) {
+	const (
+		otherKey   = "abcdef0123456789abcdef0123456789"
+		otherToken = "cafebabecafebabecafebabecafebabe"
+	)
+	h := newHarness(t, func(o *Options) {
+		o.LogHeaders = true
+		o.Locks = append(o.Locks, EntryLock{
+			Entry: "youtrack:OTHER", Key: otherKey, Token: otherToken, Projects: []string{"OTHER"},
+		})
+	})
+
+	resp := h.post(t, "/hooks/youtrack/"+otherKey, otherToken, issueUpdatedBodyForProject(freshTimestamp(), "OTHER"))
+	assertRejected(t, resp, "")
+	got := h.sink.last(t)
+	if !got.Accepted {
+		t.Fatalf("OTHER delivery was refused: %+v", got)
+	}
+	if got.TokenHeader == nil || !got.TokenHeader.MatchesConfigured {
+		t.Fatalf("token fingerprint was not computed against OTHER's token: %+v", got.TokenHeader)
+	}
+
+	resp = h.post(t, "/hooks/youtrack/"+otherKey, testToken, issueUpdatedBodyForProject(freshTimestamp(), "OTHER"))
+	assertRejected(t, resp, ReasonBadHeaderToken)
+
+	resp = h.post(t, keyedPath(), otherToken, issueUpdatedBody(freshTimestamp()))
+	assertRejected(t, resp, ReasonBadHeaderToken)
 }

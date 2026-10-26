@@ -42,6 +42,7 @@ const (
 	ReasonUnexpectedContentType = "unexpected_content_type"
 	ReasonInvalidJSON           = "invalid_json"
 	ReasonUnknownEvent          = "unknown_event"
+	ReasonProjectMismatch       = "project_mismatch"
 	ReasonUnparseableTimestamp  = "unparseable_timestamp"
 	ReasonOutsideReplayWindow   = "outside_replay_window"
 	ReasonDuplicate             = "duplicate"
@@ -60,6 +61,7 @@ var AllReasons = []string{
 	ReasonUnexpectedContentType,
 	ReasonInvalidJSON,
 	ReasonUnknownEvent,
+	ReasonProjectMismatch,
 	ReasonUnparseableTimestamp,
 	ReasonOutsideReplayWindow,
 	ReasonDuplicate,
@@ -77,18 +79,46 @@ func IsKnownReason(reason string) bool {
 	return false
 }
 
+// EntryLock is one project's entry lock material.
+//
+// The URL key selects the entry, and the token authenticates it. Both are secrets:
+// the receiver never logs or reports their values. Projects is the set of tracker
+// project keys the entry answers to (its primary key plus any aliases); a payload
+// naming another project is refused even when the key matched.
+type EntryLock struct {
+	Entry    string
+	Key      string
+	Token    string
+	Projects []string
+}
+
+// allowsProject reports whether a decoded project belongs to this entry. The
+// comparison is case-insensitive because routing matches project keys that way;
+// the two must not disagree about which projects an entry owns.
+func (l EntryLock) allowsProject(project string) bool {
+	project = strings.TrimSpace(project)
+	for _, allowed := range l.Projects {
+		if strings.EqualFold(strings.TrimSpace(allowed), project) {
+			return true
+		}
+	}
+	return false
+}
+
 // Options is the receiver half of the configuration.
 type Options struct {
 	// HookPath is the base path the handler is mounted on, without a trailing
 	// slash. It is what makes "<base>/<key>" recognisable, so the key can be
 	// redacted by position rather than by matching the configured value.
 	HookPath string
-	// HookKey is the URL embedded secret (lock 1); empty disables the lock.
-	HookKey string
-	// TokenHeader is the header name carrying the shared token (lock 2).
+	// Locks are the per-project entry locks of this source, in declaration order.
+	// The URL key selects one before the body is read; an unknown key is
+	// bad_url_key. Empty means no project can be addressed, so every delivery is
+	// refused — startup refuses that state for a served source rather than running
+	// a receiver that silently accepts nothing (projectmap.LockProblems).
+	Locks []EntryLock
+	// TokenHeader is the header name carrying the project's token (lock 2).
 	TokenHeader string
-	// Token is the expected header value; empty disables the lock.
-	Token string
 	// AllowedSources restricts accepted source IPs; empty disables the lock.
 	AllowedSources []*net.IPNet
 	// MaxBodyBytes caps the request body.
@@ -137,20 +167,26 @@ type Handler struct {
 	now   func() time.Time
 
 	activeLocks []string
-	// expectedTokenSHA is the fingerprint of the configured token, used to tell
-	// "the app sent the real token" from "the app sent the literal secret".
-	expectedTokenSHA string
 }
 
 // New builds a receiver handler.
 func New(opts Options, sink AuditSink, dd *dedupe.Cache, log *slog.Logger, stats *metrics.Counters) *Handler {
 	h := &Handler{opts: opts, sink: sink, dd: dd, log: log, stats: stats, now: time.Now}
-	if opts.HookKey != "" {
+	if len(opts.Locks) > 0 {
 		h.activeLocks = append(h.activeLocks, "url_key")
-	}
-	if opts.Token != "" {
-		h.activeLocks = append(h.activeLocks, "header_token")
-		h.expectedTokenSHA = shortSHA256(opts.Token)
+		// Startup refuses a project without a token (projectmap.LockProblems), so the
+		// summary is uniform in a real process. The check is kept here because the
+		// handler is also built directly by tests and by embedders.
+		allTokens := true
+		for _, lock := range opts.Locks {
+			if lock.Token == "" {
+				allTokens = false
+				break
+			}
+		}
+		if allTokens {
+			h.activeLocks = append(h.activeLocks, "header_token")
+		}
 	}
 	if len(opts.AllowedSources) > 0 {
 		h.activeLocks = append(h.activeLocks, "source_ip")
@@ -158,10 +194,27 @@ func New(opts Options, sink AuditSink, dd *dedupe.Cache, log *slog.Logger, stats
 	return h
 }
 
+// matchLock finds the entry whose URL key was presented. Each comparison is
+// constant-time; the scan stops at the first match, so the number of configured
+// projects is public but a key's bytes are not a timing oracle — the same property
+// the single-key comparison had before the locks became per project.
+func (h *Handler) matchLock(key string) (EntryLock, bool) {
+	for _, lock := range h.opts.Locks {
+		if lock.Key == "" {
+			continue
+		}
+		if constantTimeEqual(key, lock.Key) {
+			return lock, true
+		}
+	}
+	return EntryLock{}, false
+}
+
 // ServeHTTP implements the delivery pipeline:
 //
-//	three entry locks -> body limits -> content type -> JSON -> known event ->
-//	replay window -> idempotency -> audit + 202
+//	key selects the project -> its token -> source address -> body limits ->
+//	content type -> JSON -> known event -> project match -> replay window ->
+//	idempotency -> audit + 202
 //
 // Every failure returns the same empty response body as a success, so a scanner
 // learns nothing from the status code. The reason is only written to the local
@@ -186,7 +239,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.opts.LogHeaders {
 		rec.HeaderNames = headerNames(r.Header)
 		rec.Headers = maskHeaders(r.Header, h.opts.TokenHeader)
-		rec.TokenHeader = tokenFingerprint(r.Header, h.opts.TokenHeader, h.expectedTokenSHA)
 	}
 
 	if r.Method != http.MethodPost {
@@ -194,22 +246,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Lock 1: URL embedded key.
+	// Lock 1: the URL embedded key selects the project. Resolving the entry from
+	// the key before the body is read is what makes the attribution a comparison
+	// against configured secrets rather than a parse of attacker-controlled JSON
+	// (ADR 0015).
 	key := r.PathValue("key")
 	if key == "" {
 		key = r.URL.Query().Get("k")
 	}
-	if h.opts.HookKey != "" {
-		if !constantTimeEqual(key, h.opts.HookKey) {
-			h.respond(w, rec, ReasonBadURLKey, http.StatusAccepted)
-			return
+	lock, matched := h.matchLock(key)
+	if !matched {
+		if h.opts.LogHeaders {
+			rec.TokenHeader = tokenFingerprint(r.Header, h.opts.TokenHeader, "")
 		}
-		rec.Locks.URLKey = true
+		h.respond(w, rec, ReasonBadURLKey, http.StatusAccepted)
+		return
+	}
+	rec.Locks.URLKey = true
+	rec.Entry = lock.Entry
+	if h.opts.LogHeaders {
+		rec.TokenHeader = tokenFingerprint(r.Header, h.opts.TokenHeader, shortSHA256(lock.Token))
 	}
 
-	// Lock 2: shared token header.
-	if h.opts.Token != "" {
-		if !constantTimeEqual(r.Header.Get(h.opts.TokenHeader), h.opts.Token) {
+	// Lock 2: the matched project's own token. Comparing against the selected
+	// entry — not one process-wide value — is what keeps a key from one project
+	// from authenticating another project's payload (ADR 0015).
+	if lock.Token != "" {
+		if !constantTimeEqual(r.Header.Get(h.opts.TokenHeader), lock.Token) {
 			h.respond(w, rec, ReasonBadHeaderToken, http.StatusAccepted)
 			return
 		}
@@ -259,6 +322,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !rec.KnownEvent {
 		h.respond(w, rec, ReasonUnknownEvent, http.StatusAccepted)
+		return
+	}
+
+	// The key selected a project; the payload must actually be about one of that
+	// entry's projects. Without this check a key for TEST could post a BEAP_BE
+	// event, because routing downstream uses the payload's own project.
+	if decoded.Event == nil || !lock.allowsProject(decoded.Event.Subject.Project) {
+		h.respond(w, rec, ReasonProjectMismatch, http.StatusAccepted)
 		return
 	}
 

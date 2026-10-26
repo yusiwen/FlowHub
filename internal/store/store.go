@@ -85,11 +85,15 @@ type Record struct {
 	TokenHeader *TokenHeaderInfo    `json:"token_header,omitempty"`
 
 	// Payload facts, derived leniently from the body.
-	Event              string   `json:"event,omitempty"`
-	KnownEvent         bool     `json:"known_event"`
-	IssueID            string   `json:"issue_id,omitempty"`
-	IssueIDForm        string   `json:"issue_id_form,omitempty"`
-	ProjectKey         string   `json:"project_key,omitempty"`
+	Event       string `json:"event,omitempty"`
+	KnownEvent  bool   `json:"known_event"`
+	IssueID     string `json:"issue_id,omitempty"`
+	IssueIDForm string `json:"issue_id_form,omitempty"`
+	ProjectKey  string `json:"project_key,omitempty"`
+	// Entry is the routing entry whose URL key selected the project, e.g.
+	// "youtrack:TEST". It stays empty when no configured key matched, and it is the
+	// part of the audit that says which project's lock material was in force.
+	Entry              string   `json:"entry,omitempty"`
 	Summary            string   `json:"summary,omitempty"`
 	PrimaryActor       string   `json:"primary_actor,omitempty"`
 	ActorLogins        []string `json:"actor_logins,omitempty"`
