@@ -149,6 +149,47 @@ type v2RuntimeAuth struct {
 	PasswordFile string `json:"password_file,omitempty"`
 }
 
+// v2ProjectSource is a project's binding to one source.
+//
+// The object form carries the project's entry locks: the URL key that routes a
+// delivery to this project and the header token that authenticates it. YouTrack's
+// Webhook Triggers app is configured per project, so the sender already has one
+// pair per project; keeping the pair on the binding is what lets the receiver
+// refuse a delivery before it reads a body (ADR 0015).
+//
+// The bare string form (`"source": "youtrack"`) is the version 2 spelling that
+// predates these locks. It is still decoded so an existing file keeps parsing and
+// `-print-config` can explain it, but an enabled entry must use the object: a
+// project without a key can never be addressed by a delivery.
+type v2ProjectSource struct {
+	Name    string `json:"name"`
+	HookKey string `json:"hook_key,omitempty"`
+	Token   string `json:"token,omitempty"`
+}
+
+// UnmarshalJSON accepts either the object or the old bare string. The object is
+// decoded strictly here because the outer DisallowUnknownFields cannot see inside
+// a field that decodes itself: a typo such as `hook_keyy` must fail the load, not
+// silently drop the lock.
+func (s *v2ProjectSource) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var name string
+		if err := json.Unmarshal(trimmed, &name); err != nil {
+			return err
+		}
+		*s = v2ProjectSource{Name: name}
+		return nil
+	}
+	type plain v2ProjectSource
+	var decoded plain
+	if err := strictDecode(trimmed, &decoded); err != nil {
+		return err
+	}
+	*s = v2ProjectSource(decoded)
+	return nil
+}
+
 // v2Project is one `projects[]` entry.
 //
 // `repo.path` and `worktrees` are still per project: they are facts of the host
@@ -156,18 +197,18 @@ type v2RuntimeAuth struct {
 // (step 6) moving them under `runtimes.<name>.workspace` would relocate a path
 // without removing it. The provider already owns the *checks* (step 2).
 type v2Project struct {
-	Source        string   `json:"source"`
-	Project       string   `json:"project"`
-	Also          []string `json:"also,omitempty"`
-	Repo          Repo     `json:"repo"`
-	Worktrees     string   `json:"worktrees,omitempty"`
-	Runtime       string   `json:"runtime,omitempty"`
-	Runtimes      []string `json:"runtimes,omitempty"`
-	RuntimePolicy string   `json:"runtime_policy,omitempty"`
-	Agent         string   `json:"agent,omitempty"`
-	Model         string   `json:"model,omitempty"`
-	Authors       []string `json:"authors,omitempty"`
-	Enabled       *bool    `json:"enabled,omitempty"`
+	Source        v2ProjectSource `json:"source"`
+	Project       string          `json:"project"`
+	Also          []string        `json:"also,omitempty"`
+	Repo          Repo            `json:"repo"`
+	Worktrees     string          `json:"worktrees,omitempty"`
+	Runtime       string          `json:"runtime,omitempty"`
+	Runtimes      []string        `json:"runtimes,omitempty"`
+	RuntimePolicy string          `json:"runtime_policy,omitempty"`
+	Agent         string          `json:"agent,omitempty"`
+	Model         string          `json:"model,omitempty"`
+	Authors       []string        `json:"authors,omitempty"`
+	Enabled       *bool           `json:"enabled,omitempty"`
 	// PromptFile adds instructions for this project's turns, on top of the source's.
 	// It is how a repository says "this repo is Java, run `mvn -q verify`" (ADR 0001
 	// open question 6) without editing the tracker adapter.
@@ -242,7 +283,7 @@ func translateV1(legacy v1File) (*v2File, error) {
 			return nil, fmt.Errorf("project #%d: youtrack_key is required", index+1)
 		}
 		converted.Projects = append(converted.Projects, v2Project{
-			Source:        DefaultSourceName,
+			Source:        v2ProjectSource{Name: DefaultSourceName},
 			Project:       project.YouTrackKey,
 			Also:          project.AlsoKeys,
 			Repo:          project.Repo,

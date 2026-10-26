@@ -380,7 +380,7 @@ func TestReportRendersTheTable(t *testing.T) {
 func TestReportOnEmptyMapExplainsItself(t *testing.T) {
 	var m *Map
 	report := m.Report()
-	if !strings.Contains(report, "never routed") {
+	if !strings.Contains(report, "bad_url_key") {
 		t.Fatalf("empty report = %q", report)
 	}
 }
