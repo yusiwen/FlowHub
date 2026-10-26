@@ -103,9 +103,72 @@ type Entry struct {
 	// Enabled defaults to true when absent; a disabled entry is never matched.
 	Enabled *bool
 
+	// hookKey and token are this project's entry locks, read from the `source`
+	// object. They are secrets: EntryLocks is the only way out of this package, and
+	// nothing may print them (ADR 0015).
+	hookKey string
+	token   string
+
 	keys     []string
 	runtimes []string
 	policy   string
+}
+
+// EntryLock is one enabled project's lock material, handed to the receiver so a
+// delivery can be attributed before its body is read. Both fields are secrets;
+// callers must never log them.
+type EntryLock struct {
+	// Entry is the operator-facing label, recorded in the audit trail.
+	Entry string
+	// Key is the URL path key that selects this project.
+	Key string
+	// Token is the header value this project's app attachment sends.
+	Token string
+	// Projects is every tracker project this entry answers to (the primary key and
+	// `also`). A delivery whose payload names a project outside this set is refused,
+	// so one project's key cannot post another project's events.
+	Projects []string
+}
+
+// EntryLocks returns the enabled entries of one source, in declaration order.
+//
+// It is the only reader of the lock material: the receiver resolves a delivery by
+// scanning these with a constant-time comparison, which is why a map keyed by the
+// secret is not used here (ADR 0015 §timing).
+func (m *Map) EntryLocks(source string) []EntryLock {
+	if m == nil {
+		return nil
+	}
+	wanted := strings.ToLower(strings.TrimSpace(source))
+	var locks []EntryLock
+	for _, entry := range m.entries {
+		if !entry.IsEnabled() || entry.Source != wanted || entry.hookKey == "" {
+			continue
+		}
+		locks = append(locks, EntryLock{
+			Entry:    entry.Label(),
+			Key:      entry.hookKey,
+			Token:    entry.token,
+			Projects: append([]string(nil), entry.keys...),
+		})
+	}
+	return locks
+}
+
+// HasInlineLockMaterial reports whether the file itself holds a secret (an entry
+// lock or a runtime's inline password). The configuration file's own permissions
+// are enforced only in that case: a file that merely names variables and paths is
+// safe to copy and review (ADR 0015).
+func (m *Map) HasInlineLockMaterial() bool {
+	if m == nil {
+		return false
+	}
+	for _, entry := range m.entries {
+		if entry.hookKey != "" || entry.token != "" {
+			return true
+		}
+	}
+	return m.HasInlinePassword()
 }
 
 // Selection policies for a new task when a project is served by more than one
@@ -194,6 +257,11 @@ type Map struct {
 	// byIndex is keyed by `source\x00PROJECT`: the same project key in two sources is
 	// two entries, and a duplicate inside one source is still an error.
 	byIndex map[string]*Entry
+	// byLock is keyed by `source\x00<key>`. A URL key must select exactly one
+	// project: it is the only thing that attributes a delivery before its body is
+	// parsed, so two entries answering to one key would make that attribution a
+	// guess (ADR 0015).
+	byLock map[string]*Entry
 	// policy is the table-wide default selection policy.
 	policy string
 
@@ -412,7 +480,7 @@ func normalisePolicy(raw string) (string, error) {
 // It returns ErrNotFound (wrapped) when the file does not exist, and any other error
 // means the file exists but must not be trusted.
 func Load(path string) (*Map, error) {
-	m := &Map{path: path, byIndex: map[string]*Entry{}, format: FormatV2}
+	m := &Map{path: path, byIndex: map[string]*Entry{}, byLock: map[string]*Entry{}, format: FormatV2}
 	if strings.TrimSpace(path) == "" {
 		return m, fmt.Errorf("%w: no path configured", ErrNotFound)
 	}
@@ -471,6 +539,9 @@ func (m *Map) load(file *v2File, path string, translated bool) (*Map, error) {
 		return nil, fmt.Errorf("configuration file %s: %w", path, err)
 	}
 	m.policy = policy
+	if m.byLock == nil {
+		m.byLock = map[string]*Entry{}
+	}
 
 	for index := range file.Projects {
 		project := file.Projects[index]
@@ -478,12 +549,12 @@ func (m *Map) load(file *v2File, path string, translated bool) (*Map, error) {
 			return nil, fmt.Errorf("configuration file %s: %w", path, err)
 		}
 		extra, err := m.readPromptFile(fmt.Sprintf("projects[%s:%s].prompt_file",
-			project.Source, project.Project), project.PromptFile)
+			project.Source.Name, project.Project), project.PromptFile)
 		if err != nil {
 			return nil, fmt.Errorf("configuration file %s: %w", path, err)
 		}
 		entry := &Entry{
-			Source:        strings.ToLower(strings.TrimSpace(project.Source)),
+			Source:        strings.ToLower(strings.TrimSpace(project.Source.Name)),
 			Project:       strings.TrimSpace(project.Project),
 			AlsoKeys:      project.Also,
 			Repo:          project.Repo,
@@ -496,6 +567,8 @@ func (m *Map) load(file *v2File, path string, translated bool) (*Map, error) {
 			Authors:       project.Authors,
 			Enabled:       project.Enabled,
 			PromptExtra:   extra,
+			hookKey:       project.Source.HookKey,
+			token:         project.Source.Token,
 		}
 		if err := m.register(entry, index); err != nil {
 			return nil, fmt.Errorf("configuration file %s: %w", path, err)
@@ -609,9 +682,46 @@ func parseRuntimeURL(raw string) (runtimeURL, error) {
 	return runtimeURL{Scheme: scheme, Host: host, Path: path}, nil
 }
 
+// minLockChars is the floor for both entry locks. The app's own token setting asks
+// for at least 32 characters, and the URL key has the same job — a capability
+// copied between the tracker and this receiver — so one floor covers both rather
+// than a weaker rule for the value that travels in a path.
+const minLockChars = 32
+
+// hookKeyPattern keeps the URL key usable as one path segment. The Webhook Triggers
+// app treats a comma as a separator between URLs and the router matches the segment
+// whole, so a slash, comma, space or percent-escape would stop a delivery from
+// arriving somewhere invisible instead of failing at load time.
+var hookKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]+$`)
+
+func validateLockKey(key string) error {
+	if len(key) < minLockChars {
+		return fmt.Errorf("is %d characters long, under the %d character floor (use `openssl rand -hex 32`)", len(key), minLockChars)
+	}
+	if !hookKeyPattern.MatchString(key) {
+		return fmt.Errorf("contains a character that is not URL-safe; use A-Z, a-z, 0-9, '.', '_', '~' or '-' (a comma separates URLs in the app, and a slash would change the route)")
+	}
+	return nil
+}
+
+func validateLockToken(token string) error {
+	if len(token) < minLockChars {
+		return fmt.Errorf("is %d characters long, under the %d character floor (use `openssl rand -hex 32`)", len(token), minLockChars)
+	}
+	if strings.TrimSpace(token) != token {
+		return fmt.Errorf("has leading or trailing whitespace, which can never be part of the header value the app sends")
+	}
+	for _, r := range token {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("contains a control character, which cannot be sent in an HTTP header")
+		}
+	}
+	return nil
+}
+
 func (m *Map) register(entry *Entry, index int) error {
 	if entry.Source == "" {
-		return fmt.Errorf("project #%d: source is required (name the adapter that produces this project's events)", index+1)
+		return fmt.Errorf("project #%d: source.name is required (name the adapter that produces this project's events)", index+1)
 	}
 	if entry.Project == "" {
 		return fmt.Errorf("project #%d (%s): project is required", index+1, entry.Source)
@@ -680,6 +790,28 @@ func (m *Map) register(entry *Entry, index int) error {
 		}
 		m.byIndex[slot] = entry
 		entry.keys = append(entry.keys, key)
+	}
+	// A key that is present must be usable and unique. Whether every enabled entry
+	// *has* one depends on the source this process serves, so the completeness check
+	// is LockProblems, called by main for that source; a table may declare projects
+	// for another source that does not use these locks (ADR 0015).
+	if entry.hookKey != "" {
+		if err := validateLockKey(entry.hookKey); err != nil {
+			return fmt.Errorf("project %s: source.hook_key %w", entry.Label(), err)
+		}
+		if entry.IsEnabled() {
+			slot := entry.Source + "\x00" + entry.hookKey
+			if existing, taken := m.byLock[slot]; taken {
+				return fmt.Errorf("%s and %s declare the same source.hook_key; a key must select exactly one project, so give each project its own key",
+					existing.Label(), entry.Label())
+			}
+			m.byLock[slot] = entry
+		}
+	}
+	if entry.token != "" {
+		if err := validateLockToken(entry.token); err != nil {
+			return fmt.Errorf("project %s: source.token %w", entry.Label(), err)
+		}
 	}
 	m.entries = append(m.entries, entry)
 	return nil

@@ -40,10 +40,45 @@ func (m *Map) Validate() []string {
 	return problems
 }
 
+// LockProblems reports the enabled entries of one source that cannot receive a
+// delivery because their entry locks are incomplete.
+//
+// The check is scoped to the source this process serves: the lock material is that
+// source's addressing scheme, and a table may declare projects for a source this
+// binary does not receive from (ADR 0015). Without a key a delivery cannot be
+// attributed to a project, and without a token it cannot be authenticated, so both
+// are refused at startup instead of failing one delivery at a time.
+func (m *Map) LockProblems(source string) []string {
+	if m == nil {
+		return nil
+	}
+	wanted := strings.ToLower(strings.TrimSpace(source))
+	v1Hint := ""
+	if m.translated {
+		v1Hint = " (a version 1 file cannot express entry locks; rewrite it as version 2 and give each project a source object)"
+	}
+	var problems []string
+	for _, entry := range m.entries {
+		if !entry.IsEnabled() || entry.Source != wanted {
+			continue
+		}
+		if entry.hookKey == "" {
+			problems = append(problems, fmt.Sprintf(
+				"project %s: source.hook_key is required (the URL key routes a delivery to this project before its body is read); write \"source\": {\"name\": %q, \"hook_key\": ..., \"token\": ...}%s",
+				entry.Label(), entry.Source, v1Hint))
+		}
+		if entry.token == "" {
+			problems = append(problems, fmt.Sprintf(
+				"project %s: source.token is required (the header token authenticates the delivery after its key has selected the project)%s",
+				entry.Label(), v1Hint))
+		}
+	}
+	return problems
+}
+
 func (e *Entry) validate() []string {
 	label := e.Label()
 	var problems []string
-
 	if strings.TrimSpace(e.Repo.Path) == "" {
 		problems = append(problems, fmt.Sprintf("%s: repo.path is not configured", label))
 	}
@@ -107,7 +142,7 @@ func (m *Map) Report() string {
 	fmt.Fprintf(&b, "config_format:      %s\n", m.FormatNote())
 
 	if m == nil || m.Len() == 0 {
-		fmt.Fprintf(&b, "projects:           <none> — deliveries are recorded but never routed\n")
+		fmt.Fprintf(&b, "projects:           <none> — every delivery is refused as bad_url_key (there is no project key to attribute it to)\n")
 		return b.String()
 	}
 
@@ -138,6 +173,15 @@ func (m *Map) Report() string {
 		}
 		if entry.Worktrees != "" {
 			fmt.Fprintf(&b, "  %-14s    worktrees %s\n", "", entry.Worktrees)
+		}
+		if entry.IsEnabled() {
+			// Presence only: the values are secrets, and a report that can be pasted
+			// into a ticket must not carry them (ADR 0015).
+			if entry.hookKey != "" && entry.token != "" {
+				fmt.Fprintf(&b, "  %-14s    locks url_key,header_token\n", "")
+			} else {
+				fmt.Fprintf(&b, "  %-14s    locks MISSING (see lock_problem)\n", "")
+			}
 		}
 		if set := entry.RuntimeSet(); len(set) > 0 {
 			fmt.Fprintf(&b, "  %-14s    runtimes %s (%s)\n", "", strings.Join(set, ","), entry.Policy())
