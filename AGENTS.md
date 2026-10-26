@@ -271,7 +271,10 @@ documents. The rules below are load-bearing; do not relax them casually.
    `ask`, which must come **first** because the ruleset is an array evaluated
    last-match-wins — and then answers the `ask` requests with the arbiter. `edit`
    is `ask`, never `allow`, so the phase decides. The arbiter is an allowlist over
-   shell segments, and it must keep rejecting absolute paths and `~`: the
+   shell segments split **outside quotes** (a quoted `|`/`;`/`&&` is data, an
+   escaped `\|` too), it allows the build tools of the repositories it serves
+   (Go, Make, the Node package managers, Maven with `deploy`/release refused), and
+   it must keep rejecting absolute paths and `~`: the
    ruleset's `external_directory` does not cover a command run inside a shell.
    Never reply `always` by default, never widen the allowlist to "make the agent
    work", and remember that allowed build and test commands are arbitrary code
