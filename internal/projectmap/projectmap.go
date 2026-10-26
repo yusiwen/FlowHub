@@ -108,6 +108,10 @@ type Entry struct {
 	// nothing may print them (ADR 0015).
 	hookKey string
 	token   string
+	// hookKeyFrom and tokenFrom name where each value came from ("inline",
+	// "env NAME", "file PATH"), for -print-config. They never carry the value.
+	hookKeyFrom string
+	tokenFrom   string
 
 	keys     []string
 	runtimes []string
@@ -163,12 +167,7 @@ func (m *Map) HasInlineLockMaterial() bool {
 	if m == nil {
 		return false
 	}
-	for _, entry := range m.entries {
-		if entry.hookKey != "" || entry.token != "" {
-			return true
-		}
-	}
-	return m.HasInlinePassword()
+	return m.inlineLockMaterial || m.HasInlinePassword()
 }
 
 // Selection policies for a new task when a project is served by more than one
@@ -264,6 +263,10 @@ type Map struct {
 	byLock map[string]*Entry
 	// policy is the table-wide default selection policy.
 	policy string
+	// inlineLockMaterial records that at least one entry writes a lock value in the
+	// file itself, which is what makes the file a secret. A table that only names
+	// variables and files stays copyable and is not permission-checked.
+	inlineLockMaterial bool
 
 	// credentials holds the Basic Auth pairs read from `credentials_file`, keyed by
 	// runtime name. It is read once, when the table is loaded, so a password rotation
@@ -548,6 +551,27 @@ func (m *Map) load(file *v2File, path string, translated bool) (*Map, error) {
 		if err := checkV2(project, index); err != nil {
 			return nil, fmt.Errorf("configuration file %s: %w", path, err)
 		}
+		label := strings.ToLower(strings.TrimSpace(project.Source.Name)) + ":" + strings.TrimSpace(project.Project)
+		// A disabled entry is not addressable, so its lock references are not
+		// resolved: a parked project must not keep the whole receiver from starting
+		// because a variable it no longer uses is unset. The inline check below still
+		// runs, because a secret written in the file is a secret whether or not the
+		// entry is enabled.
+		var hookKey, token, hookKeyFrom, tokenFrom string
+		if project.Enabled == nil || *project.Enabled {
+			var err error
+			hookKey, hookKeyFrom, err = m.resolveEntryLock(label, "hook_key", project.Source)
+			if err != nil {
+				return nil, fmt.Errorf("configuration file %s: %w", path, err)
+			}
+			token, tokenFrom, err = m.resolveEntryLock(label, "token", project.Source)
+			if err != nil {
+				return nil, fmt.Errorf("configuration file %s: %w", path, err)
+			}
+		}
+		if strings.TrimSpace(project.Source.HookKey) != "" || strings.TrimSpace(project.Source.Token) != "" {
+			m.inlineLockMaterial = true
+		}
 		extra, err := m.readPromptFile(fmt.Sprintf("projects[%s:%s].prompt_file",
 			project.Source.Name, project.Project), project.PromptFile)
 		if err != nil {
@@ -567,8 +591,10 @@ func (m *Map) load(file *v2File, path string, translated bool) (*Map, error) {
 			Authors:       project.Authors,
 			Enabled:       project.Enabled,
 			PromptExtra:   extra,
-			hookKey:       project.Source.HookKey,
-			token:         project.Source.Token,
+			hookKey:       hookKey,
+			token:         token,
+			hookKeyFrom:   hookKeyFrom,
+			tokenFrom:     tokenFrom,
 		}
 		if err := m.register(entry, index); err != nil {
 			return nil, fmt.Errorf("configuration file %s: %w", path, err)
@@ -719,6 +745,67 @@ func validateLockToken(token string) error {
 	return nil
 }
 
+// resolveEntryLock turns one lock declaration into its value and a provenance
+// string. Exactly one of the inline value, an environment variable and a file may
+// be named; the value is read once at load time, so rotating a lock needs a
+// restart — the rule every other secret in this table follows.
+//
+// The shape is validated here for every source, so an environment or file value
+// cannot be weaker than an inline one.
+func (m *Map) resolveEntryLock(label, field string, source v2ProjectSource) (string, string, error) {
+	var inline, envName, file string
+	validate := validateLockToken
+	switch field {
+	case "hook_key":
+		inline, envName, file = source.HookKey, source.HookKeyEnv, source.HookKeyFile
+		validate = validateLockKey
+	case "token":
+		inline, envName, file = source.Token, source.TokenEnv, source.TokenFile
+	default:
+		return "", "", fmt.Errorf("%s: unknown lock field %q", label, field)
+	}
+	// The inline value is not trimmed: a token with a trailing space is a mistake,
+	// and quietly using the trimmed value would hide it until the first delivery is
+	// refused by the app. Names and paths are trimmed because whitespace there is
+	// never meaningful.
+	envName = strings.TrimSpace(envName)
+	file = strings.TrimSpace(file)
+
+	named := 0
+	for _, candidate := range []string{inline, envName, file} {
+		if candidate != "" {
+			named++
+		}
+	}
+	if named > 1 {
+		return "", "", fmt.Errorf("%s: source.%s names more than one source (the inline value, _env and _file); name exactly one", label, field)
+	}
+
+	var value, from string
+	switch {
+	case inline != "":
+		value, from = inline, "inline"
+	case envName != "":
+		resolved, ok := lookupSecret(os.Getenv, envName)
+		if !ok {
+			return "", "", fmt.Errorf("%s: source.%s_env names %s, which is unset or empty", label, field, envName)
+		}
+		value, from = resolved, "env "+envName
+	case file != "":
+		resolved, err := m.readSecretFile("source."+field+"_file", file)
+		if err != nil {
+			return "", "", fmt.Errorf("%s: %w", label, err)
+		}
+		value, from = resolved, "file "+m.resolveRelativePath(file)
+	default:
+		return "", "", nil
+	}
+	if err := validate(value); err != nil {
+		return "", "", fmt.Errorf("%s: source.%s %w", label, field, err)
+	}
+	return value, from, nil
+}
+
 func (m *Map) register(entry *Entry, index int) error {
 	if entry.Source == "" {
 		return fmt.Errorf("project #%d: source.name is required (name the adapter that produces this project's events)", index+1)
@@ -791,27 +878,18 @@ func (m *Map) register(entry *Entry, index int) error {
 		m.byIndex[slot] = entry
 		entry.keys = append(entry.keys, key)
 	}
-	// A key that is present must be usable and unique. Whether every enabled entry
-	// *has* one depends on the source this process serves, so the completeness check
-	// is LockProblems, called by main for that source; a table may declare projects
-	// for another source that does not use these locks (ADR 0015).
-	if entry.hookKey != "" {
-		if err := validateLockKey(entry.hookKey); err != nil {
-			return fmt.Errorf("project %s: source.hook_key %w", entry.Label(), err)
+	// A key that is present must select exactly one project. Whether every enabled
+	// entry *has* one depends on the source this process serves, so the completeness
+	// check is LockProblems, called by main for that source; a table may declare
+	// projects for another source that does not use these locks (ADR 0015). The
+	// value's shape was already checked by resolveEntryLock, whatever its source.
+	if entry.hookKey != "" && entry.IsEnabled() {
+		slot := entry.Source + "\x00" + entry.hookKey
+		if existing, taken := m.byLock[slot]; taken {
+			return fmt.Errorf("%s and %s declare the same hook_key; a key must select exactly one project, so give each project its own key",
+				existing.Label(), entry.Label())
 		}
-		if entry.IsEnabled() {
-			slot := entry.Source + "\x00" + entry.hookKey
-			if existing, taken := m.byLock[slot]; taken {
-				return fmt.Errorf("%s and %s declare the same source.hook_key; a key must select exactly one project, so give each project its own key",
-					existing.Label(), entry.Label())
-			}
-			m.byLock[slot] = entry
-		}
-	}
-	if entry.token != "" {
-		if err := validateLockToken(entry.token); err != nil {
-			return fmt.Errorf("project %s: source.token %w", entry.Label(), err)
-		}
+		m.byLock[slot] = entry
 	}
 	m.entries = append(m.entries, entry)
 	return nil

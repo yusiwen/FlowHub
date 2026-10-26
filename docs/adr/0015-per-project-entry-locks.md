@@ -2,6 +2,13 @@
 
 Status: accepted (2026-10-26, issue #171)
 
+Revision 2026-10-26 (#173): the first version required the values inline. Each field
+now names exactly one of three sources — inline, an environment variable, or a
+one-secret file — because the routing table is the file an operator copies and
+reviews, and every other secret in this project can already name a variable or a
+file instead. The security properties below are unchanged; the `0600` rule now
+applies only to a table that actually carries an inline value.
+
 ## Context
 
 The two webhook entry locks were process-wide settings:
@@ -38,19 +45,27 @@ weaker than the thing that posts to it.
    {
      "source": {
        "name": "youtrack",
-       "hook_key": "<at least 32 URL-safe characters>",
-       "token": "<at least 32 characters>"
+       "hook_key_env": "FLOWHUB_HOOK_KEY_TEST",
+       "token_env": "FLOWHUB_TOKEN_TEST"
      },
      "project": "TEST",
      "repo": { "path": "/absolute/path" }
    }
    ```
 
+   Each field names exactly one of: `hook_key`/`token` (inline, at least 32
+   characters), `hook_key_env`/`token_env` (a variable, usually from the
+   environment file that is applied before the table is read), or
+   `hook_key_file`/`token_file` (a `0600` file holding one secret). Two sources for
+   one field is a load error, and a named variable or file that is missing or empty
+   refuses the load rather than becoming a silently disabled lock. The value is
+   resolved once at load time, so rotation needs a restart.
+
    The bare string form (`"source": "youtrack"`) still parses — a disabled entry
    and a version 1 table need it — but an enabled entry of the source this process
-   serves must carry both values. `projectmap.LockProblems(source)` is the startup
-   gate; it is scoped to the served source because the lock material is that
-   source's addressing scheme, not a fact about the file.
+   serves must resolve both values. `projectmap.LockProblems(source)` is the
+   startup gate; it is scoped to the served source because the lock material is
+   that source's addressing scheme, not a fact about the file.
 
 2. **The key selects the entry before the body is read.** The receiver scans its
    configured entries with a constant-time comparison per key. An unknown key is
@@ -65,11 +80,12 @@ weaker than the thing that posts to it.
    `project_mismatch` reason. Without this check a key for TEST could post a
    BEAP_BE event: dispatch and the flow engine route by the *payload's* project.
 
-4. **Lock material makes the configuration file a secret.** A file that carries
-   `source.hook_key`/`source.token` must be mode `0600`; the same check that
-   protects an inline `auth.password` covers it, and it runs whether or not
-   dispatch is on. `-print-config`, the startup log and `/healthz` report presence
-   and lock types only — never a value.
+4. **Inline lock material makes the configuration file a secret.** A file that
+   carries `source.hook_key`/`source.token` inline must be mode `0600`; the same
+   check that protects an inline `auth.password` covers it, and it runs whether or
+   not dispatch is on. A table that only names variables and files carries no
+   secret and stays copyable. `-print-config` reports each lock's provenance
+   (`inline`, `env NAME`, `file PATH`) and never its value.
 
 5. **The global variables are removed.** `FLOWHUB_HOOK_KEY`, `FLOWHUB_TOKEN`,
    `FLOWHUB_YOUTRACK_HOOK_KEY` and `FLOWHUB_YOUTRACK_TOKEN` are no longer read.
@@ -105,7 +121,10 @@ weaker than the thing that posts to it.
 ## Consequences
 
 - A record-only receiver now needs at least one project entry, because a delivery
-  must be attributed before it can be accepted. This is a deliberate change of the
+  must be attributed before it can be accepted; the preferred form keeps the values
+  in the environment, so that table can still be copied and reviewed.
+- A configuration whose only secrets are references is not permission-checked;
+  inlining either lock turns the `0600` requirement back on for that file. This is a deliberate change of the
   first-run story: configure the project first (the routing table is already
   required for anything interesting), then post.
 - Version 1 files still translate, but they cannot express the locks; a served

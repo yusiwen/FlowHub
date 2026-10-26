@@ -178,7 +178,10 @@ func (m *Map) Report() string {
 			// Presence only: the values are secrets, and a report that can be pasted
 			// into a ticket must not carry them (ADR 0015).
 			if entry.hookKey != "" && entry.token != "" {
-				fmt.Fprintf(&b, "  %-14s    locks url_key,header_token\n", "")
+				// The provenance is part of the answer "where does this come from?";
+				// the values themselves never are (ADR 0015).
+				fmt.Fprintf(&b, "  %-14s    locks url_key,header_token (hook_key %s; token %s)\n", "",
+					entry.hookKeyFrom, entry.tokenFrom)
 			} else {
 				fmt.Fprintf(&b, "  %-14s    locks MISSING (see lock_problem)\n", "")
 			}

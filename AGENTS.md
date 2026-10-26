@@ -50,8 +50,9 @@ make lint           # go vet
 make smoke          # end-to-end: real process, real HTTP, asserts the logs
 ```
 
-Run the receiver locally (the project's URL key and token live in
-`projects[].source` in the routing table, not in the environment — ADR 0015):
+Run the receiver locally (the project's locks are named in `projects[].source`;
+the values usually live in `~/.config/flowhub/.env`, or inline if you accept the
+table being a secret — ADR 0015):
 
 ```bash
 mkdir -p ~/.config/flowhub   # then write config.json; config/config.example.json is the template
@@ -76,8 +77,8 @@ cached model included — until `opencode serve` restarts. FlowHub therefore pin
 model the runtime reported for that profile (ADR 0002), and `init` refuses a
 profile whose model the provider no longer offers.
 
-Then post to `http://127.0.0.1:8080/hooks/youtrack/<the project's source.hook_key>` with the
-header `X-YouTrack-Token: <that project's source.token>`. See `README.md`.
+Then post to `http://127.0.0.1:8080/hooks/youtrack/<that project's hook key>` with the
+header `X-YouTrack-Token: <that project's token>`. See `README.md`.
 
 ## Toolchain
 
@@ -189,14 +190,16 @@ documents. The rules below are load-bearing; do not relax them casually.
    service answers the "is the app sending the literal `secret`?" question
    through `MatchesConfigured` / `LooksLikeLiteralSecret` fingerprints instead.
    **The URL key and the header token are per project (ADR 0015).** They live in
-   `projects[].source.hook_key` / `.token` in the routing table: the key selects the
-   entry before the body is read, the entry's token authenticates the delivery, and
-   the decoded project must be one of that entry's keys (`project` or `also`) or it
-   is refused as `project_mismatch` — one project's key must never post another
-   project's event. A file that carries these locks is itself a secret and must be
-   mode `0600`; the process-wide `FLOWHUB_HOOK_KEY` / `FLOWHUB_TOKEN` (and their
-   `FLOWHUB_YOUTRACK_*` spellings) are no longer read, and a process that still has
-   one set warns.
+   `projects[].source`: the key selects the entry before the body is read, the
+   entry's token authenticates the delivery, and the decoded project must be one of
+   that entry's keys (`project` or `also`) or it is refused as `project_mismatch` —
+   one project's key must never post another project's event. Each field names
+   exactly one source: inline (`hook_key`/`token`), an environment variable
+   (`hook_key_env`/`token_env`, usually from the `.env` that is applied before the
+   table is read), or a one-secret `0600` file (`hook_key_file`/`token_file`). Only
+   the inline form makes the configuration file a secret; the process-wide
+   `FLOWHUB_HOOK_KEY` / `FLOWHUB_TOKEN` (and their `FLOWHUB_YOUTRACK_*` spellings)
+   are no longer read, and a process that still has one set warns.
    **An agent server's Basic Auth password follows the same rule (ADR 0004).** It
    comes from the environment (`FLOWHUB_OPENCODE_PASSWORD`, or
    `auth.password_env`), from a per-runtime `auth.password_file`, from the shared

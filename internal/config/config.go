@@ -752,7 +752,7 @@ func (c Config) Report() string {
 	fmt.Fprintf(&b, "addr:               %s\n", c.Addr)
 	fmt.Fprintf(&b, "hook_path:          %s\n", c.HookPath)
 	fmt.Fprintf(&b, "token_header:       %s\n", c.TokenHeader)
-	fmt.Fprintf(&b, "entry_locks:        per project (projects[].source.hook_key / .token; see the routing report)\n")
+	fmt.Fprintf(&b, "entry_locks:        per project (inline, _env or _file; see the routing report)\n")
 	sources := make([]string, 0, len(c.AllowedSources))
 	for _, n := range c.AllowedSources {
 		sources = append(sources, n.String())

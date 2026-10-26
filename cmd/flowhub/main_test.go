@@ -166,6 +166,29 @@ func TestAWorldReadableConfigRefusesToStartWhenItHoldsEntryLocks(t *testing.T) {
 	if problems := configFileSecretProblems(path, projects); len(problems) == 0 {
 		t.Fatal("a 0644 file holding entry locks was accepted")
 	}
+
+	// A table that only names variables carries no secret and keeps working at 0644:
+	// the values live in the environment (or the environment file), which is the
+	// point of the reference form.
+	t.Setenv("TEST_ENTRY_HOOK_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("TEST_ENTRY_TOKEN", "feedfacefeedfacefeedfacefeedface")
+	envBody := `{"version": 2, "projects": [{
+	  "source": {"name": "youtrack", "hook_key_env": "TEST_ENTRY_HOOK_KEY", "token_env": "TEST_ENTRY_TOKEN"},
+	  "project": "TEST", "repo": {"path": "/tmp/test"}}]}`
+	envPath := filepath.Join(dir, "env-config.json")
+	if err := os.WriteFile(envPath, []byte(envBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	envProjects, err := projectmap.Load(envPath)
+	if err != nil {
+		t.Fatalf("projectmap.Load: %v", err)
+	}
+	if envProjects.HasInlineLockMaterial() {
+		t.Fatal("a table naming only variables was treated as a secret")
+	}
+	if problems := configFileSecretProblems(envPath, envProjects); len(problems) != 0 {
+		t.Fatalf("a 0644 file naming variables was refused: %v", problems)
+	}
 }
 
 // fakeAgentServer stands in for an opencode host during activation. Each case

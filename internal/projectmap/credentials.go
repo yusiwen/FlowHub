@@ -361,7 +361,7 @@ func (m *Map) resolveCredential(name string, getenv func(string) string) (Creden
 			}
 		}
 		if file := strings.TrimSpace(auth.PasswordFile); file != "" {
-			if value, err := m.readSecretFile(file); err == nil {
+			if value, err := m.readSecretFile("password_file", file); err == nil {
 				return Credential{User: user, Password: value, Source: "password_file:" + m.resolveRelativePath(file)}, true
 			}
 		}
@@ -384,31 +384,32 @@ func (m *Map) resolveCredential(name string, getenv func(string) string) (Creden
 	return Credential{}, false
 }
 
-// readSecretFile reads a password file: one secret, optionally with a trailing
-// newline, and nothing else.
-func (m *Map) readSecretFile(path string) (string, error) {
+// readSecretFile reads a one-secret file: one value, optionally with a trailing
+// newline, and nothing else. The label names the field in messages, so a lock file
+// and a password file report the same way without pretending to be the other.
+func (m *Map) readSecretFile(label, path string) (string, error) {
 	location := m.resolveRelativePath(path)
-	if err := checkSecretPermissions("password_file", location); err != nil {
+	if err := checkSecretPermissions(label, location); err != nil {
 		return "", err
 	}
 	info, err := os.Stat(location)
 	if err != nil {
-		return "", fmt.Errorf("password_file %s: %v", location, err)
+		return "", fmt.Errorf("%s %s: %v", label, location, err)
 	}
 	if info.Size() > maxSecretFileBytes {
-		return "", fmt.Errorf("password_file %s is %d bytes, over the %d byte limit: a secret is one line",
-			location, info.Size(), maxSecretFileBytes)
+		return "", fmt.Errorf("%s %s is %d bytes, over the %d byte limit: a secret is one line",
+			label, location, info.Size(), maxSecretFileBytes)
 	}
 	raw, err := os.ReadFile(location)
 	if err != nil {
-		return "", fmt.Errorf("password_file %s: %v", location, err)
+		return "", fmt.Errorf("%s %s: %v", label, location, err)
 	}
 	// Trim the whole value: a password with deliberate leading or trailing spaces
 	// cannot be told apart from an editor's newline, and silently using the wrong
 	// bytes is worse than refusing the start.
 	value := strings.TrimSpace(string(raw))
 	if value == "" {
-		return "", fmt.Errorf("password_file %s is empty, so it would have no effect", location)
+		return "", fmt.Errorf("%s %s is empty, so it would have no effect", label, location)
 	}
 	return value, nil
 }
