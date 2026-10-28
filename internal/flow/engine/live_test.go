@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/yusiwen/flowhub/internal/source/youtrack"
 	"github.com/yusiwen/flowhub/internal/store"
 	tasksvc "github.com/yusiwen/flowhub/internal/tasks"
+	"github.com/yusiwen/flowhub/internal/upstream"
 )
 
 type liveSelector struct {
@@ -35,6 +37,7 @@ type liveTasks struct {
 	turn   int
 	grant  int
 	revoke int
+	last   tasksvc.TurnRequest
 }
 
 func (s *liveTasks) Ensure(_ context.Context, request tasksvc.EnsureRequest) (registry.Task, error) {
@@ -48,6 +51,7 @@ func (s *liveTasks) Ensure(_ context.Context, request tasksvc.EnsureRequest) (re
 
 func (s *liveTasks) Turn(_ context.Context, request tasksvc.TurnRequest) (tasksvc.TurnResult, error) {
 	s.turn++
+	s.last = request
 	s.task = request.Task
 	s.task.Turns++
 	s.task.State = registry.StateDone
@@ -295,5 +299,35 @@ func TestShadowRunPublishesItsDecisionForComparison(t *testing.T) {
 	comparison, ok := comparisons.Get(event.ID)
 	if !ok || !comparison.Match {
 		t.Fatalf("comparison = %+v, ok = %v", comparison, ok)
+	}
+}
+
+// TestTheFlowTurnCarriesTheDecisionTrigger: the executor derives the reply's
+// sign-off basis from Decision.Trigger. Passing the literal "flow" made every
+// flow-driven reply say "a FlowHub automation trigger", so a plan triggered by a
+// state change could not name what moved it. The decision's own trigger has to
+// survive into the turn.
+func TestTheFlowTurnCarriesTheDecisionTrigger(t *testing.T) {
+	now := time.Date(2026, 10, 27, 9, 0, 0, 0, time.UTC)
+	event := upstream.Event{
+		ID: "evt_trigger", Schema: 1, Upstream: "youtrack", Kind: upstream.KindIssueUpdated,
+		OccurredAt: now, ReceivedAt: now,
+		Subject: upstream.Subject{Type: "issue", Project: "TEST", Key: "TEST-12", Title: "issue"},
+		Actor:   upstream.Actor{Login: "yusiwen"},
+		Changes: []upstream.Change{{Field: "State", To: "In Progress"}},
+	}
+	service := &liveTasks{task: registry.Task{Key: "TEST-12", Plan: registry.PlanNone}}
+	engine := newLiveEngine(t, service, liveSelector{host: tasksvc.Host{Name: "builder-a"}})
+	if _, err := engine.RunEvent(event); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if service.turn != 1 {
+		t.Fatalf("turns = %d, want one plan turn", service.turn)
+	}
+	if service.last.Trigger != rules.TriggerState {
+		t.Fatalf("turn trigger = %q, want %q", service.last.Trigger, rules.TriggerState)
+	}
+	if !strings.Contains(service.last.Basis, "State changed") {
+		t.Fatalf("turn basis = %q, want the state-change reason", service.last.Basis)
 	}
 }

@@ -36,6 +36,7 @@ func (s *Source) Normalize(decoded source.Decoded, request *source.Request, rece
 			Project: e.Subject.Project,
 			Key:     e.Subject.Key,
 			Title:   e.Subject.Title,
+			Body:    e.Subject.Body,
 			URL:     e.Subject.URL,
 		},
 		Actor:     upstream.Actor{Login: e.Actor},
