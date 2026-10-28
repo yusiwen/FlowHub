@@ -265,3 +265,14 @@ func TestEngineSubmitProcessesAndCloses(t *testing.T) {
 		t.Fatalf("second close: %v", err)
 	}
 }
+
+// TestTheNeutralEventKeepsTheIssueBody: flow turns are prompted from the neutral
+// event, so the issue text has to survive the upstream conversion. The earlier
+// converter dropped it, which made a flow-driven plan prompt thinner than the same
+// turn driven through dispatch.
+func TestTheNeutralEventKeepsTheIssueBody(t *testing.T) {
+	event := neutralEvent(upstream.Event{Subject: upstream.Subject{Body: "the requirement"}})
+	if event.Subject.Body != "the requirement" {
+		t.Fatalf("neutral subject body = %q, want the upstream body", event.Subject.Body)
+	}
+}

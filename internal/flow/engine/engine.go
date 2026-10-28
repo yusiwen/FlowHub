@@ -726,11 +726,12 @@ type stepOutcome struct {
 // liveExecution is the state an `on` run threads through the graph: the record the
 // task service expects, the routing entry and the runtime host chosen for the task.
 type liveExecution struct {
-	record *store.Record
-	entry  *projectmap.Entry
-	host   tasksvc.Host
-	task   registry.Task
-	basis  string
+	record  *store.Record
+	entry   *projectmap.Entry
+	host    tasksvc.Host
+	task    registry.Task
+	basis   string
+	trigger rules.Trigger
 }
 
 func (e *Engine) run(ctx context.Context, event upstream.Event, trigger *flow.CompiledTrigger, deployment string, order uint64) (*Run, error) {
@@ -918,6 +919,7 @@ func (e *Engine) execute(ctx context.Context, node *flow.CompiledNode, event ups
 		}
 		if live != nil {
 			live.basis = decision.Reason
+			live.trigger = decision.Trigger
 		}
 		return stepOutcome{state: StepSucceeded, output: map[string]any{
 			"action": string(decision.Action),
@@ -1091,7 +1093,7 @@ func (e *Engine) turnLive(ctx context.Context, live *liveExecution, node *flow.C
 	}
 	result, err := e.opts.TaskService.Turn(ctx, tasksvc.TurnRequest{
 		Record: live.record, Delivery: neutralEvent(event), Task: live.task,
-		Entry: live.entry, Host: live.host, Action: action, Trigger: rules.Trigger("flow"),
+		Entry: live.entry, Host: live.host, Action: action, Trigger: live.trigger,
 		RequireReply: config.RequireReply, Basis: live.basis,
 	})
 	if err != nil {
@@ -1374,6 +1376,7 @@ func neutralEvent(value upstream.Event) event.Event {
 			Project: value.Subject.Project,
 			Key:     value.Subject.Key,
 			Title:   value.Subject.Title,
+			Body:    value.Subject.Body,
 			URL:     value.Subject.URL,
 		},
 		Actor:      value.Actor.Login,

@@ -37,6 +37,7 @@ type Subject struct {
 	Project string `json:"project,omitempty"`
 	Key     string `json:"key"`
 	Title   string `json:"title,omitempty"`
+	Body    string `json:"body,omitempty"`
 	URL     string `json:"url,omitempty"`
 }
 

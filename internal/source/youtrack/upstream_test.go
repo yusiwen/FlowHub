@@ -111,3 +111,19 @@ func TestIssueUpdateDedupeIncludesChangedContent(t *testing.T) {
 		t.Fatalf("different issue updates share a dedupe key: %q", first.DedupeKey)
 	}
 }
+
+// TestNormalizeCarriesTheIssueBody: the flow-driven prompts are built from the
+// upstream event, not the raw delivery. Dropping Subject.Body there meant a
+// state-triggered plan prompt carried only key/project/summary, so the model had to
+// rely on its session's memory for the requirement itself.
+func TestNormalizeCarriesTheIssueBody(t *testing.T) {
+	body := strings.Replace(createdBody, `"summary":"New issue",`,
+		`"summary":"New issue","description":"the requirement text",`, 1)
+	if body == createdBody {
+		t.Fatal("test body did not change")
+	}
+	event := normalize(t, body)
+	if event.Subject.Body != "the requirement text" {
+		t.Fatalf("subject body = %q, want the payload description", event.Subject.Body)
+	}
+}
