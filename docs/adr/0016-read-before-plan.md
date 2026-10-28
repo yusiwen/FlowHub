@@ -2,6 +2,11 @@
 
 Status: accepted (2026-10-28, issue #177)
 
+Revision 2026-10-28 (#179): Phase 2 landed as ADR 0017. The reply tool is now
+gated by the session ruleset and refused by the arbiter until the plan read
+completes; the post-turn gate below remains the backstop for sessions created
+before the ruleset change.
+
 ## Context
 
 On 2026-10-26 the BEAP_BE-73 run produced a plan turn that posted a plan without
