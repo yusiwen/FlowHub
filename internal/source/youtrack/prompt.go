@@ -40,10 +40,19 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 
 	var b strings.Builder
 	switch {
-	case ctx.Nudge:
-		// The header names the failure rather than the task: this turn exists because
+	case ctx.Nudge && ctx.NudgeRead:
+		// The header names the failures rather than the task: this turn exists because
 		// the previous one broke the contract, and a model that reads it as "try the
 		// whole task again" will loop through the same refusals.
+		fmt.Fprintf(&b, "Your previous turn on YouTrack issue %s ended without posting the comment this workflow requires and without reading the issue discussion, so the maintainer was told nothing at all.\n", d.IssueID)
+		fmt.Fprintf(&b, "Issue %s is therefore still unanswered. This follow-up turn exists only to fix both.\n", d.IssueID)
+	case ctx.NudgeRead:
+		// A plan posted from the session's memory can ask questions the discussion
+		// already answered. The header names that failure; the phase text below says
+		// what to do about it.
+		fmt.Fprintf(&b, "Your previous turn on YouTrack issue %s posted its reply without reading the live issue discussion.\n", d.IssueID)
+		b.WriteString("The plan may therefore answer questions the discussion already answered. This follow-up turn exists only to fix that.\n")
+	case ctx.Nudge:
 		fmt.Fprintf(&b, "Your previous turn on YouTrack issue %s ended without posting the comment this workflow requires, so the maintainer was told nothing at all.\n", d.IssueID)
 		fmt.Fprintf(&b, "Issue %s is therefore still unanswered. This follow-up turn exists only to fix that.\n", d.IssueID)
 	case action == rules.ActionAnalyze:
@@ -134,6 +143,17 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 	}
 
 	switch {
+	case ctx.NudgeRead:
+		b.WriteString("\n## This turn\n")
+		b.WriteString("Read the issue discussion now with `youtrack_get_issue_comments` — a read from an earlier\n")
+		b.WriteString("turn does not count for this turn. Then post exactly one comment:\n")
+		if ctx.Nudge {
+			b.WriteString("the plan you owe, written from what the discussion says. Do not start implementing.\n")
+		} else {
+			b.WriteString("a correction if the discussion answers or changes the plan you posted, or a one-line confirmation\n")
+			b.WriteString("that the plan stands because you have now read the discussion. Do not start implementing.\n")
+		}
+		b.WriteString("If the discussion answers a question you asked, do not ask it again: state the answer and who gave it.\n")
 	case ctx.Nudge:
 		b.WriteString("\n## This turn\n")
 		b.WriteString("Post the comment described below. Nothing else is required of you, and no further work should\n")
@@ -149,10 +169,14 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 		b.WriteString("no file edits, no commits, no state changes in YouTrack.\n")
 	case action == rules.ActionPlan:
 		b.WriteString("\n## This turn\n")
-		b.WriteString("This turn is READ-ONLY. Produce a concrete, ordered implementation plan: which files change, what the\n")
+		b.WriteString("This turn is READ-ONLY. Before you write the plan, call `youtrack_get_issue_comments` and read the\n")
+		b.WriteString("newest human comments. The session may hold an earlier analysis; treat it as stale. If a question\n")
+		b.WriteString("you were about to ask is already answered there, do not ask it again: state the answer and who\n")
+		b.WriteString("gave it, and build the plan on it. Name the newest human comment you read in the plan comment.\n")
+		b.WriteString("Produce a concrete, ordered implementation plan: which files change, what the\n")
 		b.WriteString("risky parts are, and how the change will be verified. List every question that must be answered by a\n")
-		b.WriteString("human before implementation can start. If a plan already exists in this session, refine it instead of\n")
-		b.WriteString("starting over. Change nothing on disk.\n")
+		b.WriteString("human before implementation can start. Treat any plan already in this session as a draft: re-read\n")
+		b.WriteString("the discussion before refining it. Change nothing on disk.\n")
 	case action == rules.ActionExecute:
 		b.WriteString("\n## This turn\n")
 		b.WriteString("Implement the plan in the working directory. You may edit files and commit locally on the task branch;\n")

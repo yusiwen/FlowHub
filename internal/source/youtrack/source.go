@@ -50,8 +50,9 @@ func (s *Source) Policy() rules.Policy { return s.policy }
 // Tools implements source.Source.
 func (s *Source) Tools() source.ToolPolicy {
 	return source.ToolPolicy{
-		Allowed: AllowedMCPTools,
-		Reply:   ReplyTools,
+		Allowed:  AllowedMCPTools,
+		Reply:    ReplyTools,
+		PlanRead: PlanReadTools,
 		Download: source.DownloadPolicy{
 			Hosts:  DownloadHosts,
 			Prefix: DownloadPrefix,
