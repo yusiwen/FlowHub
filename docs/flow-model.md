@@ -474,7 +474,9 @@ analyzing -> awaiting_input -> planning -> executing -> done
 `plan_state` is `none | draft | confirmed`; the builtin evaluate uses `plan != none`
 to choose between a planning turn and an execution turn, exactly like
 `rules.startDecision`. `last_action` lets a permit continue the action the refusals
-stopped (`task.turn.action: last`).
+stopped (`task.turn.action: last`). A `draft` is written only by a plan turn that
+read the issue discussion before it replied; a failed plan turn leaves `none`, so a
+stale draft cannot become the next start's execution input.
 
 ### 7.3 Lease
 
@@ -509,6 +511,11 @@ stopped (`task.turn.action: last`).
   owns the shell policy. A flow cannot widen either.
 - `require_reply` uses the profile's reply tools and marker. One nudge, in the same
   session, with a bounded deadline; a second silent finish fails the task.
+- A plan turn enforces the profile's `PlanRead`: a completed read must precede a
+  completed reply. One bounded follow-up (`NudgeRead`) asks for the read and a
+  correction; a plan still posted without it is failed with `plan_state=none`, never
+  a draft. The read tools are the profile's, so a tracker with no discussion is
+  unaffected.
 - Cost and turns accumulate on the task; `max_cost` and `max_turns` are enforced
   before the next turn, not after the budget is already spent.
 
@@ -620,7 +627,7 @@ test for M0 and the checklist for M1-4's parity harness.
 | 7 | phase, agent, model and deadline precedence | `task.turn` config + profile + runtime declaration |
 | 8 | permission arbiter and refusals | `task.turn` → `refusals`; the runtime still owns the arbiter |
 | 9 | `/opencode permit`, grant lifetime | `task.grant` / `task.revoke` |
-| 10 | nudge on a silent finish | `task.turn.require_reply`; one nudge, then fail |
+| 10 | nudge on a silent finish; a plan turn must read the discussion | `task.turn.require_reply` + profile `PlanRead`; one nudge, then fail |
 | 11 | reply tools, marker, last-reply probe | profile reply contract + task `last_reply` + `task.evaluate` |
 | 12 | pause file, cost cap, max turns | engine pause + task limits |
 | 13 | audit, `/healthz`, logs | event log + run journal + task store + health |
