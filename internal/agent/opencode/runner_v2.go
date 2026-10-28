@@ -93,15 +93,17 @@ func (r *Runner) runV2(ctx context.Context, task Task) (Result, error) {
 
 	handled := map[string]bool{}
 	for {
-		if err := r.answerPending(ctx, task.Directory, sessionID, &result, handled); err != nil {
-			return result, err
-		}
-
 		messages, err := r.client.Messages(ctx, task.Directory, sessionID)
 		if err != nil {
 			return result, err
 		}
 		turn := messagesFrom(messages, baseline)
+		// Record completed tools before answering permissions: a plan turn's reply
+		// request must see the discussion read that preceded it in the same turn.
+		r.arbiter.ObserveTools(v2TurnTools(turn))
+		if err := r.answerPending(ctx, task.Directory, sessionID, &result, handled); err != nil {
+			return result, err
+		}
 		idle := firstIdle(turn)
 		status, err := r.client.SessionStatuses(ctx, task.Directory, sessionID)
 		if err != nil {

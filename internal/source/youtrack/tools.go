@@ -14,7 +14,9 @@ var AllowedMCPTools = []string{
 	"youtrack_get_issue_fields_schema",
 	"youtrack_find_projects",
 	"youtrack_get_current_user",
-	"youtrack_add_issue_comment",
+	// The reply tool is deliberately absent: the session ruleset asks for it so
+	// the arbiter can allow it, or refuse it in a plan turn until the discussion
+	// read has completed. ReplyTools still names it for the executor.
 }
 
 // ReplyTools are the tool calls that mean "this turn replied". A completed call to

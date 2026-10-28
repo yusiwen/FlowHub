@@ -508,3 +508,74 @@ func TestRuntimeSendsTheV2Ruleset(t *testing.T) {
 		t.Fatalf("ruleset = %+v, want the catch-all first", fake.created.Permissions)
 	}
 }
+
+// readDiscussion appends the completed read a plan turn is expected to make,
+// before the reply permission is answered. The message shape is the v2 one: the
+// client's projection turns content[].state into the ToolCall the arbiter sees.
+func (f *fakeV2) readDiscussion() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.messages = append(f.messages, map[string]any{
+		"id": "msg_read", "type": "assistant", "agent": "devops", "finish": "tool-calls",
+		"model": map[string]any{"id": "deepseek-flash", "providerID": "deepseek"},
+		"time":  map[string]any{"created": 11, "completed": 12},
+		"content": []map[string]any{
+			{
+				"type": "tool", "name": "youtrack.get_issue_comments",
+				"state": map[string]any{"status": "completed"},
+			},
+		},
+	})
+}
+
+// TestV2ReplyPermissionWaitsForTheDiscussionRead is the runner half of Phase 2:
+// the reply permission is answered from the tools observed before it. Without a
+// read the reply is refused and the model can retry after reading; with the read
+// the reply is allowed.
+func TestV2ReplyPermissionWaitsForTheDiscussionRead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		read bool
+		want Reply
+	}{
+		{"no read", false, ReplyReject},
+		{"read first", true, ReplyOnce},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeV2(t)
+			fake.pending = []permissionV2{{
+				ID: "per_1", SessionID: "ses_v2", Action: "youtrack.add_issue_comment",
+			}}
+			if tc.read {
+				fake.afterPrompt = func(f *fakeV2) { f.readDiscussion() }
+			}
+			fake.afterReply = func(f *fakeV2) { f.finish("plan posted") }
+			server := fake.start()
+			defer server.Close()
+
+			runner := testRunnerV2(t, server.URL)
+			runner.arbiter.ReplyTools = normalizedToolSet([]string{"youtrack_add_issue_comment"})
+			runner.arbiter.RequireReadBeforeReply = []string{"youtrack_get_issue_comments"}
+			result, err := runner.Run(context.Background(), Task{
+				Directory: "/work",
+				Prompt:    "plan the change",
+				Agent:     "devops",
+				Model:     "deepseek/deepseek-flash",
+				RulesetV2: sessionRulesetV2(nil),
+				Deadline:  5 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if len(result.Permissions) != 1 {
+				t.Fatalf("permissions = %+v, want the reply decision", result.Permissions)
+			}
+			if got := result.Permissions[0].Reply; got != tc.want {
+				t.Fatalf("reply decision = %q, want %q (reason %q)", got, tc.want, result.Permissions[0].Reason)
+			}
+			if len(fake.replies) != 1 || fake.replies[0].Decision != string(tc.want) {
+				t.Fatalf("server saw %+v, want %q", fake.replies, tc.want)
+			}
+		})
+	}
+}

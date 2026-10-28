@@ -85,6 +85,19 @@ func (a *Arbiter) Decide(req PermissionRequest) Decision {
 // available set includes web crawlers and cross-system writers.
 func (a *Arbiter) decideTool(req PermissionRequest) Decision {
 	name := req.Permission
+	if a.replyTool(name) {
+		// The reply is the deliverable, not a side effect: allow it once the plan
+		// turn has read the discussion. A read from an earlier turn is not enough;
+		// the plan must be based on the live thread.
+		if len(a.RequireReadBeforeReply) > 0 && !a.readCompleted() {
+			return Decision{
+				Reply: ReplyReject,
+				Reason: fmt.Sprintf("read the issue discussion first: call %s, then post the comment; the plan must be based on the live thread",
+					strings.Join(a.RequireReadBeforeReply, " / ")),
+			}
+		}
+		return a.allow("the reply tool is this turn's deliverable")
+	}
 	switch name {
 	case "edit":
 		if a.Phase == PhaseExecution {
