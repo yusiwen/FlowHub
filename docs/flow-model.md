@@ -512,10 +512,13 @@ stale draft cannot become the next start's execution input.
 - `require_reply` uses the profile's reply tools and marker. One nudge, in the same
   session, with a bounded deadline; a second silent finish fails the task.
 - A plan turn enforces the profile's `PlanRead`: a completed read must precede a
-  completed reply. One bounded follow-up (`NudgeRead`) asks for the read and a
-  correction; a plan still posted without it is failed with `plan_state=none`, never
-  a draft. The read tools are the profile's, so a tracker with no discussion is
-  unaffected.
+  completed reply. The reply tool is not on the profile's `Allowed` allowlist; the
+  session ruleset asks for it, and the arbiter refuses it until this turn has a
+  completed read, then allows it. One bounded follow-up (`NudgeRead`) remains the
+  backstop; a plan still posted without the read is failed with `plan_state=none`,
+  never a draft. The read tools are the profile's, so a tracker with no discussion
+  is unaffected. A session created before the ruleset change still allows the reply;
+  the post-turn gate covers it.
 - Cost and turns accumulate on the task; `max_cost` and `max_turns` are enforced
   before the next turn, not after the budget is already spent.
 

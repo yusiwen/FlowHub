@@ -323,6 +323,11 @@ documents. The rules below are load-bearing; do not relax them casually.
    The default is empty, a name must be a bare command name (checked where it is trusted,
    and a bad one refuses the start), and every trusted list is logged, because trusting a
    prefix widens what the arbiter runs and must never be silent (ADR 0006).
+   **The source's reply tool is deliberately absent from the session allowlist.** It is
+   gated so the arbiter can refuse a plan reply until the turn has read the discussion
+   (`ReplyTools` + `RequireReadBeforeReply`, ADR 0017). The runner records completed tools
+   **before** answering pending permissions, or the read that just happened would look
+   like a missing one and the reply would be refused.
 9. **One task, one worktree, one session.** `internal/registry` is the
    append-only record of that binding (`<DataDir>/registry.jsonl`), indexed by
    `(source, key)`: a task is identified by the adapter that produced it *and* its
@@ -457,6 +462,10 @@ documents. The rules below are load-bearing; do not relax them casually.
     became a draft the next `/opencode start` would have executed), so the gate lives
     in the turn contract. A failed plan turn clears the plan state: a draft from an
     earlier turn is not what the failed turn was asked to produce.
+    Since ADR 0017 the reply tool itself is gated too: the session asks for it and the
+    arbiter refuses a plan reply until the same turn has a completed read. The post-turn
+    gate stays as the backstop for sessions created before that ruleset change (a task is
+    bound to its session for life, so an old session keeps its old allowlist).
 17. **A human's authorisation moves the allowlist and nothing else.** `/opencode permit`
     is answered by `internal/rules` and acted on by the dispatcher: the authorised set is
     the literal commands the task's **most recent** turn was refused for — recorded from
