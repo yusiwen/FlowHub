@@ -51,6 +51,10 @@ type fakeOpencode struct {
 	// a test can produce a silent first turn followed by a follow-up that answers. Zero
 	// means every prompt posts, which is the ordinary case.
 	commentFromPrompt int
+	// readFromPrompt makes the fake report a completed get_issue_comments only from
+	// the Nth prompt on, so a test can model a plan turn that skipped the discussion
+	// and a follow-up that read it. Zero means every prompt reads.
+	readFromPrompt int
 	// ruleset records what the session was created with.
 	ruleset []agentruntime.PermissionRule
 	// sessionBody and promptBody keep the whole request so an entry's agent and
@@ -160,6 +164,12 @@ func (f *fakeOpencode) start() *httptest.Server {
 			parts = append(parts, agentruntime.Part{
 				Type: "tool", Tool: "bash",
 				State: &agentruntime.ToolState{Status: "completed", Output: "ok"},
+			})
+		}
+		if f.readFromPrompt == 0 || len(f.prompts) >= f.readFromPrompt {
+			parts = append(parts, agentruntime.Part{
+				Type: "tool", Tool: "youtrack_get_issue_comments",
+				State: &agentruntime.ToolState{Status: "completed"},
 			})
 		}
 		if f.postComment && (f.commentFromPrompt == 0 || len(f.prompts) >= f.commentFromPrompt) {
@@ -1575,6 +1585,69 @@ func TestDispatchPublishesItsDecisionForTheEventID(t *testing.T) {
 	dispatcher.handle(context.Background(), rec)
 	if observed.EventID != "evt_test_91" || observed.Action != string(rules.ActionAnalyze) || !observed.Routable {
 		t.Fatalf("observed = %+v", observed)
+	}
+}
+
+// TestAPlanTurnThatSkippedTheDiscussionIsNudgedAndCorrected: a plan written from
+// the session's memory may ask questions the thread already answered. The turn is
+// asked once, in the same session, to read the discussion and correct the plan; only
+// that corrected reply may become a draft.
+func TestAPlanTurnThatSkippedTheDiscussionIsNudgedAndCorrected(t *testing.T) {
+	fake := newFakeOpencode(t)
+	// The analysis reads; the plan skips the discussion; the follow-up reads.
+	fake.readFromPrompt = 3
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-72", "issueCreated", issueCreatedBody("TEST-72")))
+	dispatcher.handle(context.Background(), delivery("TEST-72", "commentAdded", commentBody("TEST-72", "/opencode start")))
+
+	prompts := fake.promptsSeen()
+	if len(prompts) != 3 {
+		t.Fatalf("prompts = %d, want 3 (analysis, plan, read follow-up)", len(prompts))
+	}
+	if !strings.Contains(prompts[2], "without reading the live issue discussion") {
+		t.Fatalf("the follow-up does not name the missing read:\n%s", prompts[2])
+	}
+	if !strings.Contains(prompts[2], "youtrack_get_issue_comments") {
+		t.Fatalf("the follow-up does not name the discussion tool:\n%s", prompts[2])
+	}
+	task, ok := reg.Get(youtrack.SourceName, "TEST-72")
+	if !ok {
+		t.Fatal("task not recorded")
+	}
+	if task.State != registry.StateAwaitingInput || task.Plan != registry.PlanDraft {
+		t.Fatalf("state/plan = %q/%q, want awaiting_input/draft after the corrected plan", task.State, task.Plan)
+	}
+}
+
+// TestAPlanThatNeverReadsTheDiscussionIsNotAPlan: a plan posted without the read is
+// failed and clears the plan, so the next `/opencode start` plans again instead of
+// executing a plan written against stale discussion.
+func TestAPlanThatNeverReadsTheDiscussionIsNotAPlan(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.readFromPrompt = 99
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-73", "issueCreated", issueCreatedBody("TEST-73")))
+	dispatcher.handle(context.Background(), delivery("TEST-73", "commentAdded", commentBody("TEST-73", "/opencode start")))
+
+	task, _ := reg.Get(youtrack.SourceName, "TEST-73")
+	if task.State != registry.StateFailed || task.Plan != registry.PlanNone {
+		t.Fatalf("state/plan = %q/%q, want failed/none: an unread plan is not a plan", task.State, task.Plan)
+	}
+	if !strings.Contains(task.LastError, "without reading the issue discussion") {
+		t.Fatalf("last_error = %q, want the missing read named", task.LastError)
+	}
+
+	// The next trigger must plan again, not execute the unread plan.
+	dispatcher.handle(context.Background(), delivery("TEST-73", "commentAdded", commentBody("TEST-73", "/opencode start")))
+	task, _ = reg.Get(youtrack.SourceName, "TEST-73")
+	if task.LastAction != string(rules.ActionPlan) {
+		t.Fatalf("last_action = %q, want plan: the unread plan must not be executed", task.LastAction)
 	}
 }
 

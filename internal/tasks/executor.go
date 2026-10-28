@@ -135,12 +135,12 @@ func (e *Executor) Turn(ctx context.Context, request TurnRequest) (TurnResult, e
 		Trigger: trigger,
 		Reason:  request.Basis,
 	}
-	result := e.runTurn(ctx, request.Record, request.Delivery, request.Task,
+	result, err := e.runTurn(ctx, request.Record, request.Delivery, request.Task,
 		projectmap.Match{Entry: request.Entry}, decision, request.Host)
 	if updated, ok := e.opts.Registry.Get(e.opts.Source.Name(), request.Record.IssueID); ok {
 		result.Task = updated
 	}
-	return result, nil
+	return result, err
 }
 
 func (e *Executor) Grant(_ context.Context, request GrantRequest) (GrantResult, error) {
@@ -297,7 +297,7 @@ func (e *Executor) ensureTask(ctx context.Context, rec *store.Record, entry *pro
 // agent, which drops the step budget and the permission block the installed
 // profile carries — a silent widening of what an unattended turn may do.
 
-func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery event.Event, task registry.Task, match projectmap.Match, decision rules.Decision, host Host) TurnResult {
+func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery event.Event, task registry.Task, match projectmap.Match, decision rules.Decision, host Host) (TurnResult, error) {
 	lease := e.taskLock(e.opts.Source.Name(), rec.IssueID)
 	lease.Lock()
 	defer lease.Unlock()
@@ -353,7 +353,7 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 	prompt := e.opts.Source.Prompt(decision.Action, &delivery, promptCtx)
 	if prompt == "" {
 		e.log.Error("no prompt was built for the action", "action", decision.Action, "issue", rec.IssueID)
-		return TurnResult{Action: decision.Action}
+		return TurnResult{Action: decision.Action}, nil
 	}
 
 	// The routing entry owns the agent when it names one: which agent runs is a
@@ -421,29 +421,68 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 	// only job is the comment. One ask, not a retry loop: a model that cannot comply
 	// twice is failing, and the state below says so.
 	replied := anyToolCompleted(result.Tools, tools.Reply)
-	if silentFinish(result, err, replied) {
-		e.log.Warn("the turn finished without posting a comment; asking once more",
-			"issue", rec.IssueID, "session", result.SessionID,
-			"reply_tools", strings.Join(tools.Reply, "/"))
-		promptCtx.Nudge = true
+	// A plan is allowed to be wrong, but it is not allowed to be uninformed. A plan
+	// turn that posted its reply without reading the discussion is the failure this
+	// gate exists for: the model reuses its session's earlier analysis and asks the
+	// maintainer questions the thread already answered. The prompt asks for the read;
+	// this check is what makes it a contract.
+	planRead := planReadSatisfied(result.Tools, tools.PlanRead, tools.Reply)
+	readSeen := anyToolCompleted(result.Tools, tools.PlanRead)
+	needReadNudge := decision.Action == rules.ActionPlan && len(tools.PlanRead) > 0 &&
+		!planRead && (replied || !readSeen)
+	silent := silentFinish(result, err, replied)
+	clean := err == nil && result.Finished && !result.TimedOut && result.SessionID != ""
+	if silent || (clean && needReadNudge) {
+		if silent {
+			e.log.Warn("the turn finished without posting a comment; asking once more",
+				"issue", rec.IssueID, "session", result.SessionID,
+				"reply_tools", strings.Join(tools.Reply, "/"))
+			promptCtx.Nudge = true
+		}
+		if needReadNudge {
+			e.log.Warn("the plan turn finished without reading the issue discussion; asking once more",
+				"issue", rec.IssueID, "session", result.SessionID,
+				"read_tools", strings.Join(tools.PlanRead, "/"))
+			promptCtx.NudgeRead = true
+		}
 		if nudgePrompt := e.opts.Source.Prompt(decision.Action, &delivery, promptCtx); nudgePrompt != "" {
 			nudge := turn
 			nudge.Prompt = nudgePrompt
 			nudge.SessionID = result.SessionID
-			// The follow-up may only post a comment, and one delivery must not be able
-			// to hold a worker for two full turn budgets.
+			// The follow-up may only read and post one comment, and one delivery must
+			// not be able to hold a worker for two full turn budgets.
 			nudge.Deadline = nudgeDeadline(deadline)
 			nudged, nudgeErr := runnerHost.Run(ctx, nudge)
 			e.log.Info("follow-up turn finished",
 				"issue", rec.IssueID, "session", nudged.SessionID,
 				"finished", nudged.Finished, "timed_out", nudged.TimedOut,
 				"replied", anyToolCompleted(nudged.Tools, tools.Reply),
+				"read", anyToolCompleted(nudged.Tools, tools.PlanRead),
 				"cost", nudged.Cost, "tokens", nudged.Tokens.Total,
 				"elapsed", nudged.Elapsed.Round(time.Millisecond))
 			result = mergeTurns(result, nudged, nudgeErr)
 			err = nudgeErr
 			replied = anyToolCompleted(result.Tools, tools.Reply)
+			planRead = planReadSatisfied(result.Tools, tools.PlanRead, tools.Reply)
 		}
+	}
+
+	// The read gate is deliberately independent of the runner's error: a plan that
+	// was posted without the discussion must not become a draft merely because the
+	// follow-up failed afterwards. The task stays without a plan, and the flow run
+	// fails, so the next `/opencode start` plans again instead of executing it.
+	var planErr error
+	if decision.Action == rules.ActionPlan && len(tools.PlanRead) > 0 && replied && !planRead {
+		planErr = fmt.Errorf("plan turn posted without reading the issue discussion (%s); the task has no plan until a turn reads it", strings.Join(tools.PlanRead, "/"))
+		if err != nil {
+			planErr = fmt.Errorf("%w; follow-up: %v", planErr, err)
+		}
+		// This is a task-contract failure, not a host failure: the runtime answered.
+		// It must not flip the runtime's health, which is what stops new work from
+		// being scheduled there.
+		e.log.Error("plan turn posted without reading the issue discussion",
+			"issue", rec.IssueID, "session", result.SessionID,
+			"read_tools", strings.Join(tools.PlanRead, "/"))
 	}
 
 	// Record the turn even when it failed: the audit is the only place the
@@ -494,12 +533,29 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 	case decision.Action == rules.ActionExecute:
 		state = registry.StateDone
 	}
+	if planErr != nil {
+		// A plan turn that broke its read contract has produced nothing a human can
+		// execute, regardless of what the runner's own state says (a timeout included).
+		state = registry.StateFailed
+	}
 	plan := task.Plan
 	if replied && decision.Action == rules.ActionPlan {
-		// Only a planning turn creates a plan. An analysis turn must leave the plan
-		// empty: marking it draft made the next `/opencode start` jump straight to
-		// edit rights without a plan (found by the live journey E2E).
-		plan = registry.PlanDraft
+		// Only a planning turn creates a plan, and only one that read the discussion
+		// first. An analysis turn must leave the plan empty: marking it draft made the
+		// next `/opencode start` jump straight to edit rights without a plan (found by
+		// the live journey E2E). A plan posted without the read is not a plan either:
+		// clearing it is what stops the next start from executing it.
+		if planRead {
+			plan = registry.PlanDraft
+		} else {
+			plan = registry.PlanNone
+		}
+	}
+	if decision.Action == rules.ActionPlan && state == registry.StateFailed {
+		// A failed plan turn has nothing a human can execute. Clearing a draft from an
+		// earlier turn is the difference between "plan again" and "execute the plan
+		// this failed turn was meant to replace".
+		plan = registry.PlanNone
 	}
 
 	outcome := TurnResult{
@@ -527,7 +583,11 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 		// "failed at what?" sends the operator to a rotating log, and /healthz only keeps
 		// each host's most recent error.
 		if state == registry.StateFailed {
-			t.LastError = failureText(err, result)
+			recordErr := err
+			if planErr != nil {
+				recordErr = planErr
+			}
+			t.LastError = failureText(recordErr, result)
 		} else {
 			t.LastError = ""
 		}
@@ -552,7 +612,7 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 	}); err != nil {
 		e.log.Error("cannot record the turn in the registry", "issue", rec.IssueID, "error", err)
 	}
-	return outcome
+	return outcome, planErr
 }
 
 // sameTool compares a source's tool name with the name the server reported. On
@@ -569,15 +629,53 @@ func sameTool(got, want string) bool {
 	return norm(got) == norm(want)
 }
 
-func anyToolCompleted(calls []agent.ToolCall, replyTools []string) bool {
+func anyToolCompleted(calls []agent.ToolCall, tools []string) bool {
+	for _, call := range calls {
+		if call.Status == "completed" && matchesAnyTool(call.Name, tools) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesAnyTool reports whether got is one of wants, using the same spelling
+// normalisation as the reply check.
+func matchesAnyTool(got string, wants []string) bool {
+	for _, want := range wants {
+		if sameTool(got, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// planReadSatisfied reports whether this turn may be recorded as a plan. A turn
+// with no declared read requirement is satisfied; otherwise a completed read must
+// have arrived *before* a completed reply. Reading after posting the plan is too
+// late: the plan a human reads was written without it.
+func planReadSatisfied(calls []agent.ToolCall, readTools, replyTools []string) bool {
+	if len(readTools) == 0 {
+		return true
+	}
+	return readBeforeReply(calls, readTools, replyTools)
+}
+
+// readBeforeReply reports whether any completed reply follows a completed read.
+// Tool order is the order the runtime reported the calls in; mergeTurns keeps the
+// first turn's calls before the follow-up's, which is exactly the order that makes
+// a corrected plan count and the original unread one not.
+func readBeforeReply(calls []agent.ToolCall, readTools, replyTools []string) bool {
+	read := false
 	for _, call := range calls {
 		if call.Status != "completed" {
 			continue
 		}
-		for _, reply := range replyTools {
-			if sameTool(call.Name, reply) {
-				return true
-			}
+		if matchesAnyTool(call.Name, readTools) {
+			read = true
+			continue
+		}
+		if read && matchesAnyTool(call.Name, replyTools) {
+			return true
 		}
 	}
 	return false
