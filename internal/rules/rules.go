@@ -92,6 +92,11 @@ type PromptContext struct {
 	// outside: the maintainer sees no comment, and the task would otherwise be
 	// recorded as if a reply had been posted.
 	Nudge bool
+	// NudgeRead marks a bounded follow-up sent because a plan turn posted its
+	// reply without reading the issue discussion. The dispatcher decides when the
+	// read is missing; the source names its discussion tool and says what to do,
+	// because that tool belongs to the tracker.
+	NudgeRead bool
 }
 
 // TaskView is what the registry already knows about the issue.

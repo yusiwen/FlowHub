@@ -275,3 +275,83 @@ func TestThePromptStatesTheAuthorisedCommands(t *testing.T) {
 		t.Fatal("a turn with no authorisation claims one")
 	}
 }
+
+// TestThePlanPromptRequiresTheDiscussion pins the instruction the executor now
+// enforces: a plan written from the session's memory can ask the maintainer a
+// question the thread already answered, so the plan turn must read the newest human
+// comments first and say which one it read.
+func TestThePlanPromptRequiresTheDiscussion(t *testing.T) {
+	src := New(rules.Policy{}, "")
+	delivery := made(event.KindUpdated, "TEST-12", withSubject("TEST", "准入首页", "分页返回黑名单机构信息"))
+	ctx := rules.PromptContext{
+		Worktree: "/wt/TEST-12", Repository: "mine/test", Author: "yusiwen",
+		Basis: `the state change of State to "In Progress"`,
+	}
+	prompt := src.Prompt(rules.ActionPlan, &delivery, ctx)
+	for _, want := range []string{
+		"youtrack_get_issue_comments",
+		"newest human comments",
+		"treat it as stale",
+		"do not ask it again",
+		"Name the newest human comment you read",
+		"re-read",
+		"分页返回黑名单机构信息",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("the plan prompt is missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "If a plan already exists in this session, refine it instead of") {
+		t.Error("the plan prompt still invites refining the session's plan without re-reading the discussion")
+	}
+}
+
+// TestTheReadFollowUpNamesTheDiscussionAndAsksForACorrection is the prompt sent
+// when a plan turn replied without reading. It has to name the failure and the tool,
+// and it must not read as an invitation to start implementing.
+func TestTheReadFollowUpNamesTheDiscussionAndAsksForACorrection(t *testing.T) {
+	src := New(rules.Policy{}, "")
+	delivery := made(event.KindUpdated, "TEST-12", withSubject("TEST", "准入首页", "分页返回黑名单机构信息"))
+	ctx := rules.PromptContext{
+		Worktree: "/wt/TEST-12", Repository: "mine/test", Author: "yusiwen",
+		Basis:     `the state change of State to "In Progress"`,
+		NudgeRead: true,
+	}
+	prompt := src.Prompt(rules.ActionPlan, &delivery, ctx)
+	for _, want := range []string{
+		"posted its reply without reading the live issue discussion",
+		"youtrack_get_issue_comments",
+		"a correction if the discussion answers or changes the plan you posted",
+		"one-line confirmation",
+		"Do not start implementing",
+		rules.SelfMarker,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("the read follow-up is missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, unwanted := range []string{"## This turn\nThis turn is READ-ONLY", "Implement the plan in the working directory"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Errorf("the read follow-up still carries the ordinary phase instruction %q", unwanted)
+		}
+	}
+}
+
+// TestTheReadFollowUpAlsoCoversASilentPlanTurn: when the turn posted nothing at
+// all and never read, the one follow-up has to ask for both, and it must ask for the
+// plan rather than a correction of a comment that does not exist.
+func TestTheReadFollowUpAlsoCoversASilentPlanTurn(t *testing.T) {
+	src := New(rules.Policy{}, "")
+	delivery := made(event.KindUpdated, "TEST-12", withSubject("TEST", "准入首页", ""))
+	ctx := rules.PromptContext{Nudge: true, NudgeRead: true, Basis: `the state change of State to "In Progress"`}
+	prompt := src.Prompt(rules.ActionPlan, &delivery, ctx)
+	for _, want := range []string{
+		"ended without posting the comment this workflow requires and without reading the issue discussion",
+		"youtrack_get_issue_comments",
+		"the plan you owe, written from what the discussion says",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("the combined follow-up is missing %q:\n%s", want, prompt)
+		}
+	}
+}

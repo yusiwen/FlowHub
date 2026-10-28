@@ -28,15 +28,21 @@ type Request struct {
 	Body      []byte
 }
 
-// ToolPolicy is data, not behaviour: the dispatcher performs the checks, so a
+// ToolPolicy is data, not behaviour: the task service performs the checks, so a
 // source cannot smuggle logic into them.
 type ToolPolicy struct {
 	// Allowed lists the tools the agent may call without asking. Everything else
 	// stays gated: the session ruleset asks and the arbiter decides.
 	Allowed []string
 	// Reply lists the tool calls that mean "this turn replied". A completed call to
-	// any of them is what the dispatcher reports as the turn's answer.
+	// any of them is what the task service reports as the turn's answer.
 	Reply []string
+	// PlanRead lists the tool calls that mean "this turn read the issue's
+	// discussion". A plan turn that replies without one has planned against its
+	// session's memory rather than the live issue: it is asked once to read and
+	// correct, and is never recorded as a plan. Empty means the source has no
+	// discussion to read.
+	PlanRead []string
 	// Download constrains attachment downloads: which hosts may be reached, and
 	// where inside the worktree the file may be written.
 	Download DownloadPolicy
