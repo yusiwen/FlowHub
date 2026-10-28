@@ -46,9 +46,14 @@ type Turn struct {
 	// AllowedTools is the source's allowlist, data only. The runtime builds its own
 	// session ruleset from it.
 	AllowedTools []string
-	Downloads    agent.Downloads
-	Granted      []string
-	Metadata     map[string]any
+	// ReplyTools and RequireReadBeforeReply are the runtime-facing half of the
+	// reply gate: the source's reply tools, and the read tools a plan turn must
+	// complete first. The executor fills them; a runtime enforces them.
+	ReplyTools             []string
+	RequireReadBeforeReply []string
+	Downloads              agent.Downloads
+	Granted                []string
+	Metadata               map[string]any
 	// Deadline overrides the host's when non-zero.
 	Deadline time.Duration
 }
@@ -73,17 +78,19 @@ func (h Host) Run(ctx context.Context, turn Turn) (agent.Result, error) {
 		deadline = h.Deadline
 	}
 	return h.Runtime.Run(ctx, agent.Turn{
-		Directory:    turn.Directory,
-		Prompt:       turn.Prompt,
-		Agent:        agentName,
-		Model:        model,
-		Title:        turn.Title,
-		SessionID:    turn.SessionID,
-		Phase:        turn.Phase,
-		AllowedTools: turn.AllowedTools,
-		Downloads:    turn.Downloads,
-		Granted:      turn.Granted,
-		Metadata:     turn.Metadata,
-		Deadline:     deadline,
+		Directory:              turn.Directory,
+		Prompt:                 turn.Prompt,
+		Agent:                  agentName,
+		Model:                  model,
+		Title:                  turn.Title,
+		SessionID:              turn.SessionID,
+		Phase:                  turn.Phase,
+		AllowedTools:           turn.AllowedTools,
+		ReplyTools:             turn.ReplyTools,
+		RequireReadBeforeReply: turn.RequireReadBeforeReply,
+		Downloads:              turn.Downloads,
+		Granted:                turn.Granted,
+		Metadata:               turn.Metadata,
+		Deadline:               deadline,
 	})
 }

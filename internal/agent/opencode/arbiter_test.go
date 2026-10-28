@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/yusiwen/flowhub/internal/agent"
@@ -278,5 +279,39 @@ func TestFindExecIsRefused(t *testing.T) {
 		if decision.Allowed() {
 			t.Errorf("Decide(%q) allowed, want find -exec refused", command)
 		}
+	}
+}
+
+// TestAPlanReplyNeedsTheDiscussionReadFirst is Phase 2 of the read-before-plan
+// gate. The reply tool is gated by the session ruleset, so this arbiter is the
+// place that can refuse it *before* a plan reaches the issue. A read that failed,
+// or one from an earlier turn, does not count.
+func TestAPlanReplyNeedsTheDiscussionReadFirst(t *testing.T) {
+	arbiter := DefaultArbiter()
+	arbiter.ReplyTools = normalizedToolSet([]string{"youtrack_add_issue_comment"})
+	arbiter.RequireReadBeforeReply = []string{"youtrack_get_issue_comments"}
+
+	reply := PermissionRequest{Permission: "youtrack.add_issue_comment"}
+	if decision := arbiter.Decide(reply); decision.Allowed() {
+		t.Fatal("a plan reply was allowed before reading the discussion")
+	} else if !strings.Contains(decision.Reason, "youtrack_get_issue_comments") {
+		t.Fatalf("the refusal does not name the read tool: %q", decision.Reason)
+	}
+
+	arbiter.ObserveTools([]ToolCall{{Name: "youtrack.get_issue_comments", Status: "error"}})
+	if decision := arbiter.Decide(reply); decision.Allowed() {
+		t.Fatal("a failed read was accepted as a read")
+	}
+
+	arbiter.ObserveTools([]ToolCall{{Name: "youtrack.get_issue_comments", Status: "completed"}})
+	if decision := arbiter.Decide(reply); !decision.Allowed() {
+		t.Fatalf("a completed read did not unlock the reply: %s", decision.Reason)
+	}
+
+	// A turn with no read requirement (analysis/execute) still allows its reply.
+	plain := DefaultArbiter()
+	plain.ReplyTools = normalizedToolSet([]string{"youtrack_add_issue_comment"})
+	if decision := plain.Decide(reply); !decision.Allowed() {
+		t.Fatalf("a reply without a read requirement was refused: %s", decision.Reason)
 	}
 }

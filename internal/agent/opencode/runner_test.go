@@ -38,6 +38,9 @@ type fakeServer struct {
 	// pending list, which is what a request the server resolved on its own looks like
 	// when its bookkeeping has not caught up.
 	goneOnReply bool
+	// readBeforeReply adds a completed get_issue_comments tool call to the turn's
+	// assistant message stream, before the reply permission is answered.
+	readBeforeReply bool
 
 	sawDirectory []string
 	sawAuth      []string
@@ -97,6 +100,18 @@ func (f *fakeServer) start() *httptest.Server {
 			Info:  MessageInfo{ID: "msg_user", Role: "user", Time: MessageTime{Created: 1}},
 			Parts: []Part{{Type: "text", Text: body.Parts[0].Text}},
 		})
+		if f.readBeforeReply {
+			f.messages = append(f.messages, Message{
+				Info: MessageInfo{
+					ID: "msg_read", Role: "assistant", Finish: "tool-calls",
+					Time: MessageTime{Created: 2, Completed: 3},
+				},
+				Parts: []Part{{
+					Type: "tool", Tool: "youtrack.get_issue_comments",
+					State: &ToolState{Status: "completed"},
+				}},
+			})
+		}
 		f.busy = !f.silentPrompt
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -527,5 +542,58 @@ func TestRunnerSurvivesAPermissionThatVanishedBeforeTheReply(t *testing.T) {
 	}
 	if len(result.Permissions) != 0 {
 		t.Fatalf("permissions = %+v, want none: the reply never took effect", result.Permissions)
+	}
+}
+
+// TestV1ReplyPermissionWaitsForTheDiscussionRead is the v1 half of Phase 2: the
+// reply permission is answered from the tools observed before it, so a plan cannot
+// post before reading, and a completed read unlocks the reply.
+func TestV1ReplyPermissionWaitsForTheDiscussionRead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		read bool
+		want Reply
+	}{
+		{"no read", false, ReplyReject},
+		{"read first", true, ReplyOnce},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeServer(t)
+			fake.directory = "/private/tmp/work"
+			fake.readBeforeReply = tc.read
+			fake.addPending(PermissionRequest{
+				ID: "per_1", SessionID: fake.sessionID, Permission: "youtrack.add_issue_comment",
+			})
+			fake.afterReply = func(f *fakeServer) { f.finishWith("plan posted") }
+			server := fake.start()
+			defer server.Close()
+
+			runner := testRunner(t, server.URL)
+			runner.arbiter.ReplyTools = normalizedToolSet([]string{"youtrack_add_issue_comment"})
+			runner.arbiter.RequireReadBeforeReply = []string{"youtrack_get_issue_comments"}
+			result, err := runner.Run(context.Background(), Task{
+				Directory: "/private/tmp/work",
+				Prompt:    "plan the change",
+				Agent:     "devops",
+				Title:     "plan",
+				Ruleset:   []PermissionRule{{Permission: "youtrack_add_issue_comment", Pattern: "*", Action: "ask"}},
+				Deadline:  5 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if !result.Finished || result.TimedOut {
+				t.Fatalf("result = %+v, want a finished turn", result)
+			}
+			if len(result.Permissions) != 1 {
+				t.Fatalf("permissions = %+v, want the reply decision", result.Permissions)
+			}
+			if got := result.Permissions[0].Reply; got != tc.want {
+				t.Fatalf("reply decision = %q, want %q (reason %q)", got, tc.want, result.Permissions[0].Reason)
+			}
+			if got := fake.replies["per_1"]; got != tc.want {
+				t.Fatalf("server saw %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

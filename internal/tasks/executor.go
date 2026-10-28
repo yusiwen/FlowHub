@@ -398,6 +398,7 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 		SessionID:    task.SessionID,
 		Phase:        phase,
 		AllowedTools: tools.Allowed,
+		ReplyTools:   tools.Reply,
 		Downloads: agent.Downloads{
 			Hosts:  tools.Download.Hosts,
 			Prefix: tools.Download.Prefix,
@@ -408,6 +409,12 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 		Granted:  grantedCommands(task),
 		Metadata: map[string]any{"task_key": rec.IssueID, "action": string(decision.Action)},
 		Deadline: deadline,
+	}
+	if decision.Action == rules.ActionPlan {
+		// A plan must read the live discussion before it posts. Phase 1 enforces
+		// this after the turn; Phase 2 puts the same requirement in front of the
+		// reply tool, so the model cannot post the stale plan and then correct it.
+		turn.RequireReadBeforeReply = append([]string(nil), tools.PlanRead...)
 	}
 
 	result, err := runnerHost.Run(ctx, turn)

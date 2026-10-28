@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // Decision is the arbiter's verdict on one permission request.
@@ -78,6 +79,75 @@ type Arbiter struct {
 	// — never `git push`, never a path outside the worktree, never an edit in a
 	// read-only turn. Empty by default.
 	Granted []string
+	// ReplyTools are the tool calls that deliver the turn's answer. They are not
+	// in AllowTools: the session ruleset asks for them, and this arbiter allows
+	// them, so a plan turn can require the discussion read first.
+	ReplyTools map[string]bool
+	// RequireReadBeforeReply lists the tool calls that must have completed in this
+	// turn before a ReplyTools call is allowed. Empty disables the gate.
+	RequireReadBeforeReply []string
+
+	mu        sync.Mutex
+	completed map[string]bool
+}
+
+// normalizeTool maps the two spellings the server uses for one MCP tool
+// (`youtrack.add_issue_comment` and `youtrack_add_issue_comment`) onto one key.
+func normalizeTool(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.ReplaceAll(name, ".", "_")
+	name = strings.ReplaceAll(name, "-", "_")
+	return name
+}
+
+// normalizedToolSet builds the lookup the reply gate uses.
+func normalizedToolSet(names []string) map[string]bool {
+	if len(names) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		set[normalizeTool(name)] = true
+	}
+	return set
+}
+
+// ObserveTools records the completed tool calls visible in this turn. The runner
+// calls it before answering permissions, so a reply request that arrives after a
+// read sees the read. A failed read does not count.
+func (a *Arbiter) ObserveTools(calls []ToolCall) {
+	if a == nil || len(calls) == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.completed == nil {
+		a.completed = map[string]bool{}
+	}
+	for _, call := range calls {
+		if call.Status != "completed" {
+			continue
+		}
+		a.completed[normalizeTool(call.Name)] = true
+	}
+}
+
+// readCompleted reports whether one of the required read tools has completed in
+// this turn.
+func (a *Arbiter) readCompleted() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, name := range a.RequireReadBeforeReply {
+		if a.completed[normalizeTool(name)] {
+			return true
+		}
+	}
+	return false
+}
+
+// replyTool reports whether name is one of the source's reply tools.
+func (a *Arbiter) replyTool(name string) bool {
+	return a.ReplyTools[normalizeTool(name)]
 }
 
 // granted reports whether a human authorised this command for this turn.

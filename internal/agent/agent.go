@@ -77,6 +77,13 @@ type Turn struct {
 	// AllowedTools are the source's tool names that may run without asking. The
 	// runtime turns them into its own ruleset; everything absent stays gated.
 	AllowedTools []string
+	// ReplyTools are the tool calls that deliver the turn's answer. They are not
+	// in AllowedTools: the runtime gates them (the ruleset asks) and allows them
+	// in its own policy, so a plan turn can require a read first.
+	ReplyTools []string
+	// RequireReadBeforeReply lists the tool calls that must have completed in this
+	// turn before a ReplyTools call is allowed. Empty disables the gate.
+	RequireReadBeforeReply []string
 	// Downloads constrains attachment downloads for this turn.
 	Downloads Downloads
 	// Granted are whole command segments a human authorised for this turn by
