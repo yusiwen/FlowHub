@@ -448,6 +448,15 @@ documents. The rules below are load-bearing; do not relax them casually.
     An **analysis** turn leaves `plan_state` at `none`; only a **plan** turn records a
     draft. Marking analysis as a plan made the next `/opencode start` jump straight to
     edit rights without a plan (found by the live journey E2E).
+    A **plan** turn must also read the discussion before it replies. The source
+    declares the tool calls in `ToolPolicy.PlanRead`; the executor requires a
+    completed read before a completed reply, asks once (`rules.PromptContext.NudgeRead`)
+    when it is missing, and then fails the turn with `plan_state=none` — never a draft.
+    The prompt already asked for the read and a live model skipped it (2026-10-26,
+    BEAP_BE-73: the plan re-asked questions the maintainer had answered, and the row
+    became a draft the next `/opencode start` would have executed), so the gate lives
+    in the turn contract. A failed plan turn clears the plan state: a draft from an
+    earlier turn is not what the failed turn was asked to produce.
 17. **A human's authorisation moves the allowlist and nothing else.** `/opencode permit`
     is answered by `internal/rules` and acted on by the dispatcher: the authorised set is
     the literal commands the task's **most recent** turn was refused for — recorded from
