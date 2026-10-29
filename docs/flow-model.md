@@ -471,12 +471,18 @@ analyzing -> awaiting_input -> planning -> executing -> done
                                     \-> failed
 ```
 
-`plan_state` is `none | draft | confirmed`; the builtin evaluate uses `plan != none`
-to choose between a planning turn and an execution turn, exactly like
+`plan_state` is `none | questions | draft | confirmed`; the builtin evaluate uses
+`plan != none` to choose between a planning turn and an execution turn, exactly like
 `rules.startDecision`. `last_action` lets a permit continue the action the refusals
 stopped (`task.turn.action: last`). A `draft` is written only by a plan turn that
-read the issue discussion before it replied; a failed plan turn leaves `none`, so a
-stale draft cannot become the next start's execution input.
+read the live issue and declared no open questions; a plan that declares any
+question (or omits the marker) is `questions`, and `/opencode start` / the start
+state are ignored until `/opencode replan` produces a ready draft. A failed plan
+turn leaves `none`, so a stale draft cannot become the next start's execution
+input. A replan while `analyzing`, `planning` or `executing` is ignored: a queued
+revision would run after the turn it was meant to prevent. A replan while
+`awaiting_input`, `failed` or `done` runs a plan turn; a done task reopens to
+`planning`.
 
 ### 7.3 Lease
 
@@ -511,14 +517,27 @@ stale draft cannot become the next start's execution input.
   owns the shell policy. A flow cannot widen either.
 - `require_reply` uses the profile's reply tools and marker. One nudge, in the same
   session, with a bounded deadline; a second silent finish fails the task.
-- A plan turn enforces the profile's `PlanRead`: a completed read must precede a
-  completed reply. The reply tool is not on the profile's `Allowed` allowlist; the
-  session ruleset asks for it, and the arbiter refuses it until this turn has a
-  completed read, then allows it. One bounded follow-up (`NudgeRead`) remains the
-  backstop; a plan still posted without the read is failed with `plan_state=none`,
-  never a draft. The read tools are the profile's, so a tracker with no discussion
-  is unaffected. A session created before the ruleset change still allows the reply;
-  the post-turn gate covers it.
+- A plan turn enforces the profile's `PlanRead`: **all** the declared reads must
+  complete before a reply. For YouTrack that is `youtrack_get_issue` (description,
+  fields, attachment list) and `youtrack_get_issue_comments` (the discussion). The
+  reply tool is not on the profile's `Allowed` allowlist; the session ruleset asks
+  for it, and the arbiter refuses it until this turn has the reads, then allows it.
+  One bounded follow-up (`NudgeRead`) remains the backstop; a plan still posted
+  without the reads is failed with `plan_state=none`, never a draft. The read tools
+  are the profile's, so a tracker with no discussion is unaffected. A session
+  created before the ruleset change still allows the reply; the post-turn gate
+  covers it.
+- The plan comment carries exactly one marker: open when any question or
+  uncertainty remains, ready only when nothing is left to confirm. The executor
+  reads it from the completed reply tool input and records `questions` or `draft`;
+  missing or mixed markers are `questions`.
+- The execution turn carries the same reads as `RequireReadBeforeWork`. The arbiter
+  refuses an `edit` until they complete, so an approval given before the latest
+  replies cannot be implemented on a stale session snapshot.
+- `/opencode replan` is an explicit plan turn even with a draft; it is refused while
+  a turn is running, and its read gate is the same as the plan's. The author
+  allowlist (project `authors`, default empty) is applied before the decision, so it
+  covers the new phrase without another field.
 - Cost and turns accumulate on the task; `max_cost` and `max_turns` are enforced
   before the next turn, not after the budget is already spent.
 
@@ -630,7 +649,8 @@ test for M0 and the checklist for M1-4's parity harness.
 | 7 | phase, agent, model and deadline precedence | `task.turn` config + profile + runtime declaration |
 | 8 | permission arbiter and refusals | `task.turn` → `refusals`; the runtime still owns the arbiter |
 | 9 | `/opencode permit`, grant lifetime | `task.grant` / `task.revoke` |
-| 10 | nudge on a silent finish; a plan turn must read the discussion | `task.turn.require_reply` + profile `PlanRead`; one nudge, then fail |
+| 10 | nudge on a silent finish; a plan turn must read the live issue; a plan with open questions cannot start | `task.turn.require_reply` + profile `PlanRead`; marker; `plan_state`; one nudge, then fail |
+| 10a | a replan revises a plan; the execution turn reads before its first edit | `task.evaluate` + `ActionPlan`/`RequireReadBeforeWork` |
 | 11 | reply tools, marker, last-reply probe | profile reply contract + task `last_reply` + `task.evaluate` |
 | 12 | pause file, cost cap, max turns | engine pause + task limits |
 | 13 | audit, `/healthz`, logs | event log + run journal + task store + health |

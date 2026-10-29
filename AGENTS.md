@@ -328,6 +328,11 @@ documents. The rules below are load-bearing; do not relax them casually.
    (`ReplyTools` + `RequireReadBeforeReply`, ADR 0017). The runner records completed tools
    **before** answering pending permissions, or the read that just happened would look
    like a missing one and the reply would be refused.
+   Since ADR 0018 `PlanRead` names both `youtrack_get_issue` and
+   `youtrack_get_issue_comments`, and **all** of them must complete before the plan
+   reply. The execution turn carries the same list as `RequireReadBeforeWork`: the
+   arbiter refuses an `edit` until they complete, so approving a plan does not let the
+   agent edit on a session snapshot that predates the latest replies.
 9. **One task, one worktree, one session.** `internal/registry` is the
    append-only record of that binding (`<DataDir>/registry.jsonl`), indexed by
    `(source, key)`: a task is identified by the adapter that produced it *and* its
@@ -378,7 +383,10 @@ documents. The rules below are load-bearing; do not relax them casually.
     lost) — which is why only a turn that produced text replaces it — and an
     anchored trigger (`^\s*/opencode start\b`) so a reply that
     merely *mentions* the trigger cannot fire one. Do not loosen the anchoring,
-    and do not add a natural-language trigger. The reply must also end with a
+    and do not add a natural-language trigger.
+    The replan phrase `/opencode replan` is part of the same anchored family: it
+    only acts at the start of a comment, the marker and last-reply probe still
+    apply, and the plan comment that names it is ignored like every other reply. The reply must also end with a
     blockquote that says opencode generated it and **what triggered the turn**,
     because a reader has to be able to tell an automated reply from a human one
     and judge whether the turn answered the right question. That basis comes from
@@ -453,15 +461,31 @@ documents. The rules below are load-bearing; do not relax them casually.
     An **analysis** turn leaves `plan_state` at `none`; only a **plan** turn records a
     draft. Marking analysis as a plan made the next `/opencode start` jump straight to
     edit rights without a plan (found by the live journey E2E).
-    A **plan** turn must also read the discussion before it replies. The source
-    declares the tool calls in `ToolPolicy.PlanRead`; the executor requires a
-    completed read before a completed reply, asks once (`rules.PromptContext.NudgeRead`)
-    when it is missing, and then fails the turn with `plan_state=none` — never a draft.
+    A plan comment must carry exactly one marker: `<!-- flowhub-plan-open -->` when
+    any question, assumption or uncertainty remains, `<!-- flowhub-plan-ready -->`
+    only when nothing does. The executor reads it from the completed reply tool
+    input; missing or mixed markers are `plan_state=questions` (fail-closed), and
+    only ready becomes `draft`. `/opencode start` and the start state are ignored
+    while questions remain; `/opencode replan` (fixed, like permit/revoke) is a plan
+    turn even with a draft, reads the same live issue and discussion, and is the
+    only way to turn questions into a ready draft. A replan while `analyzing`,
+    `planning` or `executing` is ignored: a queued revision would run after the turn
+    it was meant to prevent; pause or wait instead. A replan while
+    `awaiting_input`, `failed` or `done` runs a plan (a done task reopens).
+    A **plan** turn must also read the live issue before it replies. The source
+    declares the tool calls in `ToolPolicy.PlanRead` (both `youtrack_get_issue` and
+    `youtrack_get_issue_comments`); the executor requires **all** of them before a
+    completed reply, asks once (`rules.PromptContext.NudgeRead`) when they are
+    missing, and then fails the turn with `plan_state=none` — never a draft.
     The prompt already asked for the read and a live model skipped it (2026-10-26,
     BEAP_BE-73: the plan re-asked questions the maintainer had answered, and the row
     became a draft the next `/opencode start` would have executed), so the gate lives
     in the turn contract. A failed plan turn clears the plan state: a draft from an
-    earlier turn is not what the failed turn was asked to produce.
+    earlier turn is not what the failed turn was asked to produce. A plan written
+    before the marker existed stays `draft` and remains startable; the rollout note
+    is one `/opencode replan` per such task. The execution turn carries the same
+    reads as `RequireReadBeforeWork`; the arbiter refuses an `edit` until they
+    complete, so the approved plan is not implemented on a stale thread.
     Since ADR 0017 the reply tool itself is gated too: the session asks for it and the
     arbiter refuses a plan reply until the same turn has a completed read. The post-turn
     gate stays as the backstop for sessions created before that ruleset change (a task is
@@ -482,7 +506,10 @@ documents. The rules below are load-bearing; do not relax them casually.
     the actor must pass the project's author allowlist: the agent posts as the human, so a
     model that writes the keyword itself must authorise nothing. Both phrases are answered
     **before** the turn budget, because revoking must never be blocked and a permit is a
-    human answering a refusal they have just read (ADR 0007).
+    human answering a refusal they have just read (ADR 0007). The same project/source
+    `authors` gate runs before the decision for every event, so it already covers
+    `/opencode start`, `/opencode replan` and the start-state change; the default is
+    empty (off), and enabling it is a project configuration change, not a new field.
 
 ## Code Conventions
 
