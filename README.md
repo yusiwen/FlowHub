@@ -805,11 +805,20 @@ What a maintainer sees, once `FLOWHUB_DISPATCH=1`:
 2. **Either** somebody comments `/opencode start`, **or** the issue moves to a
    state listed in `FLOWHUB_START_STATES`. If no plan has been produced yet, that
    turn produces the plan and the blocking questions instead of implementing.
-3. **With a plan in hand, the same trigger implements it**: the agent edits files
-   in its worktree, runs the narrowest test or build it can find, and commits
-   locally on branch `flowhub/<issue key>`. It never pushes and never touches the
-   shared checkout. The branch is what a human reviews.
-4. Every turn ends with exactly one YouTrack comment. The last element of that
+3. **If the plan still has questions, the same trigger does not implement it.**
+   The plan comment carries a machine marker: `<!-- flowhub-plan-open -->` when
+   anything remains to confirm, `<!-- flowhub-plan-ready -->` only when nothing
+   does. An open plan is recorded as `plan_state=questions`; `/opencode start` and
+   the start state are ignored until the answers are in the thread and
+   `/opencode replan` produces a ready revision. The replan is a plan turn even
+   when a draft exists; it reads the description and the whole discussion first.
+4. **With a ready plan in hand, the same trigger implements it**: the execution
+   turn reads the live issue and comments before its first edit (a preflight read,
+   not just a prompt), then the agent edits files in its worktree, runs the
+   narrowest test or build it can find, and commits locally on branch
+   `flowhub/<issue key>`. It never pushes and never touches the shared checkout.
+   The branch is what a human reviews.
+5. Every turn ends with exactly one YouTrack comment. The last element of that
    comment is a Markdown blockquote that says the reply was produced
    automatically by opencode and names what triggered the turn — measured
    rendering: `> 本评论由 opencode 自动生成，触发来源是本问题的创建。` — and its
@@ -817,7 +826,7 @@ What a maintainer sees, once `FLOWHUB_DISPATCH=1`:
    its own replies; the blockquote is how a *reader* can tell an automated reply
    from a human one, and the trigger it names comes from the decision rather than
    from the model's own account of why it replied.
-5. **If a command was refused, the maintainer answers with `/opencode permit`.** FlowHub
+6. **If a command was refused, the maintainer answers with `/opencode permit`.** FlowHub
    authorises exactly the commands the last turn was refused for — the ones the comment
    named — and continues the task in the same session, in the phase the refusals stopped.
    The authorisation is literal (`mvn -q verify` does not authorise `mvn -q verify
@@ -825,7 +834,7 @@ What a maintainer sees, once `FLOWHUB_DISPATCH=1`:
    touches the deny list: `git push`, `rm`, `curl` to another host and paths outside the
    worktree stay refused, and a read-only turn does not become writable. See
    [`docs/adr/0007`](./docs/adr/0007-human-permitted-commands.md).
-6. **If the agent cannot finish the work, it still posts that comment** — and it is
+7. **If the agent cannot finish the work, it still posts that comment** — and it is
    told so twice over: the agent definition says a refusal is a fact to report and
    that no turn may end in silence, and the dispatcher will not accept a silent
    finish (one bounded follow-up on the same session, then `failed`). This matters
@@ -842,17 +851,22 @@ the network. The event comes from the source adapter
 | Our own comment (marker, a distinctive repeat of our last reply, or `/opencode` in any other form) | ignore |
 | Task already at `FLOWHUB_MAX_TURNS` | ignore, and ask for a human |
 | `/opencode start` comment, or the configured state change, **and** no plan yet | plan |
-| `/opencode start` comment, or the configured state change, **with** a plan | execute |
+| `/opencode start` comment, or the configured state change, **with** a ready plan | execute |
+| `/opencode start` or state change **while the plan still has open questions** | ignore; answer the questions and `/opencode replan` |
+| `/opencode replan` comment | plan (a revision), even when a draft exists; it never executes |
 | `/opencode permit` comment, **and** the last turn was refused something | the action of that last turn, re-run with exactly the refused commands authorised |
 | `/opencode revoke` comment | ignore, and the authorisation is cleared — a retraction runs no turn |
+| `/opencode replan` while the task is `analyzing`, `planning` or `executing` | ignore; pause or wait first |
 | `issueCreated` (unless `FLOWHUB_SKIP_ANALYZE_ON_CREATE=1`) | analyze |
 | Anything else, including a project with no repository mapped | ignore |
 
-The trigger is anchored, so a reply that merely *mentions* `/opencode start` — as
-the agent's own analysis does, when it tells the maintainer how to continue —
-cannot start anything. Loop prevention therefore has three independent layers:
-the marker, a probe against the text of our last reply (for when the marker gets
-lost), and the anchored trigger.
+The trigger is anchored, so a reply that merely *mentions* `/opencode start` or
+`/opencode replan` — as the agent's own analysis does, when it tells the
+maintainer how to continue — cannot start anything. Loop prevention therefore has
+three independent layers: the marker, a probe against the text of our last reply
+(for when the marker gets lost), and the anchored trigger. The project's
+`authors` allowlist, when set, is applied before the decision, so it covers the
+replan phrase too; the default is empty (off).
 
 ### The task registry and the worktree
 
