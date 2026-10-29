@@ -92,6 +92,10 @@ type PromptContext struct {
 	// outside: the maintainer sees no comment, and the task would otherwise be
 	// recorded as if a reply had been posted.
 	Nudge bool
+	// Replan marks a plan turn requested with the replan phrase: the previous plan
+	// exists, so the source should ask for a revision and say what changed. The
+	// decision supplies it; the source owns the wording.
+	Replan bool
 	// NudgeRead marks a bounded follow-up sent because a plan turn posted its
 	// reply without reading the issue discussion. The dispatcher decides when the
 	// read is missing; the source names its discussion tool and says what to do,
@@ -101,8 +105,12 @@ type PromptContext struct {
 
 // TaskView is what the registry already knows about the issue.
 type TaskView struct {
-	Known     bool
-	Plan      registry.PlanState
+	Known bool
+	Plan  registry.PlanState
+	// State is the task's lifecycle state. A replan is refused while a turn is
+	// running: queueing it would run a revision after the execution it was meant to
+	// prevent.
+	State     registry.State
 	Turns     int
 	LastReply string
 	// Refusals are the commands the most recent turn was refused for. A bare permit
@@ -140,6 +148,10 @@ const (
 	PermitTrigger = "/opencode permit"
 	// RevokeTrigger clears that authorisation.
 	RevokeTrigger = "/opencode revoke"
+	// ReplanTrigger asks for a revised plan without approving execution. It is
+	// structural like the permit/revoke phrases: the agent's plan comment names it,
+	// and the plan state alone cannot tell "approve" from "revise".
+	ReplanTrigger = "/opencode replan"
 )
 
 // Defaults fills the zero fields with the measured, working values.
@@ -171,6 +183,8 @@ const (
 	TriggerComment Trigger = "comment"
 	// TriggerState is a workflow state change into one of the start states.
 	TriggerState Trigger = "state"
+	// TriggerReplan is a comment asking for a revised plan.
+	TriggerReplan Trigger = "replan"
 )
 
 // Decision is the outcome of applying the policy.
@@ -226,6 +240,14 @@ func (p Policy) Decide(e event.Event, task TaskView) Decision {
 
 	if e.IsComment() {
 		switch {
+		case replanPattern().MatchString(e.Comment):
+			// A revision cannot un-run an in-flight turn. Queueing it would only produce
+			// a new plan after the execution it was meant to prevent, so the operator
+			// has to pause or wait first.
+			if task.State == registry.StateAnalyzing || task.State == registry.StatePlanning || task.State == registry.StateExecuting {
+				return Decision{Action: ActionIgnore, Trigger: TriggerReplan, Reason: "a turn is running; pause/wait, then comment " + ReplanTrigger}
+			}
+			return Decision{Action: ActionPlan, Trigger: TriggerReplan, Reason: "comment matched " + ReplanTrigger + "; producing a revised plan"}
 		case startPattern(p.Trigger).MatchString(e.Comment):
 			return p.startDecision(task, TriggerComment, "comment matched "+p.Trigger)
 		case analyzePattern().MatchString(e.Comment):
@@ -248,10 +270,18 @@ func (p Policy) Decide(e event.Event, task TaskView) Decision {
 // a plan exists first" step of the agreed workflow: with no plan yet, the turn
 // produces one and asks the questions that block implementation.
 func (p Policy) startDecision(task TaskView, trigger Trigger, reason string) Decision {
-	if task.Plan == registry.PlanNone {
+	switch task.Plan {
+	case registry.PlanQuestions:
+		return Decision{
+			Action:  ActionIgnore,
+			Trigger: trigger,
+			Reason:  "the plan still has questions; answer them and comment " + ReplanTrigger,
+		}
+	case registry.PlanNone:
 		return Decision{Action: ActionPlan, Trigger: trigger, Reason: reason + "; no plan exists yet, so plan first"}
+	default:
+		return Decision{Action: ActionExecute, Trigger: trigger, Reason: reason + "; a plan exists"}
 	}
-	return Decision{Action: ActionExecute, Trigger: trigger, Reason: reason + "; a plan exists"}
 }
 
 // stateTransition reports whether the event set a workflow state that means "start
@@ -335,6 +365,13 @@ func analyzePattern() *regexp.Regexp {
 	return regexp.MustCompile(`(?i)^\s*/opencode\s*(analyze)?\s*$`)
 }
 
+// replanPattern is anchored for the same reason the start trigger is: the plan
+// comment tells the maintainer which phrase to type, and a phrase merely mentioned
+// in a discussion must not act.
+func replanPattern() *regexp.Regexp {
+	return regexp.MustCompile(`(?i)^\s*` + regexp.QuoteMeta(ReplanTrigger) + `\b`)
+}
+
 // Basis renders what triggered a turn as a short English clause, for the reply's
 // sign-off. It is derived from the delivery and the policy rather than asked of
 // the model: a model asked to explain its own reply writes something plausible
@@ -349,6 +386,11 @@ func (p Policy) Basis(decision Decision, e event.Event) string {
 			return fmt.Sprintf("the comment %q", text)
 		}
 		return "a comment on this issue"
+	case TriggerReplan:
+		if text := firstLine(e.Comment, 80); text != "" {
+			return fmt.Sprintf("the comment %q", text)
+		}
+		return "a re-plan request"
 	case TriggerState:
 		if value, ok := p.stateTransition(e); ok {
 			field := e.StateField

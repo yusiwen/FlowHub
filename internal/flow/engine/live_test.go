@@ -331,3 +331,59 @@ func TestTheFlowTurnCarriesTheDecisionTrigger(t *testing.T) {
 		t.Fatalf("turn basis = %q, want the state-change reason", service.last.Basis)
 	}
 }
+
+// TestOnAReplanPlansEvenWithADraft: the flow's evaluate must choose the plan node
+// for the replan phrase, not the execute node a draft would select for a start.
+func TestOnAReplanPlansEvenWithADraft(t *testing.T) {
+	event := readEvent(t, "events/comment-start.json")
+	event.Comment.Text = "/opencode replan"
+	service := &liveTasks{task: registry.Task{
+		Key: event.Subject.Key, Plan: registry.PlanDraft, State: registry.StateAwaitingInput, Turns: 1,
+	}}
+	engine := newLiveEngine(t, service, liveSelector{host: tasksvc.Host{Name: "builder-a"}})
+	run, err := engine.RunEvent(event)
+	if err != nil || run == nil || run.State != StateSucceeded {
+		t.Fatalf("run = %+v, err = %v", run, err)
+	}
+	if service.turn != 1 {
+		t.Fatalf("turn = %d, want one plan turn", service.turn)
+	}
+	if service.last.Action != rules.ActionPlan {
+		t.Fatalf("action = %s, want plan", service.last.Action)
+	}
+}
+
+// TestOnAStartWithOpenQuestionsIsIgnored: the hard questions guard lives in rules,
+// so the flow's evaluate must produce ignore and the task service must not run.
+func TestOnAStartWithOpenQuestionsIsIgnored(t *testing.T) {
+	event := readEvent(t, "events/comment-start.json")
+	service := &liveTasks{task: registry.Task{
+		Key: event.Subject.Key, Plan: registry.PlanQuestions, State: registry.StateAwaitingInput, Turns: 2,
+	}}
+	engine := newLiveEngine(t, service, liveSelector{host: tasksvc.Host{Name: "builder-a"}})
+	run, err := engine.RunEvent(event)
+	if err != nil || run == nil || run.State != StateSucceeded {
+		t.Fatalf("run = %+v, err = %v", run, err)
+	}
+	if service.turn != 0 {
+		t.Fatalf("turn = %d, want no turn while questions remain", service.turn)
+	}
+}
+
+// TestOnAReplanWhileATurnRunsIsIgnored: the flow's task projection must carry the
+// running state into rules; a queued revision would arrive too late to help.
+func TestOnAReplanWhileATurnRunsIsIgnored(t *testing.T) {
+	event := readEvent(t, "events/comment-start.json")
+	event.Comment.Text = "/opencode replan"
+	service := &liveTasks{task: registry.Task{
+		Key: event.Subject.Key, Plan: registry.PlanDraft, State: registry.StateExecuting, Turns: 2,
+	}}
+	engine := newLiveEngine(t, service, liveSelector{host: tasksvc.Host{Name: "builder-a"}})
+	run, err := engine.RunEvent(event)
+	if err != nil || run == nil || run.State != StateSucceeded {
+		t.Fatalf("run = %+v, err = %v", run, err)
+	}
+	if service.turn != 0 {
+		t.Fatalf("turn = %d, want no replan while executing", service.turn)
+	}
+}

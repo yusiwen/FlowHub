@@ -670,6 +670,7 @@ func (d *Dispatcher) runRouted(ctx context.Context, item routed) {
 	taskView := rules.TaskView{Known: known}
 	if known {
 		taskView.Plan = task.Plan
+		taskView.State = task.State
 		taskView.Turns = task.Turns
 		taskView.LastReply = task.LastReply
 		// What a bare `/opencode permit` authorises: the commands the last turn was

@@ -289,3 +289,92 @@ func TestThePermitPhraseIsAnchoredAndNeverOurOwnComment(t *testing.T) {
 		t.Fatalf("our own comment produced %s, want ignore", decision.Action)
 	}
 }
+
+// TestAReplanIsAPlanEvenWithADraft: the whole point of the phrase is to revise a
+// plan without approving it. `/opencode start` with a draft still executes, so the
+// two verbs must not collapse into the same decision.
+func TestAReplanIsAPlanEvenWithADraft(t *testing.T) {
+	policy := Policy{}.Defaults()
+	replan := made(event.KindCommented, "TEST-1", withComment("/opencode replan"))
+	for _, plan := range []registry.PlanState{registry.PlanNone, registry.PlanDraft, registry.PlanQuestions} {
+		decision := policy.Decide(replan, TaskView{Known: true, Plan: plan, State: registry.StateAwaitingInput})
+		if decision.Action != ActionPlan || decision.Trigger != TriggerReplan {
+			t.Errorf("replan with plan %q = %s/%s (%s), want plan/replan", plan, decision.Action, decision.Trigger, decision.Reason)
+		}
+	}
+	// The start verb is unchanged: a draft approves execution.
+	start := made(event.KindCommented, "TEST-1", withComment("/opencode start"))
+	if got := policy.Decide(start, TaskView{Known: true, Plan: registry.PlanDraft, State: registry.StateAwaitingInput}); got.Action != ActionExecute {
+		t.Fatalf("/opencode start with a draft = %s, want execute", got.Action)
+	}
+}
+
+// TestAReplanWhileATurnRunsIsIgnored: a queued replan would run after the turn it
+// was meant to revise, so it is refused rather than silently producing a stale
+// revision. The operator pauses or waits, then replans.
+func TestAReplanWhileATurnRunsIsIgnored(t *testing.T) {
+	policy := Policy{}.Defaults()
+	replan := made(event.KindCommented, "TEST-1", withComment("/opencode replan"))
+	for _, state := range []registry.State{registry.StateAnalyzing, registry.StatePlanning, registry.StateExecuting} {
+		decision := policy.Decide(replan, TaskView{Known: true, Plan: registry.PlanDraft, State: state})
+		if decision.Action != ActionIgnore {
+			t.Errorf("replan in state %q = %s, want ignore", state, decision.Action)
+		}
+		if !strings.Contains(decision.Reason, "pause/wait") {
+			t.Errorf("replan refusal does not explain the pause: %q", decision.Reason)
+		}
+	}
+	for _, state := range []registry.State{registry.StateAwaitingInput, registry.StateFailed, registry.StateDone} {
+		if got := policy.Decide(replan, TaskView{Known: true, Plan: registry.PlanDraft, State: state}); got.Action != ActionPlan {
+			t.Errorf("replan in state %q = %s, want plan", state, got.Action)
+		}
+	}
+}
+
+// TestAStartWithOpenQuestionsIsIgnored: the plan has not been confirmed. Starting
+// would implement it with the questions unanswered, so the only path is to answer
+// them and replan.
+func TestAStartWithOpenQuestionsIsIgnored(t *testing.T) {
+	policy := Policy{}.Defaults()
+	start := made(event.KindCommented, "TEST-1", withComment("/opencode start"))
+	stateChange := made(event.KindStateSet, "TEST-1", withState("State", "In Progress"))
+	for name, e := range map[string]event.Event{"comment": start, "state": stateChange} {
+		decision := policy.Decide(e, TaskView{Known: true, Plan: registry.PlanQuestions, State: registry.StateAwaitingInput})
+		if decision.Action != ActionIgnore {
+			t.Errorf("%s with open questions = %s, want ignore", name, decision.Action)
+		}
+		if !strings.Contains(decision.Reason, ReplanTrigger) {
+			t.Errorf("%s refusal does not name the replan phrase: %q", name, decision.Reason)
+		}
+	}
+}
+
+// TestTheReplanPhraseIsAnchored prevents a discussion that merely mentions the
+// phrase from starting a turn, matching the start trigger's contract.
+func TestTheReplanPhraseIsAnchored(t *testing.T) {
+	policy := Policy{}.Defaults()
+	for text, want := range map[string]Action{
+		"/opencode replan":               ActionPlan,
+		"  /opencode replan":             ActionPlan,
+		"/opencode replan after answers": ActionPlan,
+		"please /opencode replan":        ActionIgnore,
+		"/opencode replanning":           ActionIgnore,
+		"/opencode start":                ActionExecute,
+	} {
+		if got := policy.Decide(made(event.KindCommented, "TEST-1", withComment(text)), TaskView{Known: true, Plan: registry.PlanDraft}); got.Action != want {
+			t.Errorf("Decide(%q) = %s, want %s", text, got.Action, want)
+		}
+	}
+}
+
+// TestTheReplanBasisQuotesTheComment keeps the sign-off truthful: the reply says
+// the replan comment triggered it, and the model only renders that fact.
+func TestTheReplanBasisQuotesTheComment(t *testing.T) {
+	policy := Policy{}.Defaults()
+	e := made(event.KindCommented, "TEST-1", withComment("/opencode replan"))
+	decision := policy.Decide(e, TaskView{Known: true, Plan: registry.PlanDraft})
+	basis := policy.Basis(decision, e)
+	if !strings.Contains(basis, ReplanTrigger) {
+		t.Fatalf("basis = %q, want the replan comment", basis)
+	}
+}

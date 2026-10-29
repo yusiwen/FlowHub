@@ -47,8 +47,12 @@ type PlanState string
 const (
 	// PlanNone: no plan has been produced yet.
 	PlanNone PlanState = "none"
-	// PlanDraft: a plan exists but a human has not approved it.
+	// PlanDraft: a plan exists and carries no open questions; a human has not
+	// approved it yet.
 	PlanDraft PlanState = "draft"
+	// PlanQuestions: a plan exists but it still has questions a human must answer.
+	// `/opencode start` is refused until a re-plan marks it ready.
+	PlanQuestions PlanState = "questions"
 	// PlanConfirmed: a human approved the plan; execution may proceed.
 	PlanConfirmed PlanState = "confirmed"
 )
