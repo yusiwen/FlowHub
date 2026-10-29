@@ -1049,7 +1049,7 @@ func recordFor(event upstream.Event) *store.Record {
 
 func viewOf(task registry.Task) rules.TaskView {
 	return rules.TaskView{
-		Known: task.Key != "", Plan: task.Plan, Turns: task.Turns,
+		Known: task.Key != "", Plan: task.Plan, State: task.State, Turns: task.Turns,
 		LastReply: task.LastReply, Refusals: task.Refusals,
 	}
 }
@@ -1209,6 +1209,7 @@ func (e *Engine) projections(event upstream.Event) (map[string]any, map[string]r
 			"grant":       grant(task.Grant),
 		}
 		views[name] = rules.TaskView{
+			State:     task.State,
 			Known:     found,
 			Plan:      task.Plan,
 			Turns:     task.Turns,
