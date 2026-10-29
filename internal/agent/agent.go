@@ -81,9 +81,13 @@ type Turn struct {
 	// in AllowedTools: the runtime gates them (the ruleset asks) and allows them
 	// in its own policy, so a plan turn can require a read first.
 	ReplyTools []string
-	// RequireReadBeforeReply lists the tool calls that must have completed in this
-	// turn before a ReplyTools call is allowed. Empty disables the gate.
+	// RequireReadBeforeReply lists the tool calls that must all have completed in
+	// this turn before a ReplyTools call is allowed. Empty disables the gate.
 	RequireReadBeforeReply []string
+	// RequireReadBeforeWork lists the tool calls that must all have completed before
+	// the execution phase may edit files. It is the execute-turn preflight: a plan
+	// approved before the latest replies must not be implemented on stale context.
+	RequireReadBeforeWork []string
 	// Downloads constrains attachment downloads for this turn.
 	Downloads Downloads
 	// Granted are whole command segments a human authorised for this turn by

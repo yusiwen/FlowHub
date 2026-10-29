@@ -51,6 +51,7 @@ type Turn struct {
 	// complete first. The executor fills them; a runtime enforces them.
 	ReplyTools             []string
 	RequireReadBeforeReply []string
+	RequireReadBeforeWork  []string
 	Downloads              agent.Downloads
 	Granted                []string
 	Metadata               map[string]any
@@ -88,6 +89,7 @@ func (h Host) Run(ctx context.Context, turn Turn) (agent.Result, error) {
 		AllowedTools:           turn.AllowedTools,
 		ReplyTools:             turn.ReplyTools,
 		RequireReadBeforeReply: turn.RequireReadBeforeReply,
+		RequireReadBeforeWork:  turn.RequireReadBeforeWork,
 		Downloads:              turn.Downloads,
 		Granted:                turn.Granted,
 		Metadata:               turn.Metadata,

@@ -2,6 +2,7 @@ package tasks
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -346,6 +347,9 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 		// The sign-off states what the agent was reacting to; it comes from the
 		// decision, so the reply cannot invent a reason for itself.
 		Basis: e.opts.Policy.Basis(decision, delivery),
+		// A replan is the same read-only plan turn, but the source phrases it as a
+		// revision: the previous plan may be stale because the discussion changed.
+		Replan: decision.Trigger == rules.TriggerReplan,
 		// The routing entry's own instructions, read from its prompt_file when the
 		// configuration was loaded.
 		Instructions: match.Entry.PromptExtra,
@@ -411,10 +415,17 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 		Deadline: deadline,
 	}
 	if decision.Action == rules.ActionPlan {
-		// A plan must read the live discussion before it posts. Phase 1 enforces
-		// this after the turn; Phase 2 puts the same requirement in front of the
-		// reply tool, so the model cannot post the stale plan and then correct it.
+		// A plan must read the live description and discussion before it posts. The
+		// executor enforces this after the turn; the arbiter puts the same requirement
+		// in front of the reply tool, so the model cannot post the stale plan and then
+		// correct it.
 		turn.RequireReadBeforeReply = append([]string(nil), tools.PlanRead...)
+	}
+	if decision.Action == rules.ActionExecute {
+		// Approving a plan does not freeze the thread. An execute turn must read the
+		// live issue and comments before it changes a file; a reply that arrived after
+		// the plan is otherwise absent from the session snapshot.
+		turn.RequireReadBeforeWork = append([]string(nil), tools.PlanRead...)
 	}
 
 	result, err := runnerHost.Run(ctx, turn)
@@ -547,13 +558,13 @@ func (e *Executor) runTurn(ctx context.Context, rec *store.Record, delivery even
 	}
 	plan := task.Plan
 	if replied && decision.Action == rules.ActionPlan {
-		// Only a planning turn creates a plan, and only one that read the discussion
+		// Only a planning turn creates a plan, and only one that read the live issue
 		// first. An analysis turn must leave the plan empty: marking it draft made the
 		// next `/opencode start` jump straight to edit rights without a plan (found by
 		// the live journey E2E). A plan posted without the read is not a plan either:
 		// clearing it is what stops the next start from executing it.
 		if planRead {
-			plan = registry.PlanDraft
+			plan = planStateFromReply(result.Tools, tools)
 		} else {
 			plan = registry.PlanNone
 		}
@@ -657,9 +668,9 @@ func matchesAnyTool(got string, wants []string) bool {
 }
 
 // planReadSatisfied reports whether this turn may be recorded as a plan. A turn
-// with no declared read requirement is satisfied; otherwise a completed read must
-// have arrived *before* a completed reply. Reading after posting the plan is too
-// late: the plan a human reads was written without it.
+// with no declared read requirement is satisfied; otherwise **all** declared reads
+// must have completed *before* a completed reply. Reading after posting the plan is
+// too late: the plan a human reads was written without it.
 func planReadSatisfied(calls []agent.ToolCall, readTools, replyTools []string) bool {
 	if len(readTools) == 0 {
 		return true
@@ -667,25 +678,74 @@ func planReadSatisfied(calls []agent.ToolCall, readTools, replyTools []string) b
 	return readBeforeReply(calls, readTools, replyTools)
 }
 
-// readBeforeReply reports whether any completed reply follows a completed read.
-// Tool order is the order the runtime reported the calls in; mergeTurns keeps the
-// first turn's calls before the follow-up's, which is exactly the order that makes
-// a corrected plan count and the original unread one not.
+// readBeforeReply reports whether a completed reply follows all the completed
+// reads. Tool order is the order the runtime reported the calls in; mergeTurns
+// keeps the first turn's calls before the follow-up's, which is exactly the order
+// that makes a corrected plan count and the original unread one not.
 func readBeforeReply(calls []agent.ToolCall, readTools, replyTools []string) bool {
-	read := false
+	if len(readTools) == 0 {
+		return true
+	}
+	seen := make([]bool, len(readTools))
 	for _, call := range calls {
 		if call.Status != "completed" {
 			continue
 		}
-		if matchesAnyTool(call.Name, readTools) {
-			read = true
-			continue
-		}
-		if read && matchesAnyTool(call.Name, replyTools) {
+		if matchesAnyTool(call.Name, replyTools) && allSeen(seen) {
 			return true
+		}
+		for i, read := range readTools {
+			if sameTool(call.Name, read) {
+				seen[i] = true
+			}
 		}
 	}
 	return false
+}
+
+func allSeen(seen []bool) bool {
+	for _, ok := range seen {
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// planStateFromReply reads the plan-state marker out of the last completed reply
+// comment. It is fail-closed: a missing or mixed marker is `questions`, and only a
+// plan that explicitly declares ready becomes a draft. A source without markers
+// keeps the old draft behaviour.
+func planStateFromReply(calls []agent.ToolCall, tools source.ToolPolicy) registry.PlanState {
+	if strings.TrimSpace(tools.PlanOpenMarker) == "" || strings.TrimSpace(tools.PlanReadyMarker) == "" {
+		return registry.PlanDraft
+	}
+	text := lastReplyText(calls, tools.Reply)
+	open := strings.Contains(text, tools.PlanOpenMarker)
+	ready := strings.Contains(text, tools.PlanReadyMarker)
+	if open || !ready {
+		return registry.PlanQuestions
+	}
+	return registry.PlanDraft
+}
+
+// lastReplyText returns the comment text of the most recent completed reply call.
+// The v2 projection puts the MCP input in ToolCall.Input, so the marker the model
+// actually posted is read here rather than guessed from the assistant prose.
+func lastReplyText(calls []agent.ToolCall, replyTools []string) string {
+	var text string
+	for _, call := range calls {
+		if call.Status != "completed" || !matchesAnyTool(call.Name, replyTools) {
+			continue
+		}
+		var payload struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(call.Input), &payload); err == nil && strings.TrimSpace(payload.Text) != "" {
+			text = payload.Text
+		}
+	}
+	return text
 }
 
 // silentFinish reports whether a turn ended cleanly and posted no reply — the state

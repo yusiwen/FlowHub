@@ -106,10 +106,10 @@ func (f *fakeServer) start() *httptest.Server {
 					ID: "msg_read", Role: "assistant", Finish: "tool-calls",
 					Time: MessageTime{Created: 2, Completed: 3},
 				},
-				Parts: []Part{{
-					Type: "tool", Tool: "youtrack.get_issue_comments",
-					State: &ToolState{Status: "completed"},
-				}},
+				Parts: []Part{
+					{Type: "tool", Tool: "youtrack.get_issue", State: &ToolState{Status: "completed"}},
+					{Type: "tool", Tool: "youtrack.get_issue_comments", State: &ToolState{Status: "completed"}},
+				},
 			})
 		}
 		f.busy = !f.silentPrompt
@@ -570,7 +570,7 @@ func TestV1ReplyPermissionWaitsForTheDiscussionRead(t *testing.T) {
 
 			runner := testRunner(t, server.URL)
 			runner.arbiter.ReplyTools = normalizedToolSet([]string{"youtrack_add_issue_comment"})
-			runner.arbiter.RequireReadBeforeReply = []string{"youtrack_get_issue_comments"}
+			runner.arbiter.RequireReadBeforeReply = []string{"youtrack_get_issue", "youtrack_get_issue_comments"}
 			result, err := runner.Run(context.Background(), Task{
 				Directory: "/private/tmp/work",
 				Prompt:    "plan the change",

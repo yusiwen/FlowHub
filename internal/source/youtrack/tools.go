@@ -24,10 +24,24 @@ var AllowedMCPTools = []string{
 // signal that the issue actually got a comment.
 var ReplyTools = []string{"youtrack_add_issue_comment"}
 
-// PlanReadTools are the tool calls that mean "the plan turn read the discussion".
-// A plan that asks a human a question already answered in the thread is a stale
-// plan; the executor requires one of these to complete before the reply.
-var PlanReadTools = []string{"youtrack_get_issue_comments"}
+// PlanReadTools are the tool calls that together mean "the turn read the live
+// issue": the description/fields and the discussion. A plan that asks a human a
+// question already answered in the thread is a stale plan; the executor requires
+// all of these to complete before the reply, and the execution phase requires them
+// before the first edit.
+var PlanReadTools = []string{
+	"youtrack_get_issue",
+	"youtrack_get_issue_comments",
+}
+
+// The plan-state markers. They are HTML comments so they stay invisible in the
+// rendered issue but survive in the stored comment text the executor parses.
+const (
+	// PlanOpenMarker declares that the plan still has open questions.
+	PlanOpenMarker = "<!-- flowhub-plan-open -->"
+	// PlanReadyMarker declares that nothing is left to confirm.
+	PlanReadyMarker = "<!-- flowhub-plan-ready -->"
+)
 
 // DownloadHosts is the YouTrack host whose signed attachment URLs the agent is
 // allowed to download from. An empty list disables downloads entirely.

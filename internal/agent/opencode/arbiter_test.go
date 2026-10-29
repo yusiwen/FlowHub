@@ -289,23 +289,26 @@ func TestFindExecIsRefused(t *testing.T) {
 func TestAPlanReplyNeedsTheDiscussionReadFirst(t *testing.T) {
 	arbiter := DefaultArbiter()
 	arbiter.ReplyTools = normalizedToolSet([]string{"youtrack_add_issue_comment"})
-	arbiter.RequireReadBeforeReply = []string{"youtrack_get_issue_comments"}
+	arbiter.RequireReadBeforeReply = []string{"youtrack_get_issue", "youtrack_get_issue_comments"}
 
 	reply := PermissionRequest{Permission: "youtrack.add_issue_comment"}
 	if decision := arbiter.Decide(reply); decision.Allowed() {
 		t.Fatal("a plan reply was allowed before reading the discussion")
-	} else if !strings.Contains(decision.Reason, "youtrack_get_issue_comments") {
+	} else if !strings.Contains(decision.Reason, "youtrack_get_issue") {
 		t.Fatalf("the refusal does not name the read tool: %q", decision.Reason)
 	}
 
-	arbiter.ObserveTools([]ToolCall{{Name: "youtrack.get_issue_comments", Status: "error"}})
+	arbiter.ObserveTools([]ToolCall{{Name: "youtrack.get_issue", Status: "error"}})
 	if decision := arbiter.Decide(reply); decision.Allowed() {
 		t.Fatal("a failed read was accepted as a read")
 	}
-
+	arbiter.ObserveTools([]ToolCall{{Name: "youtrack.get_issue", Status: "completed"}})
+	if decision := arbiter.Decide(reply); decision.Allowed() {
+		t.Fatal("one of two required reads unlocked the reply")
+	}
 	arbiter.ObserveTools([]ToolCall{{Name: "youtrack.get_issue_comments", Status: "completed"}})
 	if decision := arbiter.Decide(reply); !decision.Allowed() {
-		t.Fatalf("a completed read did not unlock the reply: %s", decision.Reason)
+		t.Fatalf("both completed reads did not unlock the reply: %s", decision.Reason)
 	}
 
 	// A turn with no read requirement (analysis/execute) still allows its reply.
@@ -313,5 +316,36 @@ func TestAPlanReplyNeedsTheDiscussionReadFirst(t *testing.T) {
 	plain.ReplyTools = normalizedToolSet([]string{"youtrack_add_issue_comment"})
 	if decision := plain.Decide(reply); !decision.Allowed() {
 		t.Fatalf("a reply without a read requirement was refused: %s", decision.Reason)
+	}
+}
+
+// TestAnEditWaitsForTheLiveRead is the execute-turn preflight: a plan approved
+// before the latest replies must not be implemented on a stale session snapshot.
+// The edit permission is refused until both the description and the discussion
+// have been read in this turn.
+func TestAnEditWaitsForTheLiveRead(t *testing.T) {
+	arbiter := DefaultArbiter()
+	arbiter.Phase = PhaseExecution
+	arbiter.RequireReadBeforeWork = []string{"youtrack_get_issue", "youtrack_get_issue_comments"}
+
+	edit := PermissionRequest{Permission: "edit"}
+	if decision := arbiter.Decide(edit); decision.Allowed() {
+		t.Fatal("an edit was allowed before reading the live issue")
+	} else if !strings.Contains(decision.Reason, "youtrack_get_issue") {
+		t.Fatalf("the refusal does not name the read tools: %q", decision.Reason)
+	}
+	arbiter.ObserveTools([]ToolCall{{Name: "youtrack.get_issue", Status: "completed"}})
+	if decision := arbiter.Decide(edit); decision.Allowed() {
+		t.Fatal("one read unlocked the edit")
+	}
+	arbiter.ObserveTools([]ToolCall{{Name: "youtrack.get_issue_comments", Status: "completed"}})
+	if decision := arbiter.Decide(edit); !decision.Allowed() {
+		t.Fatalf("both reads did not unlock the edit: %s", decision.Reason)
+	}
+
+	analysis := DefaultArbiter()
+	analysis.Phase = PhaseAnalysis
+	if decision := analysis.Decide(edit); decision.Allowed() {
+		t.Fatal("the analysis phase is read-only")
 	}
 }

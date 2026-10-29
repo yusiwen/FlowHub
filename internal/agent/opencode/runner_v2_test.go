@@ -521,6 +521,10 @@ func (f *fakeV2) readDiscussion() {
 		"time":  map[string]any{"created": 11, "completed": 12},
 		"content": []map[string]any{
 			{
+				"type": "tool", "name": "youtrack.get_issue",
+				"state": map[string]any{"status": "completed"},
+			},
+			{
 				"type": "tool", "name": "youtrack.get_issue_comments",
 				"state": map[string]any{"status": "completed"},
 			},
@@ -555,7 +559,7 @@ func TestV2ReplyPermissionWaitsForTheDiscussionRead(t *testing.T) {
 
 			runner := testRunnerV2(t, server.URL)
 			runner.arbiter.ReplyTools = normalizedToolSet([]string{"youtrack_add_issue_comment"})
-			runner.arbiter.RequireReadBeforeReply = []string{"youtrack_get_issue_comments"}
+			runner.arbiter.RequireReadBeforeReply = []string{"youtrack_get_issue", "youtrack_get_issue_comments"}
 			result, err := runner.Run(context.Background(), Task{
 				Directory: "/work",
 				Prompt:    "plan the change",

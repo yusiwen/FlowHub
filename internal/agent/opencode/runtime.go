@@ -107,6 +107,7 @@ func (r *Runtime) Run(ctx context.Context, turn agent.Turn) (agent.Result, error
 	arbiter.AllowTools = toolSet(turn.AllowedTools)
 	arbiter.ReplyTools = normalizedToolSet(turn.ReplyTools)
 	arbiter.RequireReadBeforeReply = append([]string(nil), turn.RequireReadBeforeReply...)
+	arbiter.RequireReadBeforeWork = append([]string(nil), turn.RequireReadBeforeWork...)
 	arbiter.Wrappers = append([]string(nil), r.shellWrappers...)
 	arbiter.Granted = append([]string(nil), turn.Granted...)
 	// The attachment exception is the source's policy, applied by this runtime's

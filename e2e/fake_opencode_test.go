@@ -217,17 +217,28 @@ func (f *fakeOpencode) messages(w http.ResponseWriter, id string) {
 			"info": map[string]any{"id": fmt.Sprintf("u-%s-%d", id, i), "role": "user", "time": map[string]any{"created": i}},
 		})
 		parts := []any{map[string]any{"type": "text", "text": "analysis done"}}
-		// A plan turn must read the discussion before its reply; the fake reports
-		// that read so the executor's gate sees what a real turn does.
-		parts = append(parts, map[string]any{
-			"type": "tool", "tool": "youtrack_get_issue_comments",
-			"state": map[string]any{"status": "completed"},
-		})
+		// A plan turn must read the live issue and the discussion before its reply;
+		// the fake reports both reads so the executor's gate sees what a real turn
+		// does.
+		parts = append(parts,
+			map[string]any{
+				"type": "tool", "tool": "youtrack_get_issue",
+				"state": map[string]any{"status": "completed"},
+			},
+			map[string]any{
+				"type": "tool", "tool": "youtrack_get_issue_comments",
+				"state": map[string]any{"status": "completed"},
+			})
 		reply := mode == "every" || (mode == "nudge" && i >= 1)
 		if reply {
 			parts = append(parts, map[string]any{
 				"type": "tool", "tool": "youtrack_add_issue_comment",
-				"state": map[string]any{"status": "completed"},
+				"state": map[string]any{
+					"status": "completed",
+					"input": map[string]any{
+						"text": "plan\n<!-- flowhub-plan-ready -->",
+					},
+				},
 			})
 		}
 		out = append(out, map[string]any{

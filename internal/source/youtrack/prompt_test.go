@@ -289,12 +289,16 @@ func TestThePlanPromptRequiresTheDiscussion(t *testing.T) {
 	}
 	prompt := src.Prompt(rules.ActionPlan, &delivery, ctx)
 	for _, want := range []string{
+		"youtrack_get_issue",
 		"youtrack_get_issue_comments",
-		"newest human comments",
+		"newest human comment",
 		"treat it as stale",
 		"do not ask it again",
 		"Name the newest human comment you read",
 		"re-read",
+		PlanOpenMarker,
+		PlanReadyMarker,
+		rules.ReplanTrigger,
 		"分页返回黑名单机构信息",
 	} {
 		if !strings.Contains(prompt, want) {
@@ -353,5 +357,47 @@ func TestTheReadFollowUpAlsoCoversASilentPlanTurn(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("the combined follow-up is missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+// TestTheReplanPromptAsksForARevision: a plan turn triggered by the replan phrase
+// must read the live issue and say that the revised plan supersedes the previous
+// one. The marker contract and the start/replan choice are part of the same reply.
+func TestTheReplanPromptAsksForARevision(t *testing.T) {
+	src := New(rules.Policy{}, "")
+	delivery := made(event.KindUpdated, "TEST-12", withSubject("TEST", "准入首页", "分页返回黑名单机构信息"))
+	ctx := rules.PromptContext{
+		Worktree: "/wt/TEST-12", Repository: "mine/test", Author: "yusiwen",
+		Basis:  `the comment "/opencode replan"`,
+		Replan: true,
+	}
+	prompt := src.Prompt(rules.ActionPlan, &delivery, ctx)
+	for _, want := range []string{
+		"revised implementation plan",
+		"This is a re-plan",
+		"supersede",
+		"youtrack_get_issue",
+		"youtrack_get_issue_comments",
+		PlanOpenMarker,
+		PlanReadyMarker,
+		rules.ReplanTrigger,
+		`from the comment "/opencode replan".`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("the replan prompt is missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+// TestTheSourceDeclaresTheReadAndMarkerContract keeps the prompt text and the
+// executor's data in step: two read tools, and the marker pair the plan comment
+// must carry.
+func TestTheSourceDeclaresTheReadAndMarkerContract(t *testing.T) {
+	tools := New(rules.Policy{}, "").Tools()
+	if len(tools.PlanRead) != 2 || tools.PlanRead[0] != "youtrack_get_issue" || tools.PlanRead[1] != "youtrack_get_issue_comments" {
+		t.Fatalf("plan read tools = %v, want the issue and its comments", tools.PlanRead)
+	}
+	if tools.PlanOpenMarker != PlanOpenMarker || tools.PlanReadyMarker != PlanReadyMarker {
+		t.Fatalf("markers = %q/%q", tools.PlanOpenMarker, tools.PlanReadyMarker)
 	}
 }

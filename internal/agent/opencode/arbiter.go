@@ -83,9 +83,12 @@ type Arbiter struct {
 	// in AllowTools: the session ruleset asks for them, and this arbiter allows
 	// them, so a plan turn can require the discussion read first.
 	ReplyTools map[string]bool
-	// RequireReadBeforeReply lists the tool calls that must have completed in this
-	// turn before a ReplyTools call is allowed. Empty disables the gate.
+	// RequireReadBeforeReply lists the tool calls that must all have completed in
+	// this turn before a ReplyTools call is allowed. Empty disables the gate.
 	RequireReadBeforeReply []string
+	// RequireReadBeforeWork lists the tool calls that must all have completed before
+	// an edit is allowed in the execution phase. Empty disables the gate.
+	RequireReadBeforeWork []string
 
 	mu        sync.Mutex
 	completed map[string]bool
@@ -132,17 +135,21 @@ func (a *Arbiter) ObserveTools(calls []ToolCall) {
 	}
 }
 
-// readCompleted reports whether one of the required read tools has completed in
-// this turn.
-func (a *Arbiter) readCompleted() bool {
+// readCompleted reports whether every required read tool has completed in this
+// turn. The list is a requirement, not a menu: the plan needs the description and
+// the discussion, and the execute preflight needs both before editing.
+func (a *Arbiter) readCompleted(names []string) bool {
+	if len(names) == 0 {
+		return true
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, name := range a.RequireReadBeforeReply {
-		if a.completed[normalizeTool(name)] {
-			return true
+	for _, name := range names {
+		if !a.completed[normalizeTool(name)] {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // replyTool reports whether name is one of the source's reply tools.

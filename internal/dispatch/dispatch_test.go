@@ -51,10 +51,18 @@ type fakeOpencode struct {
 	// a test can produce a silent first turn followed by a follow-up that answers. Zero
 	// means every prompt posts, which is the ordinary case.
 	commentFromPrompt int
-	// readFromPrompt makes the fake report a completed get_issue_comments only from
-	// the Nth prompt on, so a test can model a plan turn that skipped the discussion
-	// and a follow-up that read it. Zero means every prompt reads.
+	// readFromPrompt makes the fake report the completed issue and comment reads
+	// only from the Nth prompt on, so a test can model a plan turn that skipped the
+	// discussion and a follow-up that read it. Zero means every prompt reads.
 	readFromPrompt int
+	// planOpen makes the plan comment carry the open-questions marker instead of
+	// the ready marker, so a test can model a plan that still needs confirmation.
+	planOpen bool
+	// readSkipPrompt suppresses the two reads on exactly that prompt, so a test can
+	// model an execution turn that tried to edit before reading the live issue.
+	readSkipPrompt int
+	// permissionEdit makes every turn raise one edit permission request.
+	permissionEdit bool
 	// ruleset records what the session was created with.
 	ruleset []agentruntime.PermissionRule
 	// sessionBody and promptBody keep the whole request so an entry's agent and
@@ -148,7 +156,7 @@ func (f *fakeOpencode) start() *httptest.Server {
 		if len(f.prompts) > 1 {
 			f.continued++
 		}
-		if f.permissionCommand != "" {
+		if f.permissionCommand != "" || f.permissionEdit {
 			// A fresh turn asks again: the request is unanswered until this turn's
 			// reply arrives.
 			f.permissionPending = true
@@ -166,16 +174,25 @@ func (f *fakeOpencode) start() *httptest.Server {
 				State: &agentruntime.ToolState{Status: "completed", Output: "ok"},
 			})
 		}
-		if f.readFromPrompt == 0 || len(f.prompts) >= f.readFromPrompt {
-			parts = append(parts, agentruntime.Part{
-				Type: "tool", Tool: "youtrack_get_issue_comments",
-				State: &agentruntime.ToolState{Status: "completed"},
-			})
+		if (f.readFromPrompt == 0 || len(f.prompts) >= f.readFromPrompt) && len(f.prompts) != f.readSkipPrompt {
+			for _, tool := range []string{"youtrack_get_issue", "youtrack_get_issue_comments"} {
+				parts = append(parts, agentruntime.Part{
+					Type: "tool", Tool: tool,
+					State: &agentruntime.ToolState{Status: "completed"},
+				})
+			}
 		}
 		if f.postComment && (f.commentFromPrompt == 0 || len(f.prompts) >= f.commentFromPrompt) {
+			marker := youtrack.PlanReadyMarker
+			if f.planOpen {
+				marker = youtrack.PlanOpenMarker
+			}
+			input, _ := json.Marshal(map[string]string{
+				"issueId": "TEST", "text": "plan\n" + marker,
+			})
 			parts = append(parts, agentruntime.Part{
 				Type: "tool", Tool: "youtrack_add_issue_comment",
-				State: &agentruntime.ToolState{Status: "completed"},
+				State: &agentruntime.ToolState{Status: "completed", Input: input},
 			})
 			f.toolCalls = append(f.toolCalls, "youtrack_add_issue_comment")
 		}
@@ -213,8 +230,14 @@ func (f *fakeOpencode) start() *httptest.Server {
 	handler.HandleFunc("/permission", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if f.permissionCommand == "" || !f.permissionPending {
+		if !f.permissionPending || (f.permissionCommand == "" && !f.permissionEdit) {
 			writeJSON(w, []agentruntime.PermissionRequest{})
+			return
+		}
+		if f.permissionEdit {
+			writeJSON(w, []agentruntime.PermissionRequest{{
+				ID: "per_1", SessionID: "ses_fake", Permission: "edit",
+			}})
 			return
 		}
 		writeJSON(w, []agentruntime.PermissionRequest{{
@@ -1687,5 +1710,149 @@ func TestAPlanTurnRecordsItsRunningStateBeforeThePrompt(t *testing.T) {
 	task, _ = reg.Get(youtrack.SourceName, "TEST-70")
 	if task.State != registry.StateAwaitingInput || task.Plan != registry.PlanDraft {
 		t.Fatalf("after plan: state/plan = %q/%q, want awaiting_input/draft", task.State, task.Plan)
+	}
+}
+
+// TestAReplanRevisesThePlanWithoutExecuting: `/opencode replan` is a plan turn
+// even when a draft already exists. `/opencode start` still executes, so the two
+// verbs must remain distinct.
+func TestAReplanRevisesThePlanWithoutExecuting(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-80", "issueCreated", issueCreatedBody("TEST-80")))
+	dispatcher.handle(context.Background(), delivery("TEST-80", "commentAdded", commentBody("TEST-80", "/opencode start")))
+	dispatcher.handle(context.Background(), delivery("TEST-80", "commentAdded", commentBody("TEST-80", "/opencode replan")))
+
+	prompts := fake.promptsSeen()
+	if len(prompts) != 3 {
+		t.Fatalf("prompts = %d, want analysis, plan, replan", len(prompts))
+	}
+	if !strings.Contains(prompts[2], "This is a re-plan") {
+		t.Fatalf("the replan prompt does not describe a revision:\n%s", prompts[2])
+	}
+	if !strings.Contains(prompts[2], `from the comment "/opencode replan"`) {
+		t.Fatalf("the replan prompt has the wrong basis:\n%s", prompts[2])
+	}
+	task, _ := reg.Get(youtrack.SourceName, "TEST-80")
+	if task.LastAction != string(rules.ActionPlan) || task.Plan != registry.PlanDraft {
+		t.Fatalf("after replan: last_action/plan = %q/%q, want plan/draft", task.LastAction, task.Plan)
+	}
+	if task.State != registry.StateAwaitingInput {
+		t.Fatalf("after replan: state = %q, want awaiting_input", task.State)
+	}
+
+	// The approval then executes the revised plan.
+	dispatcher.handle(context.Background(), delivery("TEST-80", "commentAdded", commentBody("TEST-80", "/opencode start")))
+	task, _ = reg.Get(youtrack.SourceName, "TEST-80")
+	if task.LastAction != string(rules.ActionExecute) || task.State != registry.StateDone {
+		t.Fatalf("after start: last_action/state = %q/%q, want execute/done", task.LastAction, task.State)
+	}
+}
+
+// TestAPlanWithOpenQuestionsBlocksStartUntilAReadyReplan: a plan that declares
+// open questions is not approvable. The start is ignored; only an answer plus a
+// replan that declares ready moves the task to a draft the start can execute.
+func TestAPlanWithOpenQuestionsBlocksStartUntilAReadyReplan(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.planOpen = true
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-81", "issueCreated", issueCreatedBody("TEST-81")))
+	dispatcher.handle(context.Background(), delivery("TEST-81", "commentAdded", commentBody("TEST-81", "/opencode start")))
+
+	task, _ := reg.Get(youtrack.SourceName, "TEST-81")
+	if task.Plan != registry.PlanQuestions || task.State != registry.StateAwaitingInput {
+		t.Fatalf("plan/state = %q/%q, want questions/awaiting_input", task.Plan, task.State)
+	}
+	if got := len(fake.promptsSeen()); got != 2 {
+		t.Fatalf("prompts = %d, want analysis and plan", got)
+	}
+
+	// A start while questions remain must not run anything.
+	dispatcher.handle(context.Background(), delivery("TEST-81", "commentAdded", commentBody("TEST-81", "/opencode start")))
+	if got := len(fake.promptsSeen()); got != 2 {
+		t.Fatalf("start with open questions ran a turn: prompts = %d", got)
+	}
+	task, _ = reg.Get(youtrack.SourceName, "TEST-81")
+	if task.Plan != registry.PlanQuestions || task.LastAction != string(rules.ActionPlan) {
+		t.Fatalf("start with open questions changed the task: %+v", task)
+	}
+
+	// The human answers; the replan now declares ready and becomes a draft.
+	fake.planOpen = false
+	dispatcher.handle(context.Background(), delivery("TEST-81", "commentAdded", commentBody("TEST-81", "/opencode replan")))
+	task, _ = reg.Get(youtrack.SourceName, "TEST-81")
+	if task.Plan != registry.PlanDraft || task.LastAction != string(rules.ActionPlan) {
+		t.Fatalf("after ready replan: plan/last_action = %q/%q, want draft/plan", task.Plan, task.LastAction)
+	}
+
+	// Only now does the start execute.
+	dispatcher.handle(context.Background(), delivery("TEST-81", "commentAdded", commentBody("TEST-81", "/opencode start")))
+	task, _ = reg.Get(youtrack.SourceName, "TEST-81")
+	if task.LastAction != string(rules.ActionExecute) || task.State != registry.StateDone {
+		t.Fatalf("after start: last_action/state = %q/%q, want execute/done", task.LastAction, task.State)
+	}
+}
+
+// TestAuthorAllowlistBlocksAReplanFromAStranger: the existing project allowlist
+// applies before the decision, so it covers the new human phrase too. Empty stays
+// the default (no restriction).
+func TestAuthorAllowlistBlocksAReplanFromAStranger(t *testing.T) {
+	fake := newFakeOpencode(t)
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server, `"authors":["yusiwen"]`)
+
+	dispatcher.handle(context.Background(), delivery("TEST-82", "issueCreated", issueCreatedBody("TEST-82")))
+	dispatcher.handle(context.Background(), delivery("TEST-82", "commentAdded", commentBody("TEST-82", "/opencode start")))
+	before := len(fake.promptsSeen())
+
+	stranger := delivery("TEST-82", "commentAdded", commentBody("TEST-82", "/opencode replan"))
+	stranger.PrimaryActor = "someone.else"
+	dispatcher.handle(context.Background(), stranger)
+	if got := len(fake.promptsSeen()); got != before {
+		t.Fatalf("a stranger's replan ran a turn: prompts %d -> %d", before, got)
+	}
+	task, _ := reg.Get(youtrack.SourceName, "TEST-82")
+	if task.Plan != registry.PlanDraft || task.LastAction != string(rules.ActionPlan) {
+		t.Fatalf("a blocked replan changed the task: %+v", task)
+	}
+}
+
+// TestAnExecuteTurnCannotEditBeforeReadingTheLiveIssue is the execute preflight:
+// approving a plan does not freeze the thread. The first edit is refused when the
+// execution turn has not read the description and the discussion in this turn, and
+// the refusal is recorded on the task like any other.
+func TestAnExecuteTurnCannotEditBeforeReadingTheLiveIssue(t *testing.T) {
+	fake := newFakeOpencode(t)
+	fake.permissionEdit = true
+	// The plan turn reads; the execution turn deliberately does not.
+	fake.readFromPrompt = 2
+	fake.readSkipPrompt = 3
+	server := fake.start()
+	defer server.Close()
+	dispatcher, reg, _ := newTestDispatcher(t, fake, server)
+
+	dispatcher.handle(context.Background(), delivery("TEST-83", "issueCreated", issueCreatedBody("TEST-83")))
+	dispatcher.handle(context.Background(), delivery("TEST-83", "commentAdded", commentBody("TEST-83", "/opencode start")))
+	dispatcher.handle(context.Background(), delivery("TEST-83", "commentAdded", commentBody("TEST-83", "/opencode start")))
+
+	if got := fake.permissionReplyFor(3); got != "reject" {
+		t.Fatalf("the execute edit permission was answered %q, want reject", got)
+	}
+	task, _ := reg.Get(youtrack.SourceName, "TEST-83")
+	if task.LastAction != string(rules.ActionExecute) || task.State != registry.StateDone {
+		t.Fatalf("task = %+v, want a completed execute turn", task)
+	}
+	// An edit request has no shell command, so it is not a /opencode permit target;
+	// the refusal is the answer the model received, not a task refusal entry. The
+	// model can retry after reading, which is the behaviour this gate wants.
+	if task.Plan != registry.PlanDraft {
+		t.Fatalf("plan = %q, want the approved draft", task.Plan)
 	}
 }
