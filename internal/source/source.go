@@ -37,12 +37,17 @@ type ToolPolicy struct {
 	// Reply lists the tool calls that mean "this turn replied". A completed call to
 	// any of them is what the task service reports as the turn's answer.
 	Reply []string
-	// PlanRead lists the tool calls that mean "this turn read the issue's
-	// discussion". A plan turn that replies without one has planned against its
-	// session's memory rather than the live issue: it is asked once to read and
-	// correct, and is never recorded as a plan. Empty means the source has no
-	// discussion to read.
+	// PlanRead lists the tool calls that together mean "this turn read the live
+	// issue": the description/fields and the discussion. All of them must complete
+	// before a plan reply; a replan or an execution's first edit is likewise refused
+	// until they have. Empty means the source has no discussion to read.
 	PlanRead []string
+	// PlanOpenMarker and PlanReadyMarker are the machine markers a plan comment must
+	// carry: open when any question or uncertainty remains, ready only when nothing
+	// is left to confirm. The executor records `plan_state=questions` for open,
+	// missing or both markers, and `draft` only for ready.
+	PlanOpenMarker  string
+	PlanReadyMarker string
 	// Download constrains attachment downloads: which hosts may be reached, and
 	// where inside the worktree the file may be written.
 	Download DownloadPolicy

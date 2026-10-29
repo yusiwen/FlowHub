@@ -89,7 +89,7 @@ func (a *Arbiter) decideTool(req PermissionRequest) Decision {
 		// The reply is the deliverable, not a side effect: allow it once the plan
 		// turn has read the discussion. A read from an earlier turn is not enough;
 		// the plan must be based on the live thread.
-		if len(a.RequireReadBeforeReply) > 0 && !a.readCompleted() {
+		if !a.readCompleted(a.RequireReadBeforeReply) {
 			return Decision{
 				Reply: ReplyReject,
 				Reason: fmt.Sprintf("read the issue discussion first: call %s, then post the comment; the plan must be based on the live thread",
@@ -101,6 +101,12 @@ func (a *Arbiter) decideTool(req PermissionRequest) Decision {
 	switch name {
 	case "edit":
 		if a.Phase == PhaseExecution {
+			if !a.readCompleted(a.RequireReadBeforeWork) {
+				return Decision{
+					Reply:  ReplyReject,
+					Reason: fmt.Sprintf("read the live issue before editing: complete %s first", strings.Join(a.RequireReadBeforeWork, ", ")),
+				}
+			}
 			return a.allow("editing the task worktree is allowed in the execution phase")
 		}
 		return Decision{Reply: ReplyReject, Reason: "the analysis phase is read-only; propose the change instead of making it"}

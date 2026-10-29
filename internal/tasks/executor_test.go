@@ -1,11 +1,14 @@
 package tasks
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/yusiwen/flowhub/internal/agent"
+	"github.com/yusiwen/flowhub/internal/registry"
+	"github.com/yusiwen/flowhub/internal/source"
 )
 
 // TestTheFollowUpIsBoundedToACleanFinish pins the two guards around the follow-up.
@@ -69,7 +72,8 @@ func TestReplyToolNamesFromV2MCPAreNormalized(t *testing.T) {
 // maintainer sees was written without it. A corrected reply after a read does
 // count, which is what makes the bounded follow-up useful.
 func TestAPlanCountsOnlyWhenTheReadPrecedesTheReply(t *testing.T) {
-	const read = "youtrack_get_issue_comments"
+	const issue = "youtrack_get_issue"
+	const comments = "youtrack_get_issue_comments"
 	const reply = "youtrack_add_issue_comment"
 	completed := func(name string) agent.ToolCall {
 		return agent.ToolCall{Name: name, Status: "completed"}
@@ -79,20 +83,62 @@ func TestAPlanCountsOnlyWhenTheReadPrecedesTheReply(t *testing.T) {
 		reads []string
 		want  bool
 	}{
-		"read then reply":            {[]agent.ToolCall{completed(read), completed(reply)}, []string{read}, true},
-		"reply then read":            {[]agent.ToolCall{completed(reply), completed(read)}, []string{read}, false},
-		"read only":                  {[]agent.ToolCall{completed(read)}, []string{read}, false},
-		"reply only":                 {[]agent.ToolCall{completed(reply)}, []string{read}, false},
-		"failed read then reply":     {[]agent.ToolCall{{Name: read, Status: "error"}, completed(reply)}, []string{read}, false},
-		"read then failed reply":     {[]agent.ToolCall{completed(read), {Name: reply, Status: "error"}}, []string{read}, false},
-		"corrected reply after read": {[]agent.ToolCall{completed(reply), completed(read), completed(reply)}, []string{read}, true},
-		"dotted v2 names":            {[]agent.ToolCall{completed("youtrack.get_issue_comments"), completed("youtrack.add_issue_comment")}, []string{read}, true},
-		"no read requirement":        {[]agent.ToolCall{completed(reply)}, nil, true},
+		"both reads then reply":         {[]agent.ToolCall{completed(issue), completed(comments), completed(reply)}, []string{issue, comments}, true},
+		"comments then issue":           {[]agent.ToolCall{completed(comments), completed(issue), completed(reply)}, []string{issue, comments}, true},
+		"only issue read then reply":    {[]agent.ToolCall{completed(issue), completed(reply)}, []string{issue, comments}, false},
+		"only comments read then reply": {[]agent.ToolCall{completed(comments), completed(reply)}, []string{issue, comments}, false},
+		"reply then both reads":         {[]agent.ToolCall{completed(reply), completed(issue), completed(comments)}, []string{issue, comments}, false},
+		"both reads only":               {[]agent.ToolCall{completed(issue), completed(comments)}, []string{issue, comments}, false},
+		"reply only":                    {[]agent.ToolCall{completed(reply)}, []string{issue, comments}, false},
+		"failed issue read then reply":  {[]agent.ToolCall{{Name: issue, Status: "error"}, completed(comments), completed(reply)}, []string{issue, comments}, false},
+		"both reads then failed reply":  {[]agent.ToolCall{completed(issue), completed(comments), {Name: reply, Status: "error"}}, []string{issue, comments}, false},
+		"corrected reply after both":    {[]agent.ToolCall{completed(reply), completed(issue), completed(comments), completed(reply)}, []string{issue, comments}, true},
+		"dotted v2 names":               {[]agent.ToolCall{completed("youtrack.get_issue"), completed("youtrack.get_issue_comments"), completed("youtrack.add_issue_comment")}, []string{issue, comments}, true},
+		"no read requirement":           {[]agent.ToolCall{completed(reply)}, nil, true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			if got := planReadSatisfied(tc.calls, tc.reads, []string{reply}); got != tc.want {
 				t.Fatalf("planReadSatisfied = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPlanStateFromReplyIsFailClosed: only a comment that explicitly declares
+// ready becomes a draft. An open marker, a missing marker, or both markers leave
+// the plan at questions, so the start cannot execute a plan with unknown answers.
+func TestPlanStateFromReplyIsFailClosed(t *testing.T) {
+	reply := "youtrack_add_issue_comment"
+	call := func(text string) agent.ToolCall {
+		input, _ := json.Marshal(map[string]string{"text": text})
+		return agent.ToolCall{Name: reply, Status: "completed", Input: string(input)}
+	}
+	tools := source.ToolPolicy{
+		Reply:           []string{reply},
+		PlanOpenMarker:  "<!-- open -->",
+		PlanReadyMarker: "<!-- ready -->",
+	}
+	for name, tc := range map[string]struct {
+		calls []agent.ToolCall
+		want  registry.PlanState
+	}{
+		"ready":          {[]agent.ToolCall{call("plan\n<!-- ready -->")}, registry.PlanDraft},
+		"open":           {[]agent.ToolCall{call("plan\n<!-- open -->")}, registry.PlanQuestions},
+		"both":           {[]agent.ToolCall{call("plan\n<!-- open --><!-- ready -->")}, registry.PlanQuestions},
+		"missing":        {[]agent.ToolCall{call("plan")}, registry.PlanQuestions},
+		"no input":       {[]agent.ToolCall{{Name: reply, Status: "completed"}}, registry.PlanQuestions},
+		"last wins":      {[]agent.ToolCall{call("<!-- open -->"), call("<!-- ready -->")}, registry.PlanDraft},
+		"last open wins": {[]agent.ToolCall{call("<!-- ready -->"), call("<!-- open -->")}, registry.PlanQuestions},
+		"no markers":     {[]agent.ToolCall{call("plan")}, registry.PlanDraft},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tp := tools
+			if name == "no markers" {
+				tp.PlanOpenMarker, tp.PlanReadyMarker = "", ""
+			}
+			if got := planStateFromReply(tc.calls, tp); got != tc.want {
+				t.Fatalf("planStateFromReply = %q, want %q", got, tc.want)
 			}
 		})
 	}

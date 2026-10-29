@@ -57,6 +57,8 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 		fmt.Fprintf(&b, "Issue %s is therefore still unanswered. This follow-up turn exists only to fix that.\n", d.IssueID)
 	case action == rules.ActionAnalyze:
 		fmt.Fprintf(&b, "Analyse YouTrack issue %s before any implementation work.\n", d.IssueID)
+	case action == rules.ActionPlan && ctx.Replan:
+		fmt.Fprintf(&b, "Produce a revised implementation plan for YouTrack issue %s.\n", d.IssueID)
 	case action == rules.ActionPlan:
 		fmt.Fprintf(&b, "Produce an implementation plan for YouTrack issue %s.\n", d.IssueID)
 	case action == rules.ActionExecute:
@@ -169,14 +171,22 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 		b.WriteString("no file edits, no commits, no state changes in YouTrack.\n")
 	case action == rules.ActionPlan:
 		b.WriteString("\n## This turn\n")
-		b.WriteString("This turn is READ-ONLY. Before you write the plan, call `youtrack_get_issue_comments` and read the\n")
-		b.WriteString("newest human comments. The session may hold an earlier analysis; treat it as stale. If a question\n")
-		b.WriteString("you were about to ask is already answered there, do not ask it again: state the answer and who\n")
+		b.WriteString("This turn is READ-ONLY. Before you write the plan, call `youtrack_get_issue` (description,\n")
+		b.WriteString("fields, attachment list) and `youtrack_get_issue_comments` (the discussion), and read the live\n")
+		b.WriteString("issue. The session may hold an earlier analysis or plan; treat it as stale. If a question you were\n")
+		b.WriteString("about to ask is already answered in the discussion, do not ask it again: state the answer and who\n")
 		b.WriteString("gave it, and build the plan on it. Name the newest human comment you read in the plan comment.\n")
+		if ctx.Replan {
+			b.WriteString("This is a re-plan: the previous plan may be stale because the discussion changed.\n")
+			b.WriteString("State what changed from the previous plan, and make the revised plan supersede it.\n")
+		} else {
+			b.WriteString("Treat any plan already in this session as a draft: re-read the discussion before refining it.\n")
+		}
 		b.WriteString("Produce a concrete, ordered implementation plan: which files change, what the\n")
 		b.WriteString("risky parts are, and how the change will be verified. List every question that must be answered by a\n")
-		b.WriteString("human before implementation can start. Treat any plan already in this session as a draft: re-read\n")
-		b.WriteString("the discussion before refining it. Change nothing on disk.\n")
+		b.WriteString("human before implementation can start. If any question, assumption, missing decision, or genuine\n")
+		b.WriteString("uncertainty remains, list it and include the open marker; only when nothing is left to confirm include\n")
+		b.WriteString("the ready marker. Do not mark a plan ready to please the maintainer. Change nothing on disk.\n")
 	case action == rules.ActionExecute:
 		b.WriteString("\n## This turn\n")
 		b.WriteString("Implement the plan in the working directory. You may edit files and commit locally on the task branch;\n")
@@ -197,7 +207,14 @@ func (s *Source) Prompt(action rules.Action, e *event.Event, ctx rules.PromptCon
 	b.WriteString("If a refusal stopped you from doing the work, say so in the comment — quote the exact command\n")
 	fmt.Fprintf(&b, "and the reason — and tell the maintainer they can reply `%s` on the issue to authorise exactly\n", rules.PermitTrigger)
 	b.WriteString("those commands and let you carry on. A refusal you did not report is a refusal nobody can lift.\n")
-	if action != rules.ActionExecute {
+	if action == rules.ActionPlan {
+		b.WriteString("This plan comment must include exactly one plan-state marker, on its own line:\n")
+		fmt.Fprintf(&b, "%s when any question, assumption, missing decision or genuine uncertainty remains, or\n", PlanOpenMarker)
+		fmt.Fprintf(&b, "%s only when nothing is left to confirm. A missing or mixed marker is treated as open.\n", PlanReadyMarker)
+		fmt.Fprintf(&b, "Before the sign-off, tell the maintainer how to proceed: if the plan still has questions, answer them\n")
+		fmt.Fprintf(&b, "and comment `%s` for a revised plan; once the plan is agreed, comment `%s` or move it to %s.\n",
+			rules.ReplanTrigger, p.Trigger, strings.Join(p.StartStates, " / "))
+	} else if action != rules.ActionExecute {
 		fmt.Fprintf(&b, "Before the sign-off, tell the maintainer how to proceed: comment `%s` on the issue, or move it to %s.\n",
 			p.Trigger, strings.Join(p.StartStates, " / "))
 	}
