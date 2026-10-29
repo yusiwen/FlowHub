@@ -667,8 +667,16 @@ kill switch.
 | --- | --- |
 | Issue created | One **read-only** turn: the agent inspects a fresh worktree and posts one comment with findings, risks and open questions. It cannot edit or commit. |
 | `/opencode start` comment, or the state moves to `start_states` — and no plan yet | A **plan** turn: the plan plus its blocking questions. |
-| The same trigger with a plan on file | An **execute** turn: edits, runs the narrowest test it can find, commits locally on `flowhub/<ISSUE-KEY>`. **It never pushes.** |
+| The same trigger with a **ready** plan | An **execute** turn: edits, runs the narrowest test it can find, commits locally on `flowhub/<ISSUE-KEY>`. **It never pushes.** |
+| The same trigger while the plan has open questions (`plan_state=questions`) | Ignored. Answer the questions and comment `/opencode replan`; a start cannot execute an unconfirmed plan. |
+| `/opencode replan` | A **plan** turn that revises the plan, even when a draft exists. It never executes; it is ignored while a turn is running. |
 | The agent's own comment comes back | Ignored, by three independent layers (the `<!-- flowhub-auto -->` marker, a probe against the task's last reply, and the anchored trigger). |
+
+A plan comment declares its readiness with `<!-- flowhub-plan-ready -->` or
+`<!-- flowhub-plan-open -->`. An open, missing or mixed marker leaves the task in
+`plan_state=questions`; only a ready plan can be started. The plan/replan read
+gate requires both the issue (description and fields) and its comments, and the
+execution turn reads both before its first edit (ADR 0018).
 
 Every reply ends with a blockquote saying opencode generated it and **what
 triggered the turn**, with `<!-- flowhub-auto -->` as the last line. The branch is
@@ -802,8 +810,9 @@ commands and who permitted them) and `a human revoked the authorised commands`.
 recognised, even at the limit, because a retraction must never be blocked. And the only
 gate on who may permit is the project's `authors` allowlist, exactly as for
 `/opencode start`: **on a project that declares no authors, anyone who can comment on
-the issue can authorise a command.** Declare `authors` on every project you dispatch
-for.
+the issue can authorise a command.** The same all-event gate covers
+`/opencode replan` and the start-state change. Declare `authors` on every project you
+dispatch for.
 
 ---
 
@@ -1030,16 +1039,18 @@ every record keeps the full raw body.
 `(source, issue key)`. Per task it records the repository, worktree, base commit,
 session id, agent, state (`analyzing → awaiting_input → executing → done`,
 `failed` on a broken turn **or on a turn that finished without posting a comment**),
-plan state, turn count, cost and last reply, plus `last_action`, `refusals` (what the
-most recent turn was stopped by), `grant` (what a human has authorised so far) and
-`last_error` — the reason a `failed` task is failed, whether the turn errored or the
-worktree could not be prepared at all. The error is cleared by the next turn that runs.
+plan state (`none`/`questions`/`draft`/`confirmed`), turn count, cost and last reply,
+plus `last_action`, `refusals` (what the most recent turn was stopped by), `grant`
+(what a human has authorised so far) and `last_error` — the reason a `failed` task is
+failed, whether the turn errored or the worktree could not be prepared at all. The
+error is cleared by the next turn that runs.
 
-`awaiting_input` with a plan state of `draft` means "a comment was posted and a
-plan exists". It is never written for a silent turn: a row claiming a plan the
-agent never posted would be read by the next delivery as approval to start an
-execution turn with edit rights. Look for `state=failed` together with
-`the turn finished without posting a comment` in the log.
+`awaiting_input` with a plan state of `draft` means "a comment was posted and a ready
+plan exists"; `questions` means the plan still has open questions and `/opencode
+start` will be ignored until a `/opencode replan` declares ready. It is never written
+for a silent turn: a row claiming a plan the agent never posted would be read by the
+next delivery as approval to start an execution turn with edit rights. Look for
+`state=failed` together with `the turn finished without posting a comment` in the log.
 
 ```bash
 jq -c '{issue,repo,runtime,state,turns,cost,worktree}' \

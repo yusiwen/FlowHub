@@ -281,6 +281,14 @@ Do not point the production YouTrack webhook app at a test instance.
 Every checked-in scenario is a Go test in [e2e/e2e_test.go](../e2e/e2e_test.go);
 the Make targets are only wrappers around the suite.
 
+The plan turns now declare readiness. The fake server reports both
+`youtrack_get_issue` and `youtrack_get_issue_comments` and a
+`<!-- flowhub-plan-ready -->` plan; in a live journey a plan that declares open
+questions leaves `plan_state=questions`, so the next `/opencode start` is ignored.
+Answer the questions and `/opencode replan` before starting. The replan, the
+questions guard and the execution preflight are covered by the unit and flow suites
+(`make test`), not by a separate E2E target.
+
 | Scenario | Test | Target |
 | --- | --- | --- |
 | live/direct issue update webhook | `TestWebhookDeliversAnIssueUpdate` | `make e2e`, `make e2e-live` |
@@ -289,7 +297,7 @@ the Make targets are only wrappers around the suite.
 | `on` execution + rollback | `TestOnExecutesAndRollsBack` | `make e2e-flow`, `make e2e-live-flow` |
 | full live analyze -> plan -> execute (dispatch) | `TestLiveFullJourney` | `make e2e-live-journey` |
 | full live analyze -> plan -> execute (`on`) | `TestOnLiveFullJourney` | `make e2e-live-on-journey` |
-| `/opencode start` plan | `TestCommentTriggerStartsAPlan` | `make e2e-comments` |
+| `/opencode start` ready plan | `TestCommentTriggerStartsAPlan` | `make e2e-comments` |
 | duplicate webhook | `TestDuplicateWebhookIsIdempotent` | `make e2e` |
 | pause | `TestPauseDoesNotDispatch` | `make e2e` |
 | shadow soak / queue drops | `TestShadowSoak` | `make e2e-soak` (`E2E_SOAK=100`), `make e2e-soak-long` (500) |

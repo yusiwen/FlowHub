@@ -1314,10 +1314,10 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 Siwen Yu.
 
 ## Not implemented yet
 
-* Structured "are there blocking questions?" output. Today the agent is asked to
-  say so in prose and a human starts the implementation; a later version can use
-  opencode's `json_schema` output format to gate `/opencode start` on a machine
-  readable answer.
+* Richer structured question output. The open/ready marker now gates
+  `/opencode start` on a machine-readable answer (ADR 0018); a later version can
+  use opencode's `json_schema` output format to structure the questions themselves,
+  beyond the one-bit marker.
 * **Enforced refusal of credential-shaped reads.** opencode's own `read *.env`
   gate is overridden by FlowHub's session ruleset (`read` is allowed so the agent
   can read source), and the arbiter allows the `read` tool by name without looking

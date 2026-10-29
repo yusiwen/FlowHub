@@ -4,6 +4,10 @@
 - Date: 2026-10-21
 - Issues: #92 (epic), #93 (model)
 
+Revision 2026-10-29 (#182): ADR 0018 refines the approval step. `/opencode start`
+approves only a ready plan; a plan that still has questions is `plan_state=questions`
+and the start/state is ignored. `/opencode replan` is a revision, not an approval.
+
 ## Context
 
 FlowHub has one orchestration pipeline, and it is hard-coded. A YouTrack webhook is
