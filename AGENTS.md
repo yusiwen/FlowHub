@@ -367,7 +367,9 @@ documents. The rules below are load-bearing; do not relax them casually.
    once — a prompt sent to a busy session is silently swallowed, and a session belongs
    to one task for life — so a second delivery for a running task waits in its
    scheduler and runs when that turn ends; it is never dropped and never races the
-   first. The routing decision is made once per task burst and remembered until that
+   first. The replan phrase is the policy exception rather than a scheduler queue:
+   while a turn is running, `rules` ignores it, because a queued revision would run
+   after the turn it was meant to revise; see rule 16. The routing decision is made once per task burst and remembered until that
    task's work drains, so two deliveries of one issue cannot reach two hosts. Do not
    replace the scheduler with a per-task mutex taken after dequeueing: that parks a
    worker on another task's turn (`internal/dispatch/schedule.go`, ADR 0003).

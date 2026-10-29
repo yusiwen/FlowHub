@@ -28,5 +28,8 @@ answering its own reply.
   the reply short enough to read on one screen.
 - `In Progress` means "start implementing this"; a comment `/opencode start` means the
   same thing.
+- A plan with open questions must not be started. Answer the questions and comment
+  `/opencode replan` to get a revised plan; only a ready plan is started with
+  `/opencode start` or `In Progress`.
 - If an issue names a service rather than a repository, ask which repository before
   planning.

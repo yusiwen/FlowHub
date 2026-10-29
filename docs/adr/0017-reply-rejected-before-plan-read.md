@@ -2,6 +2,10 @@
 
 Status: accepted (2026-10-28, issue #179)
 
+Revision 2026-10-29 (#182): ADR 0018 requires **all** of the declared reads (not one)
+before a plan reply, and adds the execution-turn preflight (`RequireReadBeforeWork`).
+The decision below describes the original one-read gate.
+
 ## Context
 
 ADR 0016 (#178) made the task service refuse to record a plan that was posted

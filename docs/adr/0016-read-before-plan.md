@@ -4,6 +4,11 @@ Status: accepted (2026-10-28, issue #177)
 
 Revision 2026-10-28 (#179): Phase 2 landed as ADR 0017. The reply tool is now
 gated by the session ruleset and refused by the arbiter until the plan read
+
+Revision 2026-10-29 (#182): ADR 0018 names both `youtrack_get_issue` and
+`youtrack_get_issue_comments` in `PlanRead` and requires all of them; the execution
+turn carries the same reads before its first edit. The historical decision below
+describes the original one-tool gate.
 completes; the post-turn gate below remains the backstop for sessions created
 before the ruleset change.
 
